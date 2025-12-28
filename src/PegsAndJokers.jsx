@@ -74,6 +74,38 @@ function getDistanceToHome(peg, player) {
   return stepsToEntry + 5;
 }
 
+// Generate a description of a move for the last move display
+function describeMoveAction(peg, newPeg, card, amount, bumpedPlayer = null) {
+  const cardInfo = CARD_VALUES[card.rank];
+
+  // Joker bump
+  if (cardInfo.isJoker && bumpedPlayer !== null) {
+    return `Joker bumped ${PLAYER_NAMES[bumpedPlayer]}`;
+  }
+
+  // Starting a peg
+  if (peg.location === 'start' && cardInfo.canStart) {
+    return 'Started a peg';
+  }
+
+  // Entering home from track
+  if (peg.location === 'track' && newPeg.location === 'home') {
+    return `Space ${peg.position} to Home ${newPeg.homePosition}`;
+  }
+
+  // Moving within home
+  if (peg.location === 'home' && newPeg.location === 'home') {
+    return `Home ${peg.homePosition} to Home ${newPeg.homePosition}`;
+  }
+
+  // Track movement
+  if (peg.location === 'track' && newPeg.location === 'track') {
+    return `Space ${peg.position} to Space ${newPeg.position}`;
+  }
+
+  return 'Moved';
+}
+
 export default function PegsAndJokers() {
   const [deck, setDeck] = useState([]);
   const [discardPiles, setDiscardPiles] = useState([[], [], [], []]); // Per-player discard piles
@@ -96,6 +128,7 @@ export default function PegsAndJokers() {
   const [gameMessage, setGameMessage] = useState('Your turn! Select a card and peg to move.');
   const [winner, setWinner] = useState(null);
   const [moveHistory, setMoveHistory] = useState([]);
+  const [lastMoves, setLastMoves] = useState([null, null, null, null]); // Last move description per player
   const aiProcessingRef = useRef(false); // Prevent AI from running twice on same turn
 
   // Animation state
@@ -130,6 +163,7 @@ export default function PegsAndJokers() {
     setGameMessage('Your turn! Select a card and peg to move.');
     setWinner(null);
     setMoveHistory([]);
+    setLastMoves([null, null, null, null]);
     aiProcessingRef.current = false;
     setAnimatingPeg(null);
     if (animationRef.current) {
@@ -633,8 +667,19 @@ export default function PegsAndJokers() {
       setGameMessage('Invalid move. Try again.');
       return false;
     }
-    
+
+    const oldPeg = pegs[player][pegIndex];
     const { newPegs } = executeMoveInternal(player, pegIndex, card, splitAmount, pegs);
+    const newPeg = newPegs[player][pegIndex];
+
+    // Record last move description
+    const moveDescription = describeMoveAction(oldPeg, newPeg, card, splitAmount);
+    setLastMoves(prev => {
+      const updated = [...prev];
+      updated[player] = moveDescription;
+      return updated;
+    });
+
     setPegs(newPegs);
     
     const cardInfo = CARD_VALUES[card.rank];
@@ -706,8 +751,19 @@ export default function PegsAndJokers() {
       setGameMessage('Invalid move for split. Try again.');
       return false;
     }
-    
+
+    const oldPeg = pegs[currentPlayer][pegIndex];
     const { newPegs } = executeMoveInternal(currentPlayer, pegIndex, splitCard, amount, pegs);
+    const newPeg = newPegs[currentPlayer][pegIndex];
+
+    // Update last move description to show split completion
+    const secondMoveDesc = describeMoveAction(oldPeg, newPeg, splitCard, amount);
+    setLastMoves(prev => {
+      const updated = [...prev];
+      updated[currentPlayer] = `Split: ${prev[currentPlayer]}, ${secondMoveDesc}`;
+      return updated;
+    });
+
     setPegs(newPegs);
     
     const w = checkWinner(newPegs);
@@ -769,30 +825,32 @@ export default function PegsAndJokers() {
     
     // After 3 stuck discards, allow player to start a peg (auto-start next peg)
     let newPegs = pegs;
+    let autoStarted = false;
     if (newStuckCounts[player] >= 3) {
       // Find a peg in start and move it to come-out position
       const pegInStart = pegs[player].findIndex(p => p.location === 'start');
       if (pegInStart !== -1) {
         const startPos = getStartPosition(player);
         const pegAtStart = findPegAtPosition(startPos, pegs);
-        
+
         // Only auto-start if come-out spot is free of own peg
         const ownPegAtStart = pegs[player].some(p => p.location === 'track' && p.position === startPos);
-        
+
         if (!ownPegAtStart) {
           newPegs = pegs.map((playerPegs, i) => playerPegs.map(peg => ({ ...peg })));
-          
+
           // Bump opponent if present
           if (pegAtStart && pegAtStart.player !== player) {
             newPegs[pegAtStart.player][pegAtStart.pegIndex] = { location: 'start', index: pegAtStart.pegIndex };
           }
-          
+
           // Move our peg out
           newPegs[player][pegInStart].location = 'track';
           newPegs[player][pegInStart].position = startPos;
-          
+
           newStuckCounts[player] = 0;
-          
+          autoStarted = true;
+
           if (player === 0) {
             setGameMessage('After 3 stuck turns, you start a peg!');
           }
@@ -801,6 +859,13 @@ export default function PegsAndJokers() {
       newStuckCounts[player] = 0; // Reset even if no peg to start
     }
     
+    // Record last move description for discard
+    setLastMoves(prev => {
+      const updated = [...prev];
+      updated[player] = autoStarted ? 'Stuck 3x - Started a peg' : 'Discarded (stuck)';
+      return updated;
+    });
+
     setPegs(newPegs);
     setHands(newHands);
     setDeck(newDeck);
@@ -856,7 +921,14 @@ export default function PegsAndJokers() {
       const aiHand = hands[aiPlayer];
       
       // Helper function to complete AI move
-      const completeAIMove = (newPegs, card) => {
+      const completeAIMove = (newPegs, card, moveDescription) => {
+        // Record last move description for AI
+        setLastMoves(prev => {
+          const updated = [...prev];
+          updated[aiPlayer] = moveDescription;
+          return updated;
+        });
+
         setPegs(newPegs);
         
         const newHands = hands.map(h => [...h]);
@@ -1138,9 +1210,31 @@ export default function PegsAndJokers() {
       if (possibleMoves.length > 0) {
         const bestMove = possibleMoves[0];
 
+        // Generate move description based on move type
+        const getMoveDescription = () => {
+          const oldPeg = pegs[aiPlayer][bestMove.pegIndex];
+          const newPeg = bestMove.newPegs[aiPlayer][bestMove.pegIndex];
+
+          if (bestMove.type === 'simple' || bestMove.type === 'start') {
+            return describeMoveAction(oldPeg, newPeg, bestMove.card, bestMove.amount);
+          } else if (bestMove.type === 'split7' || bestMove.type === 'split9') {
+            const afterFirst = executeMoveInternal(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
+            const firstDesc = describeMoveAction(oldPeg, afterFirst[aiPlayer][bestMove.pegIndex], bestMove.card, bestMove.amount);
+            const secondOldPeg = afterFirst[aiPlayer][bestMove.secondPeg];
+            const secondNewPeg = bestMove.newPegs[aiPlayer][bestMove.secondPeg];
+            const secondDesc = describeMoveAction(secondOldPeg, secondNewPeg, bestMove.card, bestMove.remaining);
+            return `Split: ${firstDesc}, ${secondDesc}`;
+          } else if (bestMove.type === 'joker') {
+            return `Joker bumped ${PLAYER_NAMES[bestMove.targetPlayer]}`;
+          }
+          return 'Moved';
+        };
+
+        const moveDescription = getMoveDescription();
+
         // If animations disabled, just complete immediately
         if (!animationsEnabled) {
-          if (completeAIMove(bestMove.newPegs, bestMove.card)) return;
+          if (completeAIMove(bestMove.newPegs, bestMove.card, moveDescription)) return;
           return;
         }
 
@@ -1148,7 +1242,7 @@ export default function PegsAndJokers() {
         if (bestMove.type === 'simple' || bestMove.type === 'start') {
           // Single move animation
           animateMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
-            completeAIMove(bestMove.newPegs, bestMove.card);
+            completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
           });
         } else if (bestMove.type === 'split7') {
           // Two-part animation for 7 split
@@ -1156,7 +1250,7 @@ export default function PegsAndJokers() {
             // After first animation, animate second peg
             const afterFirstPegs = executeMoveInternal(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
             animateMove(aiPlayer, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
-              completeAIMove(bestMove.newPegs, bestMove.card);
+              completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
             });
           });
         } else if (bestMove.type === 'split9') {
@@ -1165,12 +1259,12 @@ export default function PegsAndJokers() {
             // After first animation, animate second peg
             const afterFirstPegs = executeMoveInternal(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
             animateMove(aiPlayer, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
-              completeAIMove(bestMove.newPegs, bestMove.card);
+              completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
             });
           });
         } else if (bestMove.type === 'joker') {
           // Joker - just complete (animation path is empty for jokers)
-          completeAIMove(bestMove.newPegs, bestMove.card);
+          completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
         }
         return;
       }
@@ -1271,7 +1365,14 @@ export default function PegsAndJokers() {
     // Move our peg to that position
     sourcePeg.location = 'track';
     sourcePeg.position = targetPos;
-    
+
+    // Record last move for Joker
+    setLastMoves(prev => {
+      const updated = [...prev];
+      updated[0] = `Joker bumped ${PLAYER_NAMES[targetPlayer]}`;
+      return updated;
+    });
+
     setPegs(newPegs);
     
     // Remove card from hand and draw new one
@@ -1699,11 +1800,23 @@ export default function PegsAndJokers() {
                 );
               })}
 
-              {/* Labels */}
-              <text x="200" y="25" textAnchor="middle" fill={PLAYER_COLORS[0]} fontSize="11" fontWeight="bold">You (Yellow)</text>
-              <text x="378" y="205" textAnchor="middle" fill={PLAYER_COLORS[1]} fontSize="11" fontWeight="bold" transform="rotate(90 378 205)">Blue (AI)</text>
-              <text x="200" y="388" textAnchor="middle" fill={PLAYER_COLORS[2]} fontSize="11" fontWeight="bold">Pink (AI)</text>
-              <text x="22" y="205" textAnchor="middle" fill={PLAYER_COLORS[3]} fontSize="11" fontWeight="bold" transform="rotate(-90 22 205)">Green (AI)</text>
+              {/* Labels with last move */}
+              <g>
+                <text x="200" y="20" textAnchor="middle" fill={PLAYER_COLORS[0]} fontSize="11" fontWeight="bold">You (Yellow)</text>
+                {lastMoves[0] && <text x="200" y="31" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[0]}</text>}
+              </g>
+              <g transform="rotate(90 378 205)">
+                <text x="378" y="200" textAnchor="middle" fill={PLAYER_COLORS[1]} fontSize="11" fontWeight="bold">Blue (AI)</text>
+                {lastMoves[1] && <text x="378" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[1]}</text>}
+              </g>
+              <g>
+                <text x="200" y="383" textAnchor="middle" fill={PLAYER_COLORS[2]} fontSize="11" fontWeight="bold">Pink (AI)</text>
+                {lastMoves[2] && <text x="200" y="394" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[2]}</text>}
+              </g>
+              <g transform="rotate(-90 22 205)">
+                <text x="22" y="200" textAnchor="middle" fill={PLAYER_COLORS[3]} fontSize="11" fontWeight="bold">Green (AI)</text>
+                {lastMoves[3] && <text x="22" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[3]}</text>}
+              </g>
             </svg>
           </div>
 
