@@ -98,6 +98,11 @@ export default function PegsAndJokers() {
   const [moveHistory, setMoveHistory] = useState([]);
   const aiProcessingRef = useRef(false); // Prevent AI from running twice on same turn
 
+  // Animation state
+  const [animationsEnabled, setAnimationsEnabled] = useState(true);
+  const [animatingPeg, setAnimatingPeg] = useState(null); // { player, pegIndex, positions: [], currentStep: 0 }
+  const animationRef = useRef(null);
+
   const initGame = useCallback(() => {
     const newDeck = createDeck();
     const hand1 = newDeck.splice(0, 6);
@@ -126,6 +131,11 @@ export default function PegsAndJokers() {
     setWinner(null);
     setMoveHistory([]);
     aiProcessingRef.current = false;
+    setAnimatingPeg(null);
+    if (animationRef.current) {
+      clearInterval(animationRef.current);
+      animationRef.current = null;
+    }
   }, []);
 
   useEffect(() => {
@@ -503,6 +513,120 @@ export default function PegsAndJokers() {
     }
     return null;
   }, []);
+
+  // Calculate the path of positions a peg travels during a move
+  const calculateMovePath = useCallback((player, pegIndex, card, amount, currentPegs) => {
+    const peg = currentPegs[player][pegIndex];
+    const cardInfo = CARD_VALUES[card.rank];
+    const path = [];
+
+    // Starting from start area - just show appear at start position
+    if (peg.location === 'start' && cardInfo.canStart) {
+      const startPos = getStartPosition(player);
+      path.push({ type: 'track', position: startPos });
+      return path;
+    }
+
+    // Joker - we handle this separately (just appear at target)
+    if (cardInfo.isJoker) {
+      return path; // Empty path, handled specially
+    }
+
+    // Movement within home
+    if (peg.location === 'home') {
+      const moveAmount = amount !== null ? amount : cardInfo.value;
+      for (let step = 1; step <= moveAmount; step++) {
+        path.push({ type: 'home', position: peg.homePosition + step });
+      }
+      return path;
+    }
+
+    // Track movement
+    if (peg.location === 'track') {
+      const homeEntrance = getHomeEntrance(player);
+      const currentPos = peg.position;
+      const moveAmount = amount !== null ? amount : cardInfo.value;
+      const direction = moveAmount > 0 ? 1 : -1;
+
+      // Check if we'll enter home
+      let stepsToHome = 0;
+      if (moveAmount > 0) {
+        for (let step = 1; step <= moveAmount; step++) {
+          const checkPos = (currentPos + step) % TRACK_LENGTH;
+          if (checkPos === (homeEntrance + 1) % TRACK_LENGTH && stepsToHome === 0) {
+            stepsToHome = step;
+          }
+        }
+      }
+
+      // Check if home entry is valid
+      let willEnterHome = false;
+      let homeSteps = 0;
+      if (stepsToHome > 0 && stepsToHome <= moveAmount) {
+        homeSteps = moveAmount - stepsToHome;
+        if (homeSteps >= 0 && homeSteps < 5) {
+          const homeOccupied = currentPegs[player].some(
+            p => p.location === 'home' && p.homePosition === homeSteps
+          );
+          if (!homeOccupied) {
+            willEnterHome = true;
+          }
+        }
+      }
+
+      if (willEnterHome) {
+        // Animate to home entrance, then into home
+        for (let step = 1; step <= stepsToHome; step++) {
+          const pos = (currentPos + step) % TRACK_LENGTH;
+          path.push({ type: 'track', position: pos });
+        }
+        for (let step = 0; step <= homeSteps; step++) {
+          path.push({ type: 'home', position: step });
+        }
+      } else {
+        // Animate along track
+        for (let step = direction; Math.abs(step) <= Math.abs(moveAmount); step += direction) {
+          const pos = (currentPos + step + TRACK_LENGTH) % TRACK_LENGTH;
+          path.push({ type: 'track', position: pos });
+        }
+      }
+    }
+
+    return path;
+  }, []);
+
+  // Run animation for a move, then call onComplete when done
+  const animateMove = useCallback((player, pegIndex, card, amount, currentPegs, onComplete) => {
+    const path = calculateMovePath(player, pegIndex, card, amount, currentPegs);
+
+    if (path.length === 0) {
+      // No animation needed (e.g., Joker), complete immediately
+      onComplete();
+      return;
+    }
+
+    // Start animation
+    setAnimatingPeg({
+      player,
+      pegIndex,
+      path,
+      currentStep: 0
+    });
+
+    let step = 0;
+    animationRef.current = setInterval(() => {
+      step++;
+      if (step >= path.length) {
+        // Animation complete
+        clearInterval(animationRef.current);
+        animationRef.current = null;
+        setAnimatingPeg(null);
+        onComplete();
+      } else {
+        setAnimatingPeg(prev => prev ? { ...prev, currentStep: step } : null);
+      }
+    }, 150); // 150ms per step
+  }, [calculateMovePath]);
 
   const executeMove = useCallback((player, pegIndex, card, splitAmount = null) => {
     if (!isValidMove(player, pegIndex, card, pegs, splitAmount)) {
@@ -1009,14 +1133,48 @@ export default function PegsAndJokers() {
       
       // Sort moves by improvement + bonus (higher is better)
       possibleMoves.sort((a, b) => (b.improvement + b.bonus) - (a.improvement + a.bonus));
-      
+
       // Execute the best move
       if (possibleMoves.length > 0) {
         const bestMove = possibleMoves[0];
-        if (completeAIMove(bestMove.newPegs, bestMove.card)) return;
+
+        // If animations disabled, just complete immediately
+        if (!animationsEnabled) {
+          if (completeAIMove(bestMove.newPegs, bestMove.card)) return;
+          return;
+        }
+
+        // Animate the move before completing
+        if (bestMove.type === 'simple' || bestMove.type === 'start') {
+          // Single move animation
+          animateMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
+            completeAIMove(bestMove.newPegs, bestMove.card);
+          });
+        } else if (bestMove.type === 'split7') {
+          // Two-part animation for 7 split
+          animateMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
+            // After first animation, animate second peg
+            const afterFirstPegs = executeMoveInternal(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
+            animateMove(aiPlayer, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
+              completeAIMove(bestMove.newPegs, bestMove.card);
+            });
+          });
+        } else if (bestMove.type === 'split9') {
+          // Two-part animation for 9 split
+          animateMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
+            // After first animation, animate second peg
+            const afterFirstPegs = executeMoveInternal(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
+            animateMove(aiPlayer, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
+              completeAIMove(bestMove.newPegs, bestMove.card);
+            });
+          });
+        } else if (bestMove.type === 'joker') {
+          // Joker - just complete (animation path is empty for jokers)
+          completeAIMove(bestMove.newPegs, bestMove.card);
+        }
         return;
       }
-      
+
       // No valid move, discard (discardAndDraw handles player transition for AI)
       discardAndDraw(aiPlayer);
     }, 800);
@@ -1025,7 +1183,7 @@ export default function PegsAndJokers() {
       clearTimeout(timer);
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, isValidMove, executeMoveInternal, drawCard, checkWinner, discardAndDraw]);
+  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, isValidMove, executeMoveInternal, drawCard, checkWinner, discardAndDraw, animationsEnabled, animateMove]);
 
   const handleCardClick = (cardIndex) => {
     if (currentPlayer !== 0 || winner !== null) return;
@@ -1288,12 +1446,24 @@ export default function PegsAndJokers() {
       <div className="max-w-5xl mx-auto">
         <div className="flex justify-between items-center mb-4">
           <h1 className="text-2xl font-bold">Pegs and Jokers</h1>
-          <button
-            onClick={initGame}
-            className="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700"
-          >
-            New Game
-          </button>
+          <div className="flex gap-2 items-center">
+            <button
+              onClick={() => setAnimationsEnabled(!animationsEnabled)}
+              className={`px-3 py-2 rounded text-sm ${
+                animationsEnabled
+                  ? 'bg-green-600 hover:bg-green-700'
+                  : 'bg-gray-600 hover:bg-gray-700'
+              }`}
+            >
+              {animationsEnabled ? 'Animations On' : 'Animations Off'}
+            </button>
+            <button
+              onClick={initGame}
+              className="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700"
+            >
+              New Game
+            </button>
+          </div>
         </div>
 
         {winner !== null && (
@@ -1430,6 +1600,33 @@ export default function PegsAndJokers() {
                   );
                 })
               )}
+
+              {/* Animating peg - shows peg moving step by step */}
+              {animatingPeg && (() => {
+                const currentPos = animatingPeg.path[animatingPeg.currentStep];
+                if (!currentPos) return null;
+
+                let pos;
+                if (currentPos.type === 'track') {
+                  pos = getTrackPosition(currentPos.position);
+                } else if (currentPos.type === 'home') {
+                  pos = getHomePosition(animatingPeg.player, currentPos.position);
+                }
+
+                if (!pos) return null;
+
+                return (
+                  <circle
+                    cx={pos.x}
+                    cy={pos.y}
+                    r={8}
+                    fill={PLAYER_COLORS[animatingPeg.player]}
+                    stroke="white"
+                    strokeWidth={3}
+                    style={{ filter: 'drop-shadow(0 0 4px rgba(255,255,255,0.8))' }}
+                  />
+                );
+              })()}
 
               {/* Draw pile in center */}
               <g>
