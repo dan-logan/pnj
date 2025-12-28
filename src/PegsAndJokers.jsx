@@ -1428,28 +1428,31 @@ export default function PegsAndJokers() {
   const getTrackPosition = (trackIndex) => {
     const side = Math.floor(trackIndex / SPACES_PER_SIDE);
     const pos = trackIndex % SPACES_PER_SIDE;
-    
+
+    // Rotate visual layout so player 0 (Yellow) is at the bottom
+    const visualSide = (side + 2) % 4;
+
     const topY = MARGIN;
     const bottomY = BOARD_SIZE - MARGIN;
     const leftX = MARGIN;
     const rightX = BOARD_SIZE - MARGIN;
-    
+
     // Each side has 18 spaces, corners don't overlap
     // Space 0 is at the corner, space 17 is one step before next corner
     const sideLength = rightX - leftX;
     const spacing = sideLength / SPACES_PER_SIDE;
-    
+
     let x, y;
-    if (side === 0) { // Top side (Yellow) - left to right
+    if (visualSide === 0) { // Top side - left to right
       x = leftX + pos * spacing;
       y = topY;
-    } else if (side === 1) { // Right side (Blue) - top to bottom
+    } else if (visualSide === 1) { // Right side - top to bottom
       x = rightX;
       y = topY + pos * spacing;
-    } else if (side === 2) { // Bottom side (Pink) - right to left
+    } else if (visualSide === 2) { // Bottom side - right to left
       x = rightX - pos * spacing;
       y = bottomY;
-    } else { // Left side (Green) - bottom to top
+    } else { // Left side - bottom to top
       x = leftX;
       y = bottomY - pos * spacing;
     }
@@ -1459,25 +1462,28 @@ export default function PegsAndJokers() {
   // Start areas align with position 8 on each side (cross/plus shape)
   const getStartAreaPosition = (player, pegIndex) => {
     const trackPos8 = getTrackPosition(player * SPACES_PER_SIDE + 8);
-    
+
+    // Rotate visual layout so player 0 (Yellow) is at the bottom
+    const visualSide = (player + 2) % 4;
+
     // Offset inward from track, close to the come-out space
     const inwardOffset = 22;
     let baseX, baseY;
-    
-    if (player === 0) { // Yellow - top, start goes down
+
+    if (visualSide === 0) { // Top side - start goes down
       baseX = trackPos8.x;
       baseY = trackPos8.y + inwardOffset;
-    } else if (player === 1) { // Blue - right, start goes left
+    } else if (visualSide === 1) { // Right side - start goes left
       baseX = trackPos8.x - inwardOffset;
       baseY = trackPos8.y;
-    } else if (player === 2) { // Pink - bottom, start goes up
+    } else if (visualSide === 2) { // Bottom side - start goes up
       baseX = trackPos8.x;
       baseY = trackPos8.y - inwardOffset;
-    } else { // Green - left, start goes right
+    } else { // Left side - start goes right
       baseX = trackPos8.x + inwardOffset;
       baseY = trackPos8.y;
     }
-    
+
     // Cross pattern: center, up, down, left, right
     const crossOffsets = [
       { x: 0, y: 0 },
@@ -1486,30 +1492,34 @@ export default function PegsAndJokers() {
       { x: -10, y: 0 },
       { x: 10, y: 0 }
     ];
-    
+
     return { x: baseX + crossOffsets[pegIndex].x, y: baseY + crossOffsets[pegIndex].y };
   };
 
   // Home areas align with position 3 on each side (line of 5 going toward center)
   const getHomePosition = (player, homePos) => {
     const trackPos3 = getTrackPosition(player * SPACES_PER_SIDE + 3);
+
+    // Rotate visual layout so player 0 (Yellow) is at the bottom
+    const visualSide = (player + 2) % 4;
+
     const spacing = 14;
-    
+
     let x, y;
-    if (player === 0) { // Yellow - top, home goes down
+    if (visualSide === 0) { // Top side - home goes down
       x = trackPos3.x;
       y = trackPos3.y + spacing * (homePos + 1);
-    } else if (player === 1) { // Blue - right, home goes left
+    } else if (visualSide === 1) { // Right side - home goes left
       x = trackPos3.x - spacing * (homePos + 1);
       y = trackPos3.y;
-    } else if (player === 2) { // Pink - bottom, home goes up
+    } else if (visualSide === 2) { // Bottom side - home goes up
       x = trackPos3.x;
       y = trackPos3.y - spacing * (homePos + 1);
-    } else { // Green - left, home goes right
+    } else { // Left side - home goes right
       x = trackPos3.x + spacing * (homePos + 1);
       y = trackPos3.y;
     }
-    
+
     return { x, y };
   };
 
@@ -1739,12 +1749,12 @@ export default function PegsAndJokers() {
 
               {/* Per-player discard piles with stuck counters */}
               {[0, 1, 2, 3].map(player => {
-                // Position discard piles in corners around center draw pile, avoiding home corridors
+                // Position discard piles in corners around center draw pile (rotated so Yellow is at bottom)
                 const positions = [
-                  { x: 130, y: 140 },  // Yellow - top-left of center
-                  { x: 220, y: 140 },  // Blue - top-right of center
-                  { x: 220, y: 240 },  // Pink - bottom-right of center
-                  { x: 130, y: 240 }   // Green - bottom-left of center
+                  { x: 220, y: 240 },  // Yellow - bottom-right of center
+                  { x: 130, y: 240 },  // Blue - bottom-left of center
+                  { x: 130, y: 140 },  // Pink - top-left of center
+                  { x: 220, y: 140 }   // Green - top-right of center
                 ];
                 const pos = positions[player];
                 const lastCard = discardPiles[player]?.[discardPiles[player].length - 1];
@@ -1800,22 +1810,22 @@ export default function PegsAndJokers() {
                 );
               })}
 
-              {/* Labels with last move */}
+              {/* Labels with last move - rotated so Yellow (player 0) is at bottom */}
               <g>
-                <text x="200" y="20" textAnchor="middle" fill={PLAYER_COLORS[0]} fontSize="11" fontWeight="bold">You (Yellow)</text>
-                {lastMoves[0] && <text x="200" y="31" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[0]}</text>}
+                <text x="200" y="20" textAnchor="middle" fill={PLAYER_COLORS[2]} fontSize="11" fontWeight="bold">Pink (AI)</text>
+                {lastMoves[2] && <text x="200" y="31" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[2]}</text>}
               </g>
               <g transform="rotate(90 378 205)">
-                <text x="378" y="200" textAnchor="middle" fill={PLAYER_COLORS[1]} fontSize="11" fontWeight="bold">Blue (AI)</text>
-                {lastMoves[1] && <text x="378" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[1]}</text>}
+                <text x="378" y="200" textAnchor="middle" fill={PLAYER_COLORS[3]} fontSize="11" fontWeight="bold">Green (AI)</text>
+                {lastMoves[3] && <text x="378" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[3]}</text>}
               </g>
               <g>
-                <text x="200" y="383" textAnchor="middle" fill={PLAYER_COLORS[2]} fontSize="11" fontWeight="bold">Pink (AI)</text>
-                {lastMoves[2] && <text x="200" y="394" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[2]}</text>}
+                <text x="200" y="383" textAnchor="middle" fill={PLAYER_COLORS[0]} fontSize="11" fontWeight="bold">You (Yellow)</text>
+                {lastMoves[0] && <text x="200" y="394" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[0]}</text>}
               </g>
               <g transform="rotate(-90 22 205)">
-                <text x="22" y="200" textAnchor="middle" fill={PLAYER_COLORS[3]} fontSize="11" fontWeight="bold">Green (AI)</text>
-                {lastMoves[3] && <text x="22" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[3]}</text>}
+                <text x="22" y="200" textAnchor="middle" fill={PLAYER_COLORS[1]} fontSize="11" fontWeight="bold">Blue (AI)</text>
+                {lastMoves[1] && <text x="22" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[1]}</text>}
               </g>
             </svg>
           </div>
