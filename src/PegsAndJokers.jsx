@@ -675,6 +675,54 @@ export default function PegsAndJokers() {
       return false;
     }
 
+    const cardInfo = CARD_VALUES[card.rank];
+
+    // For 9 card splits, validate that a second peg can complete the split BEFORE executing the first move
+    if (cardInfo.mustSplit && splitAmount !== null) {
+      const remaining = splitAmount > 0 ? -(9 - splitAmount) : (9 - Math.abs(splitAmount));
+
+      // Simulate the first move to get the intermediate state
+      const { newPegs: afterFirstMove } = executeMoveInternal(player, pegIndex, card, splitAmount, pegs);
+
+      // Check if there's at least one other peg that can make the second move
+      let hasValidSecondPeg = false;
+      for (let secondPeg = 0; secondPeg < 5; secondPeg++) {
+        if (secondPeg === pegIndex) continue; // Must use a different peg
+        if (isValidMove(player, secondPeg, card, afterFirstMove, remaining)) {
+          hasValidSecondPeg = true;
+          break;
+        }
+      }
+
+      if (!hasValidSecondPeg) {
+        setGameMessage(`Cannot split: no other peg can move ${Math.abs(remaining)} ${remaining > 0 ? 'forward' : 'backward'}.`);
+        return false;
+      }
+    }
+
+    // For 7 card splits, validate that a second peg can complete the split BEFORE executing the first move
+    if (cardInfo.canSplit && splitAmount !== null && splitAmount < 7) {
+      const remaining = 7 - splitAmount;
+
+      // Simulate the first move to get the intermediate state
+      const { newPegs: afterFirstMove } = executeMoveInternal(player, pegIndex, card, splitAmount, pegs);
+
+      // Check if there's at least one peg (same or different) that can make the second move
+      let hasValidSecondPeg = false;
+      for (let secondPeg = 0; secondPeg < 5; secondPeg++) {
+        // For 7 cards, same peg is allowed
+        if (isValidMove(player, secondPeg, card, afterFirstMove, remaining)) {
+          hasValidSecondPeg = true;
+          break;
+        }
+      }
+
+      if (!hasValidSecondPeg) {
+        setGameMessage(`Cannot split: no peg can move the remaining ${remaining} spaces.`);
+        return false;
+      }
+    }
+
     const oldPeg = pegs[player][pegIndex];
     const { newPegs } = executeMoveInternal(player, pegIndex, card, splitAmount, pegs);
     const newPeg = newPegs[player][pegIndex];
@@ -688,9 +736,7 @@ export default function PegsAndJokers() {
     });
 
     setPegs(newPegs);
-    
-    const cardInfo = CARD_VALUES[card.rank];
-    
+
     // Handle 7 card splitting
     if (cardInfo.canSplit && splitAmount !== null && splitAmount < 7) {
       const remaining = 7 - splitAmount;
@@ -701,7 +747,7 @@ export default function PegsAndJokers() {
       setGameMessage(`Move remaining ${remaining} spaces with another peg.`);
       return true;
     }
-    
+
     // Handle 9 card (must split forward/backward)
     if (cardInfo.mustSplit && splitAmount !== null) {
       const remaining = 9 - Math.abs(splitAmount);
