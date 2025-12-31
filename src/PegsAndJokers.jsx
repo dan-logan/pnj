@@ -211,8 +211,8 @@ export default function PegsAndJokers() {
       // Can't use Joker or backward cards in home
       if (cardInfo.isJoker || cardInfo.backward) return false;
 
-      // Can't use 9 card (mustSplit) in home - needs both forward AND backward, but home only allows forward
-      if (cardInfo.mustSplit) {
+      // For 9 card (mustSplit), only allow positive (forward) splits - reject if no amount or backward
+      if (cardInfo.mustSplit && (moveAmount === null || moveAmount <= 0)) {
         return false;
       }
 
@@ -1342,14 +1342,9 @@ export default function PegsAndJokers() {
     if (cardInfo.canSplit && (pegs[0][pegIndex].location === 'track' || pegs[0][pegIndex].location === 'home')) {
       // For 7, show split options
       setGameMessage('Click Move button to use full 7, or select split amount.');
-    } else if (cardInfo.mustSplit && pegs[0][pegIndex].location === 'track') {
-      // For 9, show split options (only for pegs on track, not in home)
+    } else if (cardInfo.mustSplit && (pegs[0][pegIndex].location === 'track' || pegs[0][pegIndex].location === 'home')) {
+      // For 9, show split options (home pegs can only use positive/forward splits)
       setGameMessage('Select split: forward amount for this peg, backward for another peg.');
-    } else if (cardInfo.mustSplit && pegs[0][pegIndex].location === 'home') {
-      // Can't use 9 card with pegs in home
-      setGameMessage('Cannot use 9 card with pegs in home (need forward AND backward moves).');
-      setSelectedPeg(null);
-      return;
     } else {
       executeMove(0, pegIndex, card);
     }
@@ -1875,8 +1870,8 @@ export default function PegsAndJokers() {
                       ))}
                     </>
                   )}
-                  {/* Only show 9 split options for pegs on track, not in home */}
-                  {hands[0][selectedCard]?.rank === '9' && pegs[0][selectedPeg]?.location === 'track' && (
+                  {/* Show 9 split options (only valid splits will be accepted) */}
+                  {hands[0][selectedCard]?.rank === '9' && (pegs[0][selectedPeg]?.location === 'track' || pegs[0][selectedPeg]?.location === 'home') && (
                     <>
                       {[1, 2, 3, 4, 5, 6, 7, 8].map(n => (
                         <button
