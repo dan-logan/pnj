@@ -122,6 +122,7 @@ export default function PegsAndJokers() {
   const [selectedPeg, setSelectedPeg] = useState(null);
   const [splitRemaining, setSplitRemaining] = useState(0);
   const [splitCard, setSplitCard] = useState(null);
+  const [splitPegIndex, setSplitPegIndex] = useState(null); // Track which peg was moved in first part of split
   const [jokerMode, setJokerMode] = useState(false); // true when waiting for target selection
   const [jokerSourcePeg, setJokerSourcePeg] = useState(null); // which of player's pegs to move
   const [discardMode, setDiscardMode] = useState(false); // true when player is selecting a card to discard
@@ -157,6 +158,7 @@ export default function PegsAndJokers() {
     setSelectedPeg(null);
     setSplitRemaining(0);
     setSplitCard(null);
+    setSplitPegIndex(null);
     setJokerMode(false);
     setJokerSourcePeg(null);
     setDiscardMode(false);
@@ -694,6 +696,7 @@ export default function PegsAndJokers() {
       const remaining = 7 - splitAmount;
       setSplitRemaining(remaining);
       setSplitCard(card);
+      setSplitPegIndex(pegIndex); // Track which peg was moved first
       setSelectedPeg(null);
       setGameMessage(`Move remaining ${remaining} spaces with another peg.`);
       return true;
@@ -705,6 +708,7 @@ export default function PegsAndJokers() {
       const direction = splitAmount > 0 ? 'backward' : 'forward';
       setSplitRemaining(splitAmount > 0 ? -remaining : remaining);
       setSplitCard(card);
+      setSplitPegIndex(pegIndex); // Track which peg was moved first
       setSelectedPeg(null);
       setGameMessage(`Move ${remaining} spaces ${direction} with another peg.`);
       return true;
@@ -742,7 +746,8 @@ export default function PegsAndJokers() {
     setSelectedPeg(null);
     setSplitRemaining(0);
     setSplitCard(null);
-    
+    setSplitPegIndex(null);
+
     // Switch to next player
     const nextPlayer = (player + 1) % 4;
     setCurrentPlayer(nextPlayer);
@@ -752,6 +757,14 @@ export default function PegsAndJokers() {
   }, [isValidMove, pegs, executeMoveInternal, checkWinner, hands, deck, discardPiles, stuckCounts, drawCard]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
+    // For 9 cards (mustSplit), ensure different pegs are used
+    // For 7 cards (canSplit), same peg is allowed
+    const cardInfo = CARD_VALUES[splitCard?.rank];
+    if (cardInfo?.mustSplit && pegIndex === splitPegIndex) {
+      setGameMessage('Nine card must use two different pegs. Try again.');
+      return false;
+    }
+
     if (!isValidMove(currentPlayer, pegIndex, splitCard, pegs, amount)) {
       setGameMessage('Invalid move for split. Try again.');
       return false;
@@ -802,12 +815,13 @@ export default function PegsAndJokers() {
     setSelectedPeg(null);
     setSplitRemaining(0);
     setSplitCard(null);
+    setSplitPegIndex(null);
     const nextPlayer = (currentPlayer + 1) % 4;
     setCurrentPlayer(nextPlayer);
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
     
     return true;
-  }, [currentPlayer, splitCard, pegs, isValidMove, executeMoveInternal, checkWinner, hands, deck, discardPiles, stuckCounts, drawCard]);
+  }, [currentPlayer, splitCard, splitPegIndex, pegs, isValidMove, executeMoveInternal, checkWinner, hands, deck, discardPiles, stuckCounts, drawCard]);
 
   const discardAndDraw = useCallback((player, cardIndex = 0) => {
     if (hands[player].length === 0) return;
@@ -1318,6 +1332,12 @@ export default function PegsAndJokers() {
     if (player !== 0) return;
     
     if (splitRemaining !== 0) {
+      // For 9 cards only, check if trying to use the same peg
+      const cardInfo = CARD_VALUES[splitCard?.rank];
+      if (cardInfo?.mustSplit && pegIndex === splitPegIndex) {
+        setGameMessage('Nine card must use two different pegs. Try again.');
+        return;
+      }
       completeSplit(pegIndex, splitRemaining);
       return;
     }
