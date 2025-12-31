@@ -757,9 +757,11 @@ export default function PegsAndJokers() {
   }, [isValidMove, pegs, executeMoveInternal, checkWinner, hands, deck, discardPiles, stuckCounts, drawCard]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
-    // Ensure the split uses a DIFFERENT peg (can't split on the same peg)
-    if (pegIndex === splitPegIndex) {
-      setGameMessage('Must use a different peg for the split. Try again.');
+    // For 9 cards (mustSplit), ensure different pegs are used
+    // For 7 cards (canSplit), same peg is allowed
+    const cardInfo = CARD_VALUES[splitCard?.rank];
+    if (cardInfo?.mustSplit && pegIndex === splitPegIndex) {
+      setGameMessage('Nine card must use two different pegs. Try again.');
       return false;
     }
 
@@ -1330,9 +1332,10 @@ export default function PegsAndJokers() {
     if (player !== 0) return;
     
     if (splitRemaining !== 0) {
-      // Check if trying to use the same peg for split
-      if (pegIndex === splitPegIndex) {
-        setGameMessage('Must use a different peg for the split. Try again.');
+      // For 9 cards only, check if trying to use the same peg
+      const cardInfo = CARD_VALUES[splitCard?.rank];
+      if (cardInfo?.mustSplit && pegIndex === splitPegIndex) {
+        setGameMessage('Nine card must use two different pegs. Try again.');
         return;
       }
       completeSplit(pegIndex, splitRemaining);
