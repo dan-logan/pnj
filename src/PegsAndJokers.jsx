@@ -210,12 +210,12 @@ export default function PegsAndJokers() {
     if (peg.location === 'home') {
       // Can't use Joker or backward cards in home
       if (cardInfo.isJoker || cardInfo.backward) return false;
-      
-      // For 9 card (mustSplit), only allow if moveAmount is specified and positive
-      if (cardInfo.mustSplit) {
-        if (moveAmount === null || moveAmount <= 0) return false;
+
+      // For 9 card (mustSplit), only allow positive (forward) splits - reject if no amount or backward
+      if (cardInfo.mustSplit && (moveAmount === null || moveAmount <= 0)) {
+        return false;
       }
-      
+
       const amount = moveAmount !== null ? moveAmount : cardInfo.value;
       if (amount <= 0) return false; // Can only move forward in home
       
@@ -275,7 +275,12 @@ export default function PegsAndJokers() {
       }
       return false;
     }
-    
+
+    // For 9 card (mustSplit), moveAmount must be specified - cannot move a single peg 9 spaces
+    if (cardInfo.mustSplit && moveAmount === null) {
+      return false;
+    }
+
     const amount = moveAmount !== null ? moveAmount : cardInfo.value;
     const homeEntrance = getHomeEntrance(player);
     const currentPos = peg.position;
@@ -1338,7 +1343,7 @@ export default function PegsAndJokers() {
       // For 7, show split options
       setGameMessage('Click Move button to use full 7, or select split amount.');
     } else if (cardInfo.mustSplit && (pegs[0][pegIndex].location === 'track' || pegs[0][pegIndex].location === 'home')) {
-      // For 9, show split options
+      // For 9, show split options (home pegs can only use positive/forward splits)
       setGameMessage('Select split: forward amount for this peg, backward for another peg.');
     } else {
       executeMove(0, pegIndex, card);
@@ -1843,12 +1848,15 @@ export default function PegsAndJokers() {
               <div className="mb-4">
                 <h3 className="text-lg font-semibold mb-2">Actions:</h3>
                 <div className="flex gap-2 flex-wrap">
-                  <button
-                    onClick={() => handleMoveClick()}
-                    className="px-3 py-1 bg-green-600 rounded hover:bg-green-700"
-                  >
-                    Move
-                  </button>
+                  {/* Don't show Move button for 9 cards - they MUST split */}
+                  {hands[0][selectedCard]?.rank !== '9' && (
+                    <button
+                      onClick={() => handleMoveClick()}
+                      className="px-3 py-1 bg-green-600 rounded hover:bg-green-700"
+                    >
+                      Move
+                    </button>
+                  )}
                   {hands[0][selectedCard]?.rank === '7' && (pegs[0][selectedPeg]?.location === 'track' || pegs[0][selectedPeg]?.location === 'home') && (
                     <>
                       {[1, 2, 3, 4, 5, 6].map(n => (
@@ -1862,6 +1870,7 @@ export default function PegsAndJokers() {
                       ))}
                     </>
                   )}
+                  {/* Show 9 split options (only valid splits will be accepted) */}
                   {hands[0][selectedCard]?.rank === '9' && (pegs[0][selectedPeg]?.location === 'track' || pegs[0][selectedPeg]?.location === 'home') && (
                     <>
                       {[1, 2, 3, 4, 5, 6, 7, 8].map(n => (
