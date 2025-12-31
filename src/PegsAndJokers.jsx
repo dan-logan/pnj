@@ -707,10 +707,10 @@ export default function PegsAndJokers() {
       // Simulate the first move to get the intermediate state
       const { newPegs: afterFirstMove } = executeMoveInternal(player, pegIndex, card, splitAmount, pegs);
 
-      // Check if there's at least one peg (same or different) that can make the second move
+      // Check if there's at least one OTHER peg that can make the second move
       let hasValidSecondPeg = false;
       for (let secondPeg = 0; secondPeg < 5; secondPeg++) {
-        // For 7 cards, same peg is allowed
+        if (secondPeg === pegIndex) continue; // Must use a different peg
         if (isValidMove(player, secondPeg, card, afterFirstMove, remaining)) {
           hasValidSecondPeg = true;
           break;
@@ -718,7 +718,7 @@ export default function PegsAndJokers() {
       }
 
       if (!hasValidSecondPeg) {
-        setGameMessage(`Cannot split: no peg can move the remaining ${remaining} spaces.`);
+        setGameMessage(`Cannot split: no other peg can move the remaining ${remaining} spaces.`);
         return false;
       }
     }
@@ -803,11 +803,11 @@ export default function PegsAndJokers() {
   }, [isValidMove, pegs, executeMoveInternal, checkWinner, hands, deck, discardPiles, stuckCounts, drawCard]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
-    // For 9 cards (mustSplit), ensure different pegs are used
-    // For 7 cards (canSplit), same peg is allowed
+    // For both 7 and 9 cards, ensure different pegs are used
     const cardInfo = CARD_VALUES[splitCard?.rank];
-    if (cardInfo?.mustSplit && pegIndex === splitPegIndex) {
-      setGameMessage('Nine card must use two different pegs. Try again.');
+    if ((cardInfo?.mustSplit || cardInfo?.canSplit) && pegIndex === splitPegIndex) {
+      const cardName = cardInfo?.mustSplit ? 'Nine' : 'Seven';
+      setGameMessage(`${cardName} card must use two different pegs. Try again.`);
       return false;
     }
 
