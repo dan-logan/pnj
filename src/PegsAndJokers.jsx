@@ -2137,7 +2137,7 @@ export default function PegsAndJokers() {
               <ul className="space-y-1 text-gray-300">
                 <li>• A, J, Q, K: Move from START or move that many spaces</li>
                 <li>• 2-6, 10: Move face value</li>
-                <li>• 7: Split between two pegs (forward only)</li>
+                <li>• 7: Move one peg 7 spaces OR split between two pegs (both forward)</li>
                 <li>• 8: Move backward 8 spaces</li>
                 <li>• 9: Split between two pegs (one forward, one backward)</li>
                 <li>• Joker: Bump any opponent peg</li>
