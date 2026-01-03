@@ -137,7 +137,13 @@ export default function PegsAndJokers() {
   const [animatingPeg, setAnimatingPeg] = useState(null); // { player, pegIndex, positions: [], currentStep: 0 }
   const animationRef = useRef(null);
 
-  const initGame = useCallback(() => {
+  // First player selection state
+  const [showFirstPlayerModal, setShowFirstPlayerModal] = useState(false);
+  const [isSpinning, setIsSpinning] = useState(false);
+  const [spinningPlayer, setSpinningPlayer] = useState(0);
+  const spinIntervalRef = useRef(null);
+
+  const startGameWithPlayer = useCallback((firstPlayer) => {
     const newDeck = createDeck();
     const hand1 = newDeck.splice(0, 6);
     const hand2 = newDeck.splice(0, 6);
@@ -153,7 +159,7 @@ export default function PegsAndJokers() {
       Array(5).fill(null).map((_, i) => ({ location: 'start', index: i })),
       Array(5).fill(null).map((_, i) => ({ location: 'start', index: i }))
     ]);
-    setCurrentPlayer(0);
+    setCurrentPlayer(firstPlayer);
     setSelectedCard(null);
     setSelectedPeg(null);
     setSplitRemaining(0);
@@ -162,7 +168,7 @@ export default function PegsAndJokers() {
     setJokerMode(false);
     setJokerSourcePeg(null);
     setDiscardMode(false);
-    setGameMessage('Your turn! Select a card and peg to move.');
+    setGameMessage(firstPlayer === 0 ? 'Your turn! Select a card and peg to move.' : `${PLAYER_NAMES[firstPlayer]} is thinking...`);
     setWinner(null);
     setMoveHistory([]);
     setLastMoves([null, null, null, null]);
@@ -172,6 +178,63 @@ export default function PegsAndJokers() {
       clearInterval(animationRef.current);
       animationRef.current = null;
     }
+    setShowFirstPlayerModal(false);
+  }, []);
+
+  const handleGoFirst = useCallback(() => {
+    startGameWithPlayer(0);
+  }, [startGameWithPlayer]);
+
+  const handleRandomFirst = useCallback(() => {
+    setIsSpinning(true);
+
+    // Pre-select random player so spinner lands on them
+    const randomPlayer = Math.floor(Math.random() * 4);
+    const baseSpins = 12; // At least 3 full cycles
+    const extraSpins = Math.floor(Math.random() * 8); // 0-7 extra spins
+    const totalSpins = baseSpins + extraSpins + randomPlayer; // Ends on randomPlayer
+
+    let currentIndex = 0;
+    let spinCount = 0;
+    const spinDuration = 100; // milliseconds per spin
+
+    spinIntervalRef.current = setInterval(() => {
+      spinCount++;
+      currentIndex = (currentIndex + 1) % 4;
+      setSpinningPlayer(currentIndex);
+
+      if (spinCount >= totalSpins) {
+        clearInterval(spinIntervalRef.current);
+        spinIntervalRef.current = null;
+
+        // Wait a moment to show the final selection, then start game
+        setTimeout(() => {
+          setIsSpinning(false);
+          startGameWithPlayer(currentIndex);
+        }, 800);
+      }
+    }, spinDuration);
+  }, [startGameWithPlayer]);
+
+  const initGame = useCallback(() => {
+    // Clear any ongoing animations
+    if (animationRef.current) {
+      clearInterval(animationRef.current);
+      animationRef.current = null;
+    }
+    if (spinIntervalRef.current) {
+      clearInterval(spinIntervalRef.current);
+      spinIntervalRef.current = null;
+    }
+
+    setAnimatingPeg(null);
+    setIsSpinning(false);
+    setSpinningPlayer(0);
+    setWinner(null);
+    aiProcessingRef.current = false;
+
+    // Show the modal to choose first player
+    setShowFirstPlayerModal(true);
   }, []);
 
   useEffect(() => {
@@ -1625,6 +1688,53 @@ export default function PegsAndJokers() {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-2 sm:p-4">
+      {/* First Player Selection Modal */}
+      {showFirstPlayerModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
+          <div className="bg-gray-800 p-8 rounded-lg shadow-xl max-w-md w-full mx-4">
+            <h2 className="text-2xl font-bold mb-6 text-center">Choose First Player</h2>
+
+            {!isSpinning ? (
+              <div className="space-y-4">
+                <button
+                  onClick={handleGoFirst}
+                  className="w-full px-6 py-4 bg-amber-600 hover:bg-amber-700 rounded-lg text-lg font-semibold transition-colors"
+                >
+                  I'll Go First
+                </button>
+                <button
+                  onClick={handleRandomFirst}
+                  className="w-full px-6 py-4 bg-purple-600 hover:bg-purple-700 rounded-lg text-lg font-semibold transition-colors"
+                >
+                  Random First Player
+                </button>
+              </div>
+            ) : (
+              <div className="text-center">
+                <p className="text-xl mb-6">Selecting random player...</p>
+                <div className="space-y-3">
+                  {PLAYER_NAMES.map((name, idx) => (
+                    <div
+                      key={idx}
+                      className={`px-6 py-3 rounded-lg font-semibold transition-all ${
+                        spinningPlayer === idx
+                          ? 'bg-white text-gray-900 scale-105 shadow-lg'
+                          : 'bg-gray-700 text-gray-400'
+                      }`}
+                      style={{
+                        borderLeft: `4px solid ${PLAYER_COLORS[idx]}`
+                      }}
+                    >
+                      {name}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="max-w-5xl mx-auto">
         <div className="flex justify-between items-center mb-4">
           <h1 className="text-2xl font-bold">Pegs and Jokers</h1>
