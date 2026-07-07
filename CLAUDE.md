@@ -12,21 +12,26 @@ A digital implementation of the Pegs and Jokers board game built with React, Vit
 - `npm run dev` - Start development server
 - `npm run build` - Build for production (outputs to `dist/`)
 - `npm run preview` - Preview production build locally
+- `npm test` - Run the Vitest suite once
+- `npm run test:watch` - Run tests in watch mode
 
 ## Architecture
 
-This is a single-component React application:
+The rules engine is pure JavaScript (no React), separated from the UI so it can be unit-tested and reused:
 
-- **src/PegsAndJokers.jsx** - The entire game logic and UI (~1650 lines). Contains:
-  - Game state management via React hooks
-  - Card deck creation and shuffling
-  - Move validation logic for all card types
-  - AI player logic with scoring heuristics (prioritizes moves that advance toward home, avoids vulnerable positions)
-  - SVG-based board rendering
-  - 4 players, 5 pegs each, 72-space track (18 per side)
-
+- **src/game/constants.js** - Card values, board dimensions (72-space track, 18 per side), player colors/names
+- **src/game/deck.js** - Deck creation (two 52-card decks + 4 jokers), shuffling, drawing with discard-pile reshuffle
+- **src/game/engine.js** - Move validation (`isValidMove`, `hasAnyValidMove`), move application (`applyMove`), win detection, animation paths. All functions take the peg state as an argument and return new state without mutating.
+- **src/game/ai.js** - AI move enumeration and scoring (`getPossibleMoves`, `findBestAIMove`); prioritizes moves that advance toward home, avoids vulnerable positions
+- **src/PegsAndJokers.jsx** - React component: game state via hooks, turn flow, input handlers, SVG board rendering
 - **src/main.jsx** - React entry point
 - **src/index.css** - Tailwind imports only
+
+Peg state shape: a 4-element array (one per player) of 5 peg objects, each `{ location: 'start' | 'track' | 'home', position?, homePosition?, index }`.
+
+## Testing
+
+Tests live next to the modules they cover (`src/game/*.test.js`) and run with Vitest. They cover deck composition, move validation for every card type (including 7/9 split rules and home-corridor edge cases), bumping, win detection, and AI move selection. CI (`.github/workflows/ci.yml`) runs tests and the build on every pull request, and the deploy workflow runs tests before deploying. When changing game rules, add or update engine tests in the same change.
 
 ## Game Logic Key Concepts
 
