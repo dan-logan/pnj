@@ -1,0 +1,350 @@
+import { describe, it, expect } from 'vitest';
+import {
+  createInitialPegs,
+  getStartPosition,
+  getHomeEntrance,
+  getDistanceToHome,
+  describeMoveAction,
+  findPegAtPosition,
+  isValidMove,
+  hasAnyValidMove,
+  applyMove,
+  checkWinner,
+  calculateMovePath
+} from './engine.js';
+
+const card = (rank, suit = '♠') => ({ rank, suit, id: `${rank}${suit}test` });
+
+// Build a full 4x5 peg state, then place specific pegs.
+// placements: array of [player, pegIndex, peg] tuples
+function pegState(placements = []) {
+  const pegs = createInitialPegs();
+  for (const [player, pegIndex, peg] of placements) {
+    pegs[player][pegIndex] = { index: pegIndex, ...peg };
+  }
+  return pegs;
+}
+
+const onTrack = (position) => ({ location: 'track', position });
+const inHome = (homePosition) => ({ location: 'home', homePosition });
+
+describe('board geometry', () => {
+  it('come-out spot is position 8 on each side', () => {
+    expect(getStartPosition(0)).toBe(8);
+    expect(getStartPosition(1)).toBe(26);
+    expect(getStartPosition(2)).toBe(44);
+    expect(getStartPosition(3)).toBe(62);
+  });
+
+  it('home entrance is position 3 on each side', () => {
+    expect(getHomeEntrance(0)).toBe(3);
+    expect(getHomeEntrance(3)).toBe(57);
+  });
+});
+
+describe('getDistanceToHome', () => {
+  it('is large for pegs in start', () => {
+    expect(getDistanceToHome({ location: 'start', index: 0 }, 0)).toBe(100);
+  });
+
+  it('counts remaining home spots for pegs in home', () => {
+    expect(getDistanceToHome(inHome(4), 0)).toBe(0);
+    expect(getDistanceToHome(inHome(0), 0)).toBe(4);
+  });
+
+  it('decreases as a track peg approaches its home entry point', () => {
+    const far = getDistanceToHome(onTrack(10), 0);
+    const near = getDistanceToHome(onTrack(70), 0);
+    expect(near).toBeLessThan(far);
+  });
+});
+
+describe('isValidMove: leaving start', () => {
+  it('allows A, J, Q, K from start', () => {
+    const pegs = pegState();
+    for (const rank of ['A', 'J', 'Q', 'K']) {
+      expect(isValidMove(0, 0, card(rank), pegs)).toBe(true);
+    }
+  });
+
+  it('rejects number cards from start', () => {
+    const pegs = pegState();
+    for (const rank of ['2', '5', '7', '8', '9', '10']) {
+      expect(isValidMove(0, 0, card(rank), pegs)).toBe(false);
+    }
+  });
+
+  it('rejects starting when own peg occupies the come-out spot', () => {
+    const pegs = pegState([[0, 1, onTrack(getStartPosition(0))]]);
+    expect(isValidMove(0, 0, card('A'), pegs)).toBe(false);
+  });
+
+  it('allows starting onto an opponent peg at the come-out spot (bump)', () => {
+    const pegs = pegState([[1, 0, onTrack(getStartPosition(0))]]);
+    expect(isValidMove(0, 0, card('A'), pegs)).toBe(true);
+  });
+});
+
+describe('isValidMove: track movement', () => {
+  it('allows a simple forward move', () => {
+    const pegs = pegState([[0, 0, onTrack(20)]]);
+    expect(isValidMove(0, 0, card('5'), pegs)).toBe(true);
+  });
+
+  it('moves backward with an 8', () => {
+    const pegs = pegState([[0, 0, onTrack(20)]]);
+    expect(isValidMove(0, 0, card('8'), pegs)).toBe(true);
+    const { newPegs } = applyMove(0, 0, card('8'), null, pegs);
+    expect(newPegs[0][0].position).toBe(12);
+  });
+
+  it('wraps backward moves around position 0', () => {
+    const pegs = pegState([[0, 0, onTrack(5)]]);
+    const { newPegs } = applyMove(0, 0, card('8'), null, pegs);
+    expect(newPegs[0][0].position).toBe(69);
+  });
+
+  it('rejects landing on your own peg', () => {
+    const pegs = pegState([[0, 0, onTrack(20)], [0, 1, onTrack(25)]]);
+    expect(isValidMove(0, 0, card('5'), pegs)).toBe(false);
+  });
+
+  it('rejects jumping over your own peg', () => {
+    const pegs = pegState([[0, 0, onTrack(20)], [0, 1, onTrack(22)]]);
+    expect(isValidMove(0, 0, card('5'), pegs)).toBe(false);
+  });
+
+  it('rejects jumping over your own peg when moving backward', () => {
+    const pegs = pegState([[0, 0, onTrack(20)], [0, 1, onTrack(15)]]);
+    expect(isValidMove(0, 0, card('8'), pegs)).toBe(false);
+  });
+
+  it('allows landing on an opponent peg (bump)', () => {
+    const pegs = pegState([[0, 0, onTrack(20)], [1, 0, onTrack(25)]]);
+    expect(isValidMove(0, 0, card('5'), pegs)).toBe(true);
+  });
+
+  it('allows jumping over opponent pegs', () => {
+    const pegs = pegState([[0, 0, onTrack(20)], [1, 0, onTrack(22)]]);
+    expect(isValidMove(0, 0, card('5'), pegs)).toBe(true);
+  });
+
+  it('rejects a 9 played without a split amount', () => {
+    const pegs = pegState([[0, 0, onTrack(20)]]);
+    expect(isValidMove(0, 0, card('9'), pegs)).toBe(false);
+    expect(isValidMove(0, 0, card('9'), pegs, 4)).toBe(true);
+    expect(isValidMove(0, 0, card('9'), pegs, -5)).toBe(true);
+  });
+});
+
+describe('isValidMove: home entry and home movement', () => {
+  // Player 0's home entry point is track position 4 (one past entrance 3)
+
+  it('enters home when passing the entry point with an exact fit', () => {
+    // From 0, a 5 reaches entry point (4) in 4 steps, then 1 step into home
+    const pegs = pegState([[0, 0, onTrack(0)]]);
+    expect(isValidMove(0, 0, card('5'), pegs)).toBe(true);
+    const { newPegs } = applyMove(0, 0, card('5'), null, pegs);
+    expect(newPegs[0][0]).toMatchObject({ location: 'home', homePosition: 1 });
+  });
+
+  it('continues on track when the move would overshoot the home corridor', () => {
+    // From 0, a 10 would need home position 6 - overshoots, stays on track
+    const pegs = pegState([[0, 0, onTrack(0)]]);
+    const { newPegs } = applyMove(0, 0, card('10'), null, pegs);
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: 10 });
+  });
+
+  it('continues on track when the home destination is occupied', () => {
+    const pegs = pegState([[0, 0, onTrack(0)], [0, 1, inHome(1)]]);
+    expect(isValidMove(0, 0, card('5'), pegs)).toBe(true);
+    const { newPegs } = applyMove(0, 0, card('5'), null, pegs);
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: 5 });
+  });
+
+  it('rejects entering home past your own peg in the corridor', () => {
+    // Entering at home position 1 would jump over own peg at home 0
+    const pegs = pegState([[0, 0, onTrack(0)], [0, 1, inHome(0)]]);
+    const { newPegs } = applyMove(0, 0, card('5'), null, pegs);
+    expect(newPegs[0][0].location).toBe('track'); // fell through to track move
+  });
+
+  it('does not enter an opponent home corridor', () => {
+    // Player 1 peg passing player 0's entry point stays on track
+    const pegs = pegState([[1, 0, onTrack(0)]]);
+    const { newPegs } = applyMove(1, 0, card('5'), null, pegs);
+    expect(newPegs[1][0]).toMatchObject({ location: 'track', position: 5 });
+  });
+
+  it('moves forward within home with an exact fit only', () => {
+    const pegs = pegState([[0, 0, inHome(0)]]);
+    expect(isValidMove(0, 0, card('4'), pegs)).toBe(true);
+    expect(isValidMove(0, 0, card('5'), pegs)).toBe(false); // overshoots position 4
+  });
+
+  it('rejects landing on or jumping over your own peg in home', () => {
+    const pegs = pegState([[0, 0, inHome(0)], [0, 1, inHome(2)]]);
+    expect(isValidMove(0, 0, card('2'), pegs)).toBe(false); // lands on it
+    expect(isValidMove(0, 0, card('3'), pegs)).toBe(false); // jumps over it
+  });
+
+  it('rejects backward cards and jokers in home', () => {
+    const pegs = pegState([[0, 0, inHome(2)], [1, 0, onTrack(30)]]);
+    expect(isValidMove(0, 0, card('8'), pegs)).toBe(false);
+    expect(isValidMove(0, 0, card('JOKER'), pegs)).toBe(false);
+  });
+
+  it('allows only forward amounts for a 9 in home', () => {
+    const pegs = pegState([[0, 0, inHome(0)]]);
+    expect(isValidMove(0, 0, card('9'), pegs, 3)).toBe(true);
+    expect(isValidMove(0, 0, card('9'), pegs, -3)).toBe(false);
+    expect(isValidMove(0, 0, card('9'), pegs)).toBe(false);
+  });
+});
+
+describe('isValidMove: joker', () => {
+  it('is valid from start or track when an opponent is on the track', () => {
+    const pegs = pegState([[0, 0, onTrack(20)], [1, 0, onTrack(40)]]);
+    expect(isValidMove(0, 0, card('JOKER'), pegs)).toBe(true); // from track
+    expect(isValidMove(0, 1, card('JOKER'), pegs)).toBe(true); // from start
+  });
+
+  it('is invalid when no opponent peg is on the track', () => {
+    const pegs = pegState([[0, 0, onTrack(20)], [1, 0, inHome(0)]]);
+    expect(isValidMove(0, 0, card('JOKER'), pegs)).toBe(false);
+  });
+});
+
+describe('applyMove', () => {
+  it('does not mutate the input peg state', () => {
+    const pegs = pegState([[0, 0, onTrack(20)]]);
+    applyMove(0, 0, card('5'), null, pegs);
+    expect(pegs[0][0].position).toBe(20);
+  });
+
+  it('wraps forward moves around the track', () => {
+    const pegs = pegState([[1, 0, onTrack(70)]]);
+    const { newPegs } = applyMove(1, 0, card('5'), null, pegs);
+    expect(newPegs[1][0].position).toBe(3);
+  });
+
+  it('bumps an opponent peg back to start on landing', () => {
+    const pegs = pegState([[0, 0, onTrack(20)], [1, 0, onTrack(25)]]);
+    const { newPegs, bumpedOpponent } = applyMove(0, 0, card('5'), null, pegs);
+    expect(bumpedOpponent).toBe(true);
+    expect(newPegs[0][0].position).toBe(25);
+    expect(newPegs[1][0]).toMatchObject({ location: 'start', index: 0 });
+  });
+
+  it('starting a peg places it at the come-out spot and bumps an opponent there', () => {
+    const startPos = getStartPosition(0);
+    const pegs = pegState([[1, 0, onTrack(startPos)]]);
+    const { newPegs, bumpedOpponent } = applyMove(0, 0, card('K'), null, pegs);
+    expect(bumpedOpponent).toBe(true);
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: startPos });
+    expect(newPegs[1][0].location).toBe('start');
+  });
+
+  it('joker bumps an opponent and takes its spot', () => {
+    const pegs = pegState([[1, 2, onTrack(33)]]);
+    const { newPegs, bumpedOpponent } = applyMove(0, 0, card('JOKER'), null, pegs);
+    expect(bumpedOpponent).toBe(true);
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: 33 });
+    expect(newPegs[1][2].location).toBe('start');
+  });
+
+  it('advances within the home corridor', () => {
+    const pegs = pegState([[0, 0, inHome(1)]]);
+    const { newPegs } = applyMove(0, 0, card('3'), null, pegs);
+    expect(newPegs[0][0]).toMatchObject({ location: 'home', homePosition: 4 });
+  });
+});
+
+describe('checkWinner', () => {
+  it('returns null when no player has all pegs home', () => {
+    expect(checkWinner(pegState())).toBeNull();
+  });
+
+  it('returns the player index once all 5 pegs are home', () => {
+    const pegs = pegState([
+      [2, 0, inHome(0)], [2, 1, inHome(1)], [2, 2, inHome(2)], [2, 3, inHome(3)], [2, 4, inHome(4)]
+    ]);
+    expect(checkWinner(pegs)).toBe(2);
+  });
+});
+
+describe('hasAnyValidMove', () => {
+  it('is false with only number cards and all pegs in start', () => {
+    const pegs = pegState();
+    expect(hasAnyValidMove(0, [card('5'), card('2'), card('10')], pegs)).toBe(false);
+  });
+
+  it('is true when holding a start card with pegs in start', () => {
+    const pegs = pegState();
+    expect(hasAnyValidMove(0, [card('5'), card('A')], pegs)).toBe(true);
+  });
+
+  it('is true when a 9 has a legal forward/backward split', () => {
+    const pegs = pegState([[0, 0, onTrack(20)], [0, 1, onTrack(40)]]);
+    expect(hasAnyValidMove(0, [card('9')], pegs)).toBe(true);
+  });
+
+  it('detects a playable joker when an opponent is on the track', () => {
+    const pegs = pegState([[1, 0, onTrack(30)]]);
+    expect(hasAnyValidMove(0, [card('JOKER')], pegs)).toBe(true);
+  });
+
+  it('joker alone is not playable when opponents are all in start', () => {
+    const pegs = pegState();
+    expect(hasAnyValidMove(0, [card('JOKER')], pegs)).toBe(false);
+  });
+});
+
+describe('calculateMovePath', () => {
+  it('emits one step per space for a track move', () => {
+    const pegs = pegState([[0, 0, onTrack(20)]]);
+    const path = calculateMovePath(0, 0, card('5'), null, pegs);
+    expect(path).toHaveLength(5);
+    expect(path[path.length - 1]).toEqual({ type: 'track', position: 25 });
+  });
+
+  it('routes into home when entering the corridor', () => {
+    const pegs = pegState([[0, 0, onTrack(0)]]);
+    const path = calculateMovePath(0, 0, card('5'), null, pegs);
+    expect(path[path.length - 1]).toEqual({ type: 'home', position: 1 });
+  });
+
+  it('is empty for jokers (handled without step animation)', () => {
+    const pegs = pegState([[1, 0, onTrack(30)]]);
+    expect(calculateMovePath(0, 0, card('JOKER'), null, pegs)).toHaveLength(0);
+  });
+});
+
+describe('describeMoveAction', () => {
+  it('describes starting a peg', () => {
+    const desc = describeMoveAction({ location: 'start', index: 0 }, onTrack(8), card('A'), null);
+    expect(desc).toBe('Started a peg');
+  });
+
+  it('describes track and home transitions', () => {
+    expect(describeMoveAction(onTrack(20), onTrack(25), card('5'), null)).toBe('Space 20 to Space 25');
+    expect(describeMoveAction(onTrack(0), inHome(1), card('5'), null)).toBe('Space 0 to Home 1');
+    expect(describeMoveAction(inHome(1), inHome(4), card('3'), null)).toBe('Home 1 to Home 4');
+  });
+
+  it('describes a joker bump', () => {
+    expect(describeMoveAction({ location: 'start', index: 0 }, onTrack(33), card('JOKER'), null, 1)).toBe('Joker bumped Blue');
+  });
+});
+
+describe('findPegAtPosition', () => {
+  it('finds a track peg by position', () => {
+    const pegs = pegState([[2, 3, onTrack(50)]]);
+    expect(findPegAtPosition(50, pegs)).toEqual({ player: 2, pegIndex: 3 });
+  });
+
+  it('returns null for empty spaces and ignores start/home pegs', () => {
+    const pegs = pegState([[0, 0, inHome(2)]]);
+    expect(findPegAtPosition(10, pegs)).toBeNull();
+  });
+});
