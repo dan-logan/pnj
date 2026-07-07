@@ -21,6 +21,17 @@ import {
   findBumps
 } from './game/engine.js';
 import { findBestAIMove } from './game/ai.js';
+import {
+  loadStats,
+  saveStats,
+  resetStats,
+  recordGame,
+  winRate,
+  averageTurns,
+  bucketWinRate,
+  formatStreak,
+  getNemesis
+} from './game/stats.js';
 import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
 
 export default function PegsAndJokers() {
@@ -52,6 +63,20 @@ export default function PegsAndJokers() {
 
   // Sound / haptics
   const [soundOn, setSoundOn] = useState(() => !isMuted());
+
+  // Player statistics (persisted to localStorage)
+  const [stats, setStats] = useState(() => loadStats());
+  const [showStats, setShowStats] = useState(false);
+
+  // Per-game tallies, folded into stats when the game ends. Refs so updating
+  // them mid-turn never triggers a re-render.
+  const turnsRef = useRef(0); // completed player turns (transitions)
+  const prevTurnPlayerRef = useRef(null);
+  const jokersThisGameRef = useRef(0);
+  const bumpsDeliveredThisGameRef = useRef(0);
+  const timesBumpedThisGameRef = useRef(0);
+  const startModeRef = useRef('chosen'); // 'chosen' | 'random'
+  const gameRecordedRef = useRef(false); // guard against double-recording a win
 
   // Bump fly-back animation: { player, pegIndex, from: {x,y}, to: {x,y}, progress: 0-1 }
   const [bumpFx, setBumpFx] = useState(null);
@@ -98,16 +123,25 @@ export default function PegsAndJokers() {
       clearInterval(bumpFxRef.current);
       bumpFxRef.current = null;
     }
+    // Reset per-game stat tallies for the new game
+    turnsRef.current = 0;
+    prevTurnPlayerRef.current = null;
+    jokersThisGameRef.current = 0;
+    bumpsDeliveredThisGameRef.current = 0;
+    timesBumpedThisGameRef.current = 0;
+    gameRecordedRef.current = false;
     setShowFirstPlayerModal(false);
   }, []);
 
   const handleGoFirst = useCallback(() => {
     unlockAudio();
+    startModeRef.current = 'chosen';
     startGameWithPlayer(0);
   }, [startGameWithPlayer]);
 
   const handleRandomFirst = useCallback(() => {
     unlockAudio();
+    startModeRef.current = 'random';
     setIsSpinning(true);
 
     // Pre-select random player so spinner lands on them
@@ -203,9 +237,15 @@ export default function PegsAndJokers() {
 
   // Compare peg states around a move: if someone got bumped, play the bump
   // sound/haptic and fly the bumped peg back to its start slot.
-  const triggerMoveEffects = useCallback((oldPegs, updatedPegs) => {
+  const triggerMoveEffects = useCallback((oldPegs, updatedPegs, mover) => {
     const bumps = findBumps(oldPegs, updatedPegs);
     if (bumps.length === 0) return;
+
+    // Tally bumps for stats: pegs you sent home vs. your pegs sent home.
+    for (const b of bumps) {
+      if (mover === 0 && b.player !== 0) bumpsDeliveredThisGameRef.current += 1;
+      if (mover !== 0 && b.player === 0) timesBumpedThisGameRef.current += 1;
+    }
 
     sfx.bump();
     if (!animationsEnabled) return;
@@ -288,7 +328,7 @@ export default function PegsAndJokers() {
     const { newPegs } = applyMove(player, pegIndex, card, splitAmount, pegs);
     const newPeg = newPegs[player][pegIndex];
 
-    triggerMoveEffects(pegs, newPegs);
+    triggerMoveEffects(pegs, newPegs, player);
     if (newPeg.location === 'home') {
       sfx.home();
     } else {
@@ -388,7 +428,7 @@ export default function PegsAndJokers() {
     const { newPegs } = applyMove(currentPlayer, pegIndex, splitCard, amount, pegs);
     const newPeg = newPegs[currentPlayer][pegIndex];
 
-    triggerMoveEffects(pegs, newPegs);
+    triggerMoveEffects(pegs, newPegs, currentPlayer);
     if (newPeg.location === 'home') {
       sfx.home();
     } else {
@@ -506,7 +546,7 @@ export default function PegsAndJokers() {
       return updated;
     });
 
-    if (autoStarted) triggerMoveEffects(pegs, newPegs);
+    if (autoStarted) triggerMoveEffects(pegs, newPegs, player);
 
     setPegs(newPegs);
     setHands(newHands);
@@ -571,7 +611,7 @@ export default function PegsAndJokers() {
           return updated;
         });
 
-        triggerMoveEffects(pegs, newPegs);
+        triggerMoveEffects(pegs, newPegs, aiPlayer);
         sfx.peg();
 
         setPegs(newPegs);
@@ -695,6 +735,16 @@ export default function PegsAndJokers() {
     prevPlayerRef.current = currentPlayer;
   }, [currentPlayer, winner]);
 
+  // Count a completed turn each time control passes to a different player.
+  // The winning move doesn't switch players, so it's added on at record time.
+  useEffect(() => {
+    if (winner !== null) return;
+    if (prevTurnPlayerRef.current !== null && prevTurnPlayerRef.current !== currentPlayer) {
+      turnsRef.current += 1;
+    }
+    prevTurnPlayerRef.current = currentPlayer;
+  }, [currentPlayer, winner]);
+
   // Fanfare on win, descending tone on loss
   useEffect(() => {
     if (winner === null) return;
@@ -703,6 +753,26 @@ export default function PegsAndJokers() {
     } else {
       sfx.lose();
     }
+  }, [winner]);
+
+  // Fold the finished game into the persisted player stats exactly once.
+  useEffect(() => {
+    if (winner === null || gameRecordedRef.current) return;
+    gameRecordedRef.current = true;
+    const result = {
+      won: winner === 0,
+      winner,
+      turns: turnsRef.current + 1, // include the winning turn
+      startMode: startModeRef.current,
+      jokersPlayed: jokersThisGameRef.current,
+      bumpsDelivered: bumpsDeliveredThisGameRef.current,
+      timesBumped: timesBumpedThisGameRef.current
+    };
+    setStats(prev => {
+      const updated = recordGame(prev, result);
+      saveStats(updated);
+      return updated;
+    });
   }, [winner]);
 
   const selectedCardObj = selectedCard !== null ? hands[0]?.[selectedCard] ?? null : null;
@@ -848,7 +918,8 @@ export default function PegsAndJokers() {
       return updated;
     });
 
-    triggerMoveEffects(pegs, newPegs);
+    jokersThisGameRef.current += 1;
+    triggerMoveEffects(pegs, newPegs, 0);
 
     setPegs(newPegs);
 
@@ -1039,6 +1110,25 @@ export default function PegsAndJokers() {
           <div className="bg-gray-800 p-8 rounded-lg shadow-xl max-w-md w-full mx-4">
             <h2 className="text-2xl font-bold mb-6 text-center">Choose First Player</h2>
 
+            {!isSpinning && stats.gamesPlayed > 0 && (
+              <div className="grid grid-cols-3 gap-2 mb-6">
+                <div className="bg-gray-700 rounded-lg p-3 text-center">
+                  <div className="text-xl font-bold">{stats.gamesPlayed}</div>
+                  <div className="text-xs text-gray-400">Games</div>
+                </div>
+                <div className="bg-gray-700 rounded-lg p-3 text-center">
+                  <div className="text-xl font-bold">{Math.round(winRate(stats) * 100)}%</div>
+                  <div className="text-xs text-gray-400">Win rate</div>
+                </div>
+                <div className="bg-gray-700 rounded-lg p-3 text-center">
+                  <div className={`text-xl font-bold ${stats.currentStreak > 0 ? 'text-green-400' : stats.currentStreak < 0 ? 'text-red-400' : ''}`}>
+                    {formatStreak(stats.currentStreak)}
+                  </div>
+                  <div className="text-xs text-gray-400">Streak</div>
+                </div>
+              </div>
+            )}
+
             {!isSpinning ? (
               <div className="space-y-4">
                 <button
@@ -1080,6 +1170,159 @@ export default function PegsAndJokers() {
         </div>
       )}
 
+      {/* Player Stats Modal */}
+      {showStats && (
+        <div
+          className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4"
+          onClick={() => setShowStats(false)}
+        >
+          <div
+            className="bg-gray-800 rounded-lg shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex justify-between items-center p-6 pb-4 border-b border-gray-700 sticky top-0 bg-gray-800">
+              <h2 className="text-2xl font-bold">📊 Your Stats</h2>
+              <button
+                onClick={() => setShowStats(false)}
+                className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-lg leading-none"
+                aria-label="Close stats"
+              >
+                ✕
+              </button>
+            </div>
+
+            {stats.gamesPlayed === 0 ? (
+              <div className="p-8 text-center text-gray-400">
+                <p className="text-lg mb-2">No games played yet.</p>
+                <p className="text-sm">Finish a game and your stats will show up here.</p>
+              </div>
+            ) : (
+              <div className="p-6 space-y-6">
+                {/* Headline tiles */}
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="bg-gray-700 rounded-lg p-3 text-center">
+                    <div className="text-2xl font-bold">{stats.gamesPlayed}</div>
+                    <div className="text-xs text-gray-400 mt-1">Games</div>
+                  </div>
+                  <div className="bg-gray-700 rounded-lg p-3 text-center">
+                    <div className="text-2xl font-bold text-amber-400">{Math.round(winRate(stats) * 100)}%</div>
+                    <div className="text-xs text-gray-400 mt-1">Win rate</div>
+                  </div>
+                  <div className="bg-gray-700 rounded-lg p-3 text-center">
+                    <div className={`text-2xl font-bold ${stats.currentStreak > 0 ? 'text-green-400' : stats.currentStreak < 0 ? 'text-red-400' : ''}`}>
+                      {formatStreak(stats.currentStreak)}
+                    </div>
+                    <div className="text-xs text-gray-400 mt-1">Streak</div>
+                  </div>
+                </div>
+
+                {/* Record + form */}
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div className="flex justify-between bg-gray-700/50 rounded px-3 py-2">
+                    <span className="text-gray-400">Record (W–L)</span>
+                    <span className="font-semibold">{stats.wins}–{stats.losses}</span>
+                  </div>
+                  <div className="flex justify-between bg-gray-700/50 rounded px-3 py-2">
+                    <span className="text-gray-400">Longest win streak</span>
+                    <span className="font-semibold">{stats.longestWinStreak}</span>
+                  </div>
+                  <div className="flex justify-between bg-gray-700/50 rounded px-3 py-2">
+                    <span className="text-gray-400">Fastest win</span>
+                    <span className="font-semibold">
+                      {stats.fastestWinTurns !== null ? `${stats.fastestWinTurns} turns` : '—'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between bg-gray-700/50 rounded px-3 py-2">
+                    <span className="text-gray-400">Avg. game length</span>
+                    <span className="font-semibold">{Math.round(averageTurns(stats))} turns</span>
+                  </div>
+                </div>
+
+                {/* Aggression */}
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-300 mb-2">Aggression</h3>
+                  <div className="grid grid-cols-3 gap-3 text-center">
+                    <div className="bg-gray-700 rounded-lg p-3">
+                      <div className="text-xl font-bold">{stats.jokersPlayed}</div>
+                      <div className="text-xs text-gray-400 mt-1">Jokers played</div>
+                    </div>
+                    <div className="bg-gray-700 rounded-lg p-3">
+                      <div className="text-xl font-bold text-green-400">{stats.bumpsDelivered}</div>
+                      <div className="text-xs text-gray-400 mt-1">Pegs you bumped</div>
+                    </div>
+                    <div className="bg-gray-700 rounded-lg p-3">
+                      <div className="text-xl font-bold text-red-400">{stats.timesBumped}</div>
+                      <div className="text-xs text-gray-400 mt-1">Times bumped</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* First-player edge */}
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-300 mb-2">Does going first help?</h3>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div className="flex justify-between bg-gray-700/50 rounded px-3 py-2">
+                      <span className="text-gray-400">You first</span>
+                      <span className="font-semibold">
+                        {stats.chosenFirst.games > 0
+                          ? `${Math.round(bucketWinRate(stats.chosenFirst) * 100)}% (${stats.chosenFirst.games})`
+                          : '—'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between bg-gray-700/50 rounded px-3 py-2">
+                      <span className="text-gray-400">Random first</span>
+                      <span className="font-semibold">
+                        {stats.randomFirst.games > 0
+                          ? `${Math.round(bucketWinRate(stats.randomFirst) * 100)}% (${stats.randomFirst.games})`
+                          : '—'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Nemesis */}
+                {(() => {
+                  const nemesis = getNemesis(stats);
+                  if (!nemesis) return null;
+                  return (
+                    <div className="flex items-center justify-between bg-gray-700/50 rounded-lg px-4 py-3">
+                      <div>
+                        <div className="text-sm font-semibold text-gray-300">Nemesis</div>
+                        <div className="text-xs text-gray-400">Beats you most often</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span
+                          className="inline-block w-3 h-3 rounded-full"
+                          style={{ backgroundColor: PLAYER_COLORS[nemesis.player] }}
+                        />
+                        <span className="font-bold" style={{ color: PLAYER_COLORS[nemesis.player] }}>
+                          {PLAYER_NAMES[nemesis.player]}
+                        </span>
+                        <span className="text-gray-400 text-sm">({nemesis.losses})</span>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Reset */}
+                <div className="pt-2 border-t border-gray-700 text-right">
+                  <button
+                    onClick={() => {
+                      if (window.confirm('Reset all your stats? This cannot be undone.')) {
+                        setStats(resetStats());
+                      }
+                    }}
+                    className="text-sm text-gray-400 hover:text-red-400 underline"
+                  >
+                    Reset stats
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="max-w-5xl mx-auto">
         <div className="flex justify-between items-center mb-4">
           <h1 className="text-2xl font-bold">Pegs and Jokers</h1>
@@ -1105,6 +1348,12 @@ export default function PegsAndJokers() {
               }`}
             >
               {animationsEnabled ? 'Animations On' : 'Animations Off'}
+            </button>
+            <button
+              onClick={() => setShowStats(true)}
+              className="px-4 py-2 bg-indigo-600 rounded hover:bg-indigo-700"
+            >
+              📊 Stats
             </button>
             <button
               onClick={initGame}
