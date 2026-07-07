@@ -1,122 +1,31 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-
-const CARD_VALUES = {
-  'A': { value: 1, canStart: true },
-  '2': { value: 2, canStart: false },
-  '3': { value: 3, canStart: false },
-  '4': { value: 4, canStart: false },
-  '5': { value: 5, canStart: false },
-  '6': { value: 6, canStart: false },
-  '7': { value: 7, canStart: false, canSplit: true },
-  '8': { value: -8, canStart: false, backward: true },
-  '9': { value: 9, canStart: false, mustSplit: true },
-  '10': { value: 10, canStart: false },
-  'J': { value: 11, canStart: true },
-  'Q': { value: 12, canStart: true },
-  'K': { value: 13, canStart: true },
-  'JOKER': { value: 0, canStart: false, isJoker: true }
-};
-
-const SUITS = ['♠', '♥', '♦', '♣'];
-const TRACK_LENGTH = 72; // 18 spaces per side * 4 sides
-const PLAYER_COLORS = ['#F59E0B', '#3B82F6', '#EC4899', '#10B981'];
-const PLAYER_NAMES = ['Yellow', 'Blue', 'Pink', 'Green'];
-
-function createDeck() {
-  const deck = [];
-  for (let d = 0; d < 2; d++) {
-    for (const suit of SUITS) {
-      for (const rank of Object.keys(CARD_VALUES)) {
-        if (rank !== 'JOKER') {
-          deck.push({ rank, suit, id: `${rank}${suit}${d}` });
-        }
-      }
-    }
-    deck.push({ rank: 'JOKER', suit: '🃏', id: `JOKER1_${d}` });
-    deck.push({ rank: 'JOKER', suit: '🃏', id: `JOKER2_${d}` });
-  }
-  return shuffle(deck);
-}
-
-function shuffle(array) {
-  const arr = [...array];
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
-}
-
-function getStartPosition(player) {
-  return player * 18 + 8;  // Position 8 on each player's side, adjacent to start area
-}
-
-function getHomeEntrance(player) {
-  return player * 18 + 3;  // Position 3 on each player's side, where home area connects
-}
-
-// Calculate how far a peg is from being fully home (lower = closer to winning)
-function getDistanceToHome(peg, player) {
-  if (peg.location === 'home') {
-    // In home: distance is how many spots until position 4 (final spot)
-    return 4 - peg.homePosition;
-  }
-  if (peg.location === 'start') {
-    // In start: very far (need to get out + travel + enter home)
-    return 100;
-  }
-  // On track: calculate steps to home entry point
-  const homeEntrance = getHomeEntrance(player);
-  const homeEntryPoint = (homeEntrance + 1) % TRACK_LENGTH;
-  let stepsToEntry = (homeEntryPoint - peg.position + TRACK_LENGTH) % TRACK_LENGTH;
-  if (stepsToEntry === 0) stepsToEntry = TRACK_LENGTH; // At entry point, must go around
-  // Add 5 because after entering home, need to reach position 4
-  return stepsToEntry + 5;
-}
-
-// Generate a description of a move for the last move display
-function describeMoveAction(peg, newPeg, card, amount, bumpedPlayer = null) {
-  const cardInfo = CARD_VALUES[card.rank];
-
-  // Joker bump
-  if (cardInfo.isJoker && bumpedPlayer !== null) {
-    return `Joker bumped ${PLAYER_NAMES[bumpedPlayer]}`;
-  }
-
-  // Starting a peg
-  if (peg.location === 'start' && cardInfo.canStart) {
-    return 'Started a peg';
-  }
-
-  // Entering home from track
-  if (peg.location === 'track' && newPeg.location === 'home') {
-    return `Space ${peg.position} to Home ${newPeg.homePosition}`;
-  }
-
-  // Moving within home
-  if (peg.location === 'home' && newPeg.location === 'home') {
-    return `Home ${peg.homePosition} to Home ${newPeg.homePosition}`;
-  }
-
-  // Track movement
-  if (peg.location === 'track' && newPeg.location === 'track') {
-    return `Space ${peg.position} to Space ${newPeg.position}`;
-  }
-
-  return 'Moved';
-}
+import {
+  CARD_VALUES,
+  TRACK_LENGTH,
+  SPACES_PER_SIDE,
+  PLAYER_COLORS,
+  PLAYER_NAMES
+} from './game/constants.js';
+import { createDeck, drawCard } from './game/deck.js';
+import {
+  createInitialPegs,
+  getStartPosition,
+  describeMoveAction,
+  findPegAtPosition,
+  isValidMove,
+  hasAnyValidMove,
+  applyMove,
+  checkWinner,
+  calculateMovePath
+} from './game/engine.js';
+import { findBestAIMove } from './game/ai.js';
 
 export default function PegsAndJokers() {
   const [deck, setDeck] = useState([]);
   const [discardPiles, setDiscardPiles] = useState([[], [], [], []]); // Per-player discard piles
   const [stuckCounts, setStuckCounts] = useState([0, 0, 0, 0]); // Track stuck discards per player
   const [hands, setHands] = useState([[], [], [], []]);
-  const [pegs, setPegs] = useState([
-    Array(5).fill(null).map((_, i) => ({ location: 'start', index: i })),
-    Array(5).fill(null).map((_, i) => ({ location: 'start', index: i })),
-    Array(5).fill(null).map((_, i) => ({ location: 'start', index: i })),
-    Array(5).fill(null).map((_, i) => ({ location: 'start', index: i }))
-  ]);
+  const [pegs, setPegs] = useState(createInitialPegs);
   const [currentPlayer, setCurrentPlayer] = useState(0);
   const [selectedCard, setSelectedCard] = useState(null);
   const [selectedPeg, setSelectedPeg] = useState(null);
@@ -153,12 +62,7 @@ export default function PegsAndJokers() {
     setDiscardPiles([[], [], [], []]);
     setStuckCounts([0, 0, 0, 0]);
     setHands([hand1, hand2, hand3, hand4]);
-    setPegs([
-      Array(5).fill(null).map((_, i) => ({ location: 'start', index: i })),
-      Array(5).fill(null).map((_, i) => ({ location: 'start', index: i })),
-      Array(5).fill(null).map((_, i) => ({ location: 'start', index: i })),
-      Array(5).fill(null).map((_, i) => ({ location: 'start', index: i }))
-    ]);
+    setPegs(createInitialPegs());
     setCurrentPlayer(firstPlayer);
     setSelectedCard(null);
     setSelectedPeg(null);
@@ -241,464 +145,6 @@ export default function PegsAndJokers() {
     initGame();
   }, [initGame]);
 
-  const drawCard = useCallback((currentDeck, allDiscardPiles) => {
-    if (currentDeck.length === 0) {
-      // Combine all discard piles for reshuffling
-      const allDiscards = allDiscardPiles.flat();
-      if (allDiscards.length === 0) {
-        return { card: null, newDeck: [], newDiscardPiles: [[], [], [], []] };
-      }
-      const reshuffled = shuffle([...allDiscards]);
-      return { card: reshuffled.pop(), newDeck: reshuffled, newDiscardPiles: [[], [], [], []] };
-    }
-    const newDeck = [...currentDeck];
-    return { card: newDeck.pop(), newDeck, newDiscardPiles: allDiscardPiles };
-  }, []);
-
-  const findPegAtPosition = useCallback((position, playerPegs) => {
-    for (let p = 0; p < 4; p++) {
-      for (let i = 0; i < 5; i++) {
-        const peg = playerPegs[p][i];
-        if (peg.location === 'track' && peg.position === position) {
-          return { player: p, pegIndex: i };
-        }
-      }
-    }
-    return null;
-  }, []);
-
-  const isValidMove = useCallback((player, pegIndex, card, currentPegs, moveAmount = null) => {
-    const peg = currentPegs[player][pegIndex];
-    const cardInfo = CARD_VALUES[card.rank];
-    
-    // Handle pegs already in home - can only move forward within home
-    if (peg.location === 'home') {
-      // Can't use Joker or backward cards in home
-      if (cardInfo.isJoker || cardInfo.backward) return false;
-
-      // For 9 card (mustSplit), only allow positive (forward) splits - reject if no amount or backward
-      if (cardInfo.mustSplit && (moveAmount === null || moveAmount <= 0)) {
-        return false;
-      }
-
-      const amount = moveAmount !== null ? moveAmount : cardInfo.value;
-      if (amount <= 0) return false; // Can only move forward in home
-      
-      const newHomePos = peg.homePosition + amount;
-      // Must land exactly on a valid home position (0-4)
-      if (newHomePos > 4) return false;
-      
-      // Check if destination is occupied
-      const homeOccupied = currentPegs[player].some(
-        p => p.location === 'home' && p.homePosition === newHomePos
-      );
-      if (homeOccupied) return false;
-      
-      // Check if jumping over own peg in home
-      for (let pos = peg.homePosition + 1; pos < newHomePos; pos++) {
-        const blocked = currentPegs[player].some(
-          p => p.location === 'home' && p.homePosition === pos
-        );
-        if (blocked) return false;
-      }
-      
-      return true;
-    }
-    
-    if (peg.location === 'start') {
-      // Joker can also be used from start
-      if (cardInfo.isJoker) {
-        for (let p = 0; p < 4; p++) {
-          if (p === player) continue;
-          for (let i = 0; i < 5; i++) {
-            const otherPeg = currentPegs[p][i];
-            if (otherPeg.location === 'track') return true;
-          }
-        }
-        return false;
-      }
-      
-      // Check if own peg is already at come-out spot
-      if (cardInfo.canStart) {
-        const startPos = getStartPosition(player);
-        const ownPegAtStart = currentPegs[player].some(
-          p => p.location === 'track' && p.position === startPos
-        );
-        if (ownPegAtStart) return false;
-      }
-      
-      return cardInfo.canStart;
-    }
-    
-    if (cardInfo.isJoker) {
-      for (let p = 0; p < 4; p++) {
-        if (p === player) continue; // Can't bump own pegs
-        for (let i = 0; i < 5; i++) {
-          const otherPeg = currentPegs[p][i];
-          if (otherPeg.location === 'track') return true;
-        }
-      }
-      return false;
-    }
-
-    // For 9 card (mustSplit), moveAmount must be specified - cannot move a single peg 9 spaces
-    if (cardInfo.mustSplit && moveAmount === null) {
-      return false;
-    }
-
-    const amount = moveAmount !== null ? moveAmount : cardInfo.value;
-    const homeEntrance = getHomeEntrance(player);
-    const currentPos = peg.position;
-    
-    let newPos;
-    if (amount > 0) {
-      newPos = (currentPos + amount) % TRACK_LENGTH;
-    } else {
-      newPos = (currentPos + amount + TRACK_LENGTH) % TRACK_LENGTH;
-    }
-    
-    // Check if passing through home entrance (only for forward movement)
-    if (amount > 0) {
-      let stepsToHome = 0;
-      for (let step = 1; step <= amount; step++) {
-        const checkPos = (currentPos + step) % TRACK_LENGTH;
-        if (checkPos === (homeEntrance + 1) % TRACK_LENGTH && stepsToHome === 0) {
-          stepsToHome = step;
-        }
-      }
-      
-      if (stepsToHome > 0 && stepsToHome <= amount) {
-        const homeSteps = amount - stepsToHome;
-        
-        // Check if home position is valid (0-4)
-        if (homeSteps >= 0 && homeSteps < 5) {
-          // Check if destination home position is occupied
-          const homeOccupied = currentPegs[player].some(
-            p => p.location === 'home' && p.homePosition === homeSteps
-          );
-          if (homeOccupied) {
-            // Can't enter home here, will continue on track - check track move validity below
-          } else {
-            // Check if we'd jump over own pegs on track before home entrance
-            let trackBlocked = false;
-            for (let step = 1; step < stepsToHome; step++) {
-              const checkPos = (currentPos + step) % TRACK_LENGTH;
-              const pegAtCheck = findPegAtPosition(checkPos, currentPegs);
-              if (pegAtCheck && pegAtCheck.player === player) {
-                trackBlocked = true;
-                break;
-              }
-            }
-            
-            // Check if we'd jump over own pegs in home corridor
-            let homeBlocked = false;
-            for (let homePos = 0; homePos < homeSteps; homePos++) {
-              const blocked = currentPegs[player].some(
-                p => p.location === 'home' && p.homePosition === homePos
-              );
-              if (blocked) {
-                homeBlocked = true;
-                break;
-              }
-            }
-            
-            if (!trackBlocked && !homeBlocked) {
-              return true; // Valid home entry
-            }
-            // Otherwise, can't enter home - check if track move is valid below
-          }
-        }
-        // If homeSteps >= 5, we overshoot home - continue on track
-      }
-    }
-    
-    // Check if landing on own peg
-    const pegAtNewPos = findPegAtPosition(newPos, currentPegs);
-    if (pegAtNewPos && pegAtNewPos.player === player) {
-      return false;
-    }
-    
-    // Check if jumping over own peg
-    const direction = amount > 0 ? 1 : -1;
-    for (let step = direction; Math.abs(step) < Math.abs(amount); step += direction) {
-      const checkPos = (currentPos + step + TRACK_LENGTH) % TRACK_LENGTH;
-      const pegAtCheck = findPegAtPosition(checkPos, currentPegs);
-      if (pegAtCheck && pegAtCheck.player === player) {
-        return false;
-      }
-    }
-    
-    return true;
-  }, [findPegAtPosition]);
-
-  const hasAnyValidMove = useCallback((player, hand, currentPegs) => {
-    for (const card of hand) {
-      const cardInfo = CARD_VALUES[card.rank];
-      
-      for (let pegIndex = 0; pegIndex < 5; pegIndex++) {
-        // Check basic move
-        if (isValidMove(player, pegIndex, card, currentPegs)) {
-          return true;
-        }
-        
-        // Check 7 splits
-        if (cardInfo.canSplit) {
-          for (let split = 1; split <= 6; split++) {
-            if (isValidMove(player, pegIndex, card, currentPegs, split)) {
-              return true;
-            }
-          }
-        }
-        
-        // Check 9 splits (forward/backward combinations)
-        if (cardInfo.mustSplit) {
-          for (let split = 1; split <= 8; split++) {
-            if (isValidMove(player, pegIndex, card, currentPegs, split)) {
-              return true;
-            }
-            if (isValidMove(player, pegIndex, card, currentPegs, -split)) {
-              return true;
-            }
-          }
-        }
-      }
-      
-      // Check Joker - valid if any opponent has a peg on track
-      if (cardInfo.isJoker) {
-        const hasOpponentOnTrack = currentPegs.some((playerPegs, p) => 
-          p !== player && playerPegs.some(peg => peg.location === 'track')
-        );
-        const hasOwnPegToMove = currentPegs[player].some(peg => 
-          peg.location === 'start' || peg.location === 'track'
-        );
-        if (hasOpponentOnTrack && hasOwnPegToMove) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }, [isValidMove]);
-
-  const executeMoveInternal = useCallback((player, pegIndex, card, amount, currentPegs) => {
-    const newPegs = currentPegs.map(p => p.map(peg => ({ ...peg })));
-    const peg = newPegs[player][pegIndex];
-    const cardInfo = CARD_VALUES[card.rank];
-    
-    // Handle movement within home corridor
-    if (peg.location === 'home') {
-      const moveAmount = amount !== null ? amount : cardInfo.value;
-      peg.homePosition = peg.homePosition + moveAmount;
-      return { newPegs, bumpedOpponent: false };
-    }
-    
-    if (peg.location === 'start' && cardInfo.canStart) {
-      const startPos = getStartPosition(player);
-      const pegAtStart = findPegAtPosition(startPos, newPegs);
-      
-      // Safety check: can't start if own peg is at come-out spot
-      if (pegAtStart && pegAtStart.player === player) {
-        return { newPegs, bumpedOpponent: false };
-      }
-      
-      // Bump opponent peg if present
-      const bumpedOpponent = pegAtStart && pegAtStart.player !== player;
-      if (bumpedOpponent) {
-        newPegs[pegAtStart.player][pegAtStart.pegIndex] = { location: 'start', index: pegAtStart.pegIndex };
-      }
-      peg.location = 'track';
-      peg.position = startPos;
-      return { newPegs, bumpedOpponent };
-    }
-    
-    if (cardInfo.isJoker) {
-      // Find any opponent peg on track to bump
-      for (let p = 0; p < 4; p++) {
-        if (p === player) continue;
-        for (let i = 0; i < 5; i++) {
-          const otherPeg = newPegs[p][i];
-          if (otherPeg.location === 'track') {
-            const targetPos = otherPeg.position;
-            newPegs[p][i] = { location: 'start', index: i };
-            peg.location = 'track';
-            peg.position = targetPos;
-            return { newPegs, bumpedOpponent: true };
-          }
-        }
-      }
-      return { newPegs, bumpedOpponent: false };
-    }
-    
-    const homeEntrance = getHomeEntrance(player);
-    const currentPos = peg.position;
-    const moveAmount = amount !== null ? amount : cardInfo.value;
-    
-    // Check if we should enter home (only for forward movement)
-    let shouldEnterHome = false;
-    let homeSteps = 0;
-    
-    if (moveAmount > 0) {
-      let stepsToHome = 0;
-      for (let step = 1; step <= moveAmount; step++) {
-        const checkPos = (currentPos + step) % TRACK_LENGTH;
-        if (checkPos === (homeEntrance + 1) % TRACK_LENGTH && stepsToHome === 0) {
-          stepsToHome = step;
-        }
-      }
-      
-      if (stepsToHome > 0 && stepsToHome <= moveAmount) {
-        homeSteps = moveAmount - stepsToHome;
-        
-        if (homeSteps >= 0 && homeSteps < 5) {
-          // Check if destination home position is occupied
-          const homeOccupied = newPegs[player].some(
-            p => p.location === 'home' && p.homePosition === homeSteps
-          );
-          
-          if (!homeOccupied) {
-            // Check if we'd jump over own pegs on track before home entrance
-            let trackBlocked = false;
-            for (let step = 1; step < stepsToHome; step++) {
-              const checkPos = (currentPos + step) % TRACK_LENGTH;
-              const pegAtCheck = findPegAtPosition(checkPos, newPegs);
-              if (pegAtCheck && pegAtCheck.player === player) {
-                trackBlocked = true;
-                break;
-              }
-            }
-            
-            // Check if we'd jump over own pegs in home corridor
-            let homeBlocked = false;
-            for (let homePos = 0; homePos < homeSteps; homePos++) {
-              const blocked = newPegs[player].some(
-                p => p.location === 'home' && p.homePosition === homePos
-              );
-              if (blocked) {
-                homeBlocked = true;
-                break;
-              }
-            }
-            
-            if (!trackBlocked && !homeBlocked) {
-              shouldEnterHome = true;
-            }
-          }
-        }
-      }
-    }
-    
-    if (shouldEnterHome) {
-      peg.location = 'home';
-      peg.homePosition = homeSteps;
-      return { newPegs, bumpedOpponent: false };
-    }
-    
-    // Continue on track
-    let newPos;
-    if (moveAmount > 0) {
-      newPos = (currentPos + moveAmount) % TRACK_LENGTH;
-    } else {
-      newPos = (currentPos + moveAmount + TRACK_LENGTH) % TRACK_LENGTH;
-    }
-    
-    const pegAtNewPos = findPegAtPosition(newPos, newPegs);
-    if (pegAtNewPos && pegAtNewPos.player !== player) {
-      newPegs[pegAtNewPos.player][pegAtNewPos.pegIndex] = { location: 'start', index: pegAtNewPos.pegIndex };
-    }
-    
-    peg.position = newPos;
-    return { newPegs, bumpedOpponent: !!pegAtNewPos };
-  }, [findPegAtPosition]);
-
-  const checkWinner = useCallback((currentPegs) => {
-    for (let p = 0; p < 4; p++) {
-      if (currentPegs[p].every(peg => peg.location === 'home')) {
-        return p;
-      }
-    }
-    return null;
-  }, []);
-
-  // Calculate the path of positions a peg travels during a move
-  const calculateMovePath = useCallback((player, pegIndex, card, amount, currentPegs) => {
-    const peg = currentPegs[player][pegIndex];
-    const cardInfo = CARD_VALUES[card.rank];
-    const path = [];
-
-    // Starting from start area - just show appear at start position
-    if (peg.location === 'start' && cardInfo.canStart) {
-      const startPos = getStartPosition(player);
-      path.push({ type: 'track', position: startPos });
-      return path;
-    }
-
-    // Joker - we handle this separately (just appear at target)
-    if (cardInfo.isJoker) {
-      return path; // Empty path, handled specially
-    }
-
-    // Movement within home
-    if (peg.location === 'home') {
-      const moveAmount = amount !== null ? amount : cardInfo.value;
-      for (let step = 1; step <= moveAmount; step++) {
-        path.push({ type: 'home', position: peg.homePosition + step });
-      }
-      return path;
-    }
-
-    // Track movement
-    if (peg.location === 'track') {
-      const homeEntrance = getHomeEntrance(player);
-      const currentPos = peg.position;
-      const moveAmount = amount !== null ? amount : cardInfo.value;
-      const direction = moveAmount > 0 ? 1 : -1;
-
-      // Check if we'll enter home
-      let stepsToHome = 0;
-      if (moveAmount > 0) {
-        for (let step = 1; step <= moveAmount; step++) {
-          const checkPos = (currentPos + step) % TRACK_LENGTH;
-          if (checkPos === (homeEntrance + 1) % TRACK_LENGTH && stepsToHome === 0) {
-            stepsToHome = step;
-          }
-        }
-      }
-
-      // Check if home entry is valid
-      let willEnterHome = false;
-      let homeSteps = 0;
-      if (stepsToHome > 0 && stepsToHome <= moveAmount) {
-        homeSteps = moveAmount - stepsToHome;
-        if (homeSteps >= 0 && homeSteps < 5) {
-          const homeOccupied = currentPegs[player].some(
-            p => p.location === 'home' && p.homePosition === homeSteps
-          );
-          if (!homeOccupied) {
-            willEnterHome = true;
-          }
-        }
-      }
-
-      if (willEnterHome) {
-        // Animate to home entrance, then into home
-        for (let step = 1; step <= stepsToHome; step++) {
-          const pos = (currentPos + step) % TRACK_LENGTH;
-          path.push({ type: 'track', position: pos });
-        }
-        for (let step = 0; step <= homeSteps; step++) {
-          path.push({ type: 'home', position: step });
-        }
-      } else {
-        // Animate along track
-        for (let step = direction; Math.abs(step) <= Math.abs(moveAmount); step += direction) {
-          const pos = (currentPos + step + TRACK_LENGTH) % TRACK_LENGTH;
-          path.push({ type: 'track', position: pos });
-        }
-      }
-    }
-
-    return path;
-  }, []);
-
   // Run animation for a move, then call onComplete when done
   const animateMove = useCallback((player, pegIndex, card, amount, currentPegs, onComplete) => {
     const path = calculateMovePath(player, pegIndex, card, amount, currentPegs);
@@ -730,7 +176,7 @@ export default function PegsAndJokers() {
         setAnimatingPeg(prev => prev ? { ...prev, currentStep: step } : null);
       }
     }, 150); // 150ms per step
-  }, [calculateMovePath]);
+  }, []);
 
   const executeMove = useCallback((player, pegIndex, card, splitAmount = null) => {
     if (!isValidMove(player, pegIndex, card, pegs, splitAmount)) {
@@ -745,7 +191,7 @@ export default function PegsAndJokers() {
       const remaining = splitAmount > 0 ? -(9 - splitAmount) : (9 - Math.abs(splitAmount));
 
       // Simulate the first move to get the intermediate state
-      const { newPegs: afterFirstMove } = executeMoveInternal(player, pegIndex, card, splitAmount, pegs);
+      const { newPegs: afterFirstMove } = applyMove(player, pegIndex, card, splitAmount, pegs);
 
       // Check if there's at least one other peg that can make the second move
       let hasValidSecondPeg = false;
@@ -768,7 +214,7 @@ export default function PegsAndJokers() {
       const remaining = 7 - splitAmount;
 
       // Simulate the first move to get the intermediate state
-      const { newPegs: afterFirstMove } = executeMoveInternal(player, pegIndex, card, splitAmount, pegs);
+      const { newPegs: afterFirstMove } = applyMove(player, pegIndex, card, splitAmount, pegs);
 
       // Check if there's at least one OTHER peg that can make the second move
       let hasValidSecondPeg = false;
@@ -787,7 +233,7 @@ export default function PegsAndJokers() {
     }
 
     const oldPeg = pegs[player][pegIndex];
-    const { newPegs } = executeMoveInternal(player, pegIndex, card, splitAmount, pegs);
+    const { newPegs } = applyMove(player, pegIndex, card, splitAmount, pegs);
     const newPeg = newPegs[player][pegIndex];
 
     // Record last move description
@@ -822,35 +268,35 @@ export default function PegsAndJokers() {
       setGameMessage(`Move ${remaining} spaces ${direction} with another peg.`);
       return true;
     }
-    
+
     const w = checkWinner(newPegs);
     if (w !== null) {
       setWinner(w);
       return true;
     }
-    
+
     // Remove card from hand and draw new one
     const newHands = hands.map(h => [...h]);
     const cardIndex = newHands[player].findIndex(c => c.id === card.id);
     const discarded = newHands[player].splice(cardIndex, 1)[0];
-    
+
     // Add to player's discard pile
-    const newDiscardPiles = discardPiles.map((pile, i) => 
+    const newDiscardPiles = discardPiles.map((pile, i) =>
       i === player ? [...pile, discarded] : [...pile]
     );
-    
+
     const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
     if (newCard) newHands[player].push(newCard);
-    
+
     setHands(newHands);
     setDeck(newDeck);
     setDiscardPiles(updatedDiscardPiles);
-    
+
     // Reset stuck count on successful move
     const newStuckCounts = [...stuckCounts];
     newStuckCounts[player] = 0;
     setStuckCounts(newStuckCounts);
-    
+
     setSelectedCard(null);
     setSelectedPeg(null);
     setSplitRemaining(0);
@@ -861,9 +307,9 @@ export default function PegsAndJokers() {
     const nextPlayer = (player + 1) % 4;
     setCurrentPlayer(nextPlayer);
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
-    
+
     return true;
-  }, [isValidMove, pegs, executeMoveInternal, checkWinner, hands, deck, discardPiles, stuckCounts, drawCard]);
+  }, [pegs, hands, deck, discardPiles, stuckCounts]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
     // For both 7 and 9 cards, ensure different pegs are used
@@ -880,7 +326,7 @@ export default function PegsAndJokers() {
     }
 
     const oldPeg = pegs[currentPlayer][pegIndex];
-    const { newPegs } = executeMoveInternal(currentPlayer, pegIndex, splitCard, amount, pegs);
+    const { newPegs } = applyMove(currentPlayer, pegIndex, splitCard, amount, pegs);
     const newPeg = newPegs[currentPlayer][pegIndex];
 
     // Update last move description to show split completion
@@ -892,34 +338,34 @@ export default function PegsAndJokers() {
     });
 
     setPegs(newPegs);
-    
+
     const w = checkWinner(newPegs);
     if (w !== null) {
       setWinner(w);
       return true;
     }
-    
+
     const newHands = hands.map(h => [...h]);
     const cardIndex = newHands[currentPlayer].findIndex(c => c.id === splitCard.id);
     const discarded = newHands[currentPlayer].splice(cardIndex, 1)[0];
-    
+
     // Add to player's discard pile
-    const newDiscardPiles = discardPiles.map((pile, i) => 
+    const newDiscardPiles = discardPiles.map((pile, i) =>
       i === currentPlayer ? [...pile, discarded] : [...pile]
     );
-    
+
     const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
     if (newCard) newHands[currentPlayer].push(newCard);
-    
+
     setHands(newHands);
     setDeck(newDeck);
     setDiscardPiles(updatedDiscardPiles);
-    
+
     // Reset stuck count on successful move
     const newStuckCounts = [...stuckCounts];
     newStuckCounts[currentPlayer] = 0;
     setStuckCounts(newStuckCounts);
-    
+
     setSelectedCard(null);
     setSelectedPeg(null);
     setSplitRemaining(0);
@@ -928,29 +374,29 @@ export default function PegsAndJokers() {
     const nextPlayer = (currentPlayer + 1) % 4;
     setCurrentPlayer(nextPlayer);
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
-    
+
     return true;
-  }, [currentPlayer, splitCard, splitPegIndex, pegs, isValidMove, executeMoveInternal, checkWinner, hands, deck, discardPiles, stuckCounts, drawCard]);
+  }, [currentPlayer, splitCard, splitPegIndex, pegs, hands, deck, discardPiles, stuckCounts]);
 
   const discardAndDraw = useCallback((player, cardIndex = 0) => {
     if (hands[player].length === 0) return;
-    
+
     const newHands = hands.map(h => [...h]);
     // Use provided cardIndex for player selection, otherwise first card (for AI)
     const discarded = newHands[player].splice(cardIndex, 1)[0];
-    
+
     // Add to player's discard pile (face down for stuck discards - we track separately)
-    const newDiscardPiles = discardPiles.map((pile, i) => 
+    const newDiscardPiles = discardPiles.map((pile, i) =>
       i === player ? [...pile, discarded] : [...pile]
     );
-    
+
     const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
     if (newCard) newHands[player].push(newCard);
-    
+
     // Update stuck count
     const newStuckCounts = [...stuckCounts];
     newStuckCounts[player] = stuckCounts[player] + 1;
-    
+
     // After 3 stuck discards, allow player to start a peg (auto-start next peg)
     let newPegs = pegs;
     let autoStarted = false;
@@ -965,7 +411,7 @@ export default function PegsAndJokers() {
         const ownPegAtStart = pegs[player].some(p => p.location === 'track' && p.position === startPos);
 
         if (!ownPegAtStart) {
-          newPegs = pegs.map((playerPegs, i) => playerPegs.map(peg => ({ ...peg })));
+          newPegs = pegs.map((playerPegs) => playerPegs.map(peg => ({ ...peg })));
 
           // Bump opponent if present
           if (pegAtStart && pegAtStart.player !== player) {
@@ -986,7 +432,7 @@ export default function PegsAndJokers() {
       }
       newStuckCounts[player] = 0; // Reset even if no peg to start
     }
-    
+
     // Record last move description for discard
     setLastMoves(prev => {
       const updated = [...prev];
@@ -1002,7 +448,7 @@ export default function PegsAndJokers() {
     setSelectedCard(null);
     setSelectedPeg(null);
     setDiscardMode(false);
-    
+
     if (player === 0) {
       const nextPlayer = 1;
       setCurrentPlayer(nextPlayer);
@@ -1015,17 +461,17 @@ export default function PegsAndJokers() {
     } else {
       // AI player discarded - show message with stuck count, then advance player
       const nextPlayer = (player + 1) % 4;
-      
+
       if (newStuckCounts[player] === 0 && newPegs !== pegs) {
         setGameMessage(`${PLAYER_NAMES[player]} was stuck 3 turns and started a peg!`);
       } else {
         setGameMessage(`${PLAYER_NAMES[player]} discarded (stuck: ${newStuckCounts[player]}/3)`);
       }
-      
+
       // Set next player immediately to prevent useEffect from re-triggering
       setCurrentPlayer(nextPlayer);
       aiProcessingRef.current = false; // Allow next AI to process
-      
+
       // Delay the "thinking" message so discard message is visible
       setTimeout(() => {
         if (nextPlayer === 0) {
@@ -1034,20 +480,20 @@ export default function PegsAndJokers() {
         // If next is AI, the useEffect will set the message
       }, 1200);
     }
-  }, [hands, deck, discardPiles, stuckCounts, pegs, drawCard, findPegAtPosition]);
+  }, [hands, deck, discardPiles, stuckCounts, pegs]);
 
   // AI logic - handles players 1, 2, 3
   useEffect(() => {
     if (currentPlayer === 0 || winner !== null) return;
     if (aiProcessingRef.current) return; // Already processing this turn
-    
+
     aiProcessingRef.current = true;
     const aiPlayer = currentPlayer;
     const nextPlayer = (currentPlayer + 1) % 4;
-    
+
     const timer = setTimeout(() => {
       const aiHand = hands[aiPlayer];
-      
+
       // Helper function to complete AI move
       const completeAIMove = (newPegs, card, moveDescription) => {
         // Record last move description for AI
@@ -1058,35 +504,35 @@ export default function PegsAndJokers() {
         });
 
         setPegs(newPegs);
-        
+
         const newHands = hands.map(h => [...h]);
         const cardIndex = newHands[aiPlayer].findIndex(c => c.id === card.id);
         const discarded = newHands[aiPlayer].splice(cardIndex, 1)[0];
-        
+
         // Add to AI player's discard pile
-        const newDiscardPiles = discardPiles.map((pile, i) => 
+        const newDiscardPiles = discardPiles.map((pile, i) =>
           i === aiPlayer ? [...pile, discarded] : [...pile]
         );
-        
+
         const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
         if (newCard) newHands[aiPlayer].push(newCard);
-        
+
         setHands(newHands);
         setDeck(newDeck);
         setDiscardPiles(updatedDiscardPiles);
-        
+
         // Reset stuck count on successful move
         const newStuckCounts = [...stuckCounts];
         newStuckCounts[aiPlayer] = 0;
         setStuckCounts(newStuckCounts);
-        
+
         const w = checkWinner(newPegs);
         if (w !== null) {
           setWinner(w);
           aiProcessingRef.current = false;
           return true;
         }
-        
+
         setCurrentPlayer(nextPlayer);
         aiProcessingRef.current = false;
         if (nextPlayer === 0) {
@@ -1096,248 +542,11 @@ export default function PegsAndJokers() {
         }
         return false;
       };
-      
-      // Calculate total distance for all pegs (lower is better)
-      const getTotalDistance = (pegState) => {
-        return pegState[aiPlayer].reduce((sum, peg) => sum + getDistanceToHome(peg, aiPlayer), 0);
-      };
-      
-      // Calculate vulnerability penalty for a position (landing on opponent's come-out spot is risky)
-      const getVulnerabilityPenalty = (position, pegState) => {
-        let penalty = 0;
-        for (let p = 0; p < 4; p++) {
-          if (p === aiPlayer) continue;
-          const opponentStartPos = getStartPosition(p);
-          if (position === opponentStartPos) {
-            // Landing on opponent's come-out spot - they have ~30% chance to bump us back
-            penalty += 15;
-            // Extra penalty if opponent has pegs in start (more likely to use start card)
-            const opponentPegsInStart = pegState[p].filter(peg => peg.location === 'start').length;
-            penalty += opponentPegsInStart * 3;
-          }
-        }
-        return penalty;
-      };
-      
-      // Find all possible moves and score them
-      const possibleMoves = [];
-      
-      for (const card of aiHand) {
-        const cardInfo = CARD_VALUES[card.rank];
-        
-        // Try each peg
-        for (let pegIndex = 0; pegIndex < 5; pegIndex++) {
-          const peg = pegs[aiPlayer][pegIndex];
-          
-          // Skip pegs in final home position
-          if (peg.location === 'home' && peg.homePosition === 4) continue;
-          
-          // For non-split cards
-          if (!cardInfo.canSplit && !cardInfo.mustSplit && !cardInfo.isJoker) {
-            if (isValidMove(aiPlayer, pegIndex, card, pegs)) {
-              const { newPegs } = executeMoveInternal(aiPlayer, pegIndex, card, null, pegs);
-              const currentDist = getTotalDistance(pegs);
-              const newDist = getTotalDistance(newPegs);
-              const improvement = currentDist - newDist;
-              
-              // Calculate vulnerability penalty for landing position
-              const movedPeg = newPegs[aiPlayer][pegIndex];
-              const vulnPenalty = movedPeg.location === 'track' 
-                ? getVulnerabilityPenalty(movedPeg.position, newPegs) 
-                : 0;
-              
-              possibleMoves.push({
-                type: 'simple',
-                card,
-                pegIndex,
-                amount: null,
-                newPegs,
-                improvement,
-                // Bonus for moving pegs already in home deeper, minus vulnerability
-                bonus: (peg.location === 'home' ? 10 : 0) - vulnPenalty
-              });
-            }
-          }
-          
-          // For 7 card (can split forward)
-          if (cardInfo.canSplit) {
-            // Try full 7 first
-            if (isValidMove(aiPlayer, pegIndex, card, pegs, 7)) {
-              const { newPegs } = executeMoveInternal(aiPlayer, pegIndex, card, 7, pegs);
-              const improvement = getTotalDistance(pegs) - getTotalDistance(newPegs);
-              const movedPeg = newPegs[aiPlayer][pegIndex];
-              const vulnPenalty = movedPeg.location === 'track' 
-                ? getVulnerabilityPenalty(movedPeg.position, newPegs) 
-                : 0;
-              possibleMoves.push({
-                type: 'simple',
-                card,
-                pegIndex,
-                amount: 7,
-                newPegs,
-                improvement,
-                bonus: (peg.location === 'home' ? 10 : 0) - vulnPenalty
-              });
-            }
-            
-            // Try splits
-            for (let split = 1; split <= 6; split++) {
-              if (isValidMove(aiPlayer, pegIndex, card, pegs, split)) {
-                const { newPegs: afterFirst } = executeMoveInternal(aiPlayer, pegIndex, card, split, pegs);
-                const remaining = 7 - split;
-                
-                // Find another peg for the remaining
-                for (let secondPeg = 0; secondPeg < 5; secondPeg++) {
-                  if (secondPeg === pegIndex) continue;
-                  if (isValidMove(aiPlayer, secondPeg, card, afterFirst, remaining)) {
-                    const { newPegs: finalPegs } = executeMoveInternal(aiPlayer, secondPeg, card, remaining, afterFirst);
-                    const improvement = getTotalDistance(pegs) - getTotalDistance(finalPegs);
-                    
-                    // Calculate vulnerability for both moved pegs
-                    const peg1 = finalPegs[aiPlayer][pegIndex];
-                    const peg2 = finalPegs[aiPlayer][secondPeg];
-                    const vuln1 = peg1.location === 'track' ? getVulnerabilityPenalty(peg1.position, finalPegs) : 0;
-                    const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs) : 0;
-                    
-                    possibleMoves.push({
-                      type: 'split7',
-                      card,
-                      pegIndex,
-                      amount: split,
-                      secondPeg,
-                      remaining,
-                      newPegs: finalPegs,
-                      improvement,
-                      bonus: (pegs[aiPlayer][pegIndex].location === 'home' ? 10 : 0) + 
-                             (afterFirst[aiPlayer][secondPeg].location === 'home' ? 10 : 0) -
-                             vuln1 - vuln2
-                    });
-                  }
-                }
-              }
-            }
-          }
-          
-          // For 9 card (must split forward/backward)
-          if (cardInfo.mustSplit) {
-            for (let forward = 1; forward <= 8; forward++) {
-              const backward = -(9 - forward);
-              
-              // Try this peg forward
-              if (isValidMove(aiPlayer, pegIndex, card, pegs, forward)) {
-                const { newPegs: afterFirst } = executeMoveInternal(aiPlayer, pegIndex, card, forward, pegs);
-                
-                // Find another peg for backward
-                for (let secondPeg = 0; secondPeg < 5; secondPeg++) {
-                  if (secondPeg === pegIndex) continue;
-                  if (isValidMove(aiPlayer, secondPeg, card, afterFirst, backward)) {
-                    const { newPegs: finalPegs } = executeMoveInternal(aiPlayer, secondPeg, card, backward, afterFirst);
-                    const improvement = getTotalDistance(pegs) - getTotalDistance(finalPegs);
-                    
-                    // Calculate vulnerability for both moved pegs
-                    const peg1 = finalPegs[aiPlayer][pegIndex];
-                    const peg2 = finalPegs[aiPlayer][secondPeg];
-                    const vuln1 = peg1.location === 'track' ? getVulnerabilityPenalty(peg1.position, finalPegs) : 0;
-                    const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs) : 0;
-                    
-                    possibleMoves.push({
-                      type: 'split9',
-                      card,
-                      pegIndex,
-                      amount: forward,
-                      secondPeg,
-                      remaining: backward,
-                      newPegs: finalPegs,
-                      improvement,
-                      bonus: (pegs[aiPlayer][pegIndex].location === 'home' ? 10 : 0) - vuln1 - vuln2
-                    });
-                  }
-                }
-              }
-            }
-          }
-          
-          // For starting cards (A, J, Q, K) - try to get pegs out of start
-          if (cardInfo.canStart && peg.location === 'start') {
-            if (isValidMove(aiPlayer, pegIndex, card, pegs)) {
-              const { newPegs } = executeMoveInternal(aiPlayer, pegIndex, card, null, pegs);
-              const improvement = getTotalDistance(pegs) - getTotalDistance(newPegs);
-              const startPos = getStartPosition(aiPlayer);
-              const vulnPenalty = getVulnerabilityPenalty(startPos, newPegs);
-              possibleMoves.push({
-                type: 'start',
-                card,
-                pegIndex,
-                amount: null,
-                newPegs,
-                improvement,
-                bonus: -5 - vulnPenalty // Slight penalty vs advancing existing pegs, plus vulnerability
-              });
-            }
-          }
-          
-          // For Joker - bump opponent pegs
-          if (cardInfo.isJoker && (peg.location === 'start' || peg.location === 'track')) {
-            // Find opponent pegs to bump
-            for (let oppPlayer = 0; oppPlayer < 4; oppPlayer++) {
-              if (oppPlayer === aiPlayer) continue;
-              for (let oppPeg = 0; oppPeg < 5; oppPeg++) {
-                const opponentPeg = pegs[oppPlayer][oppPeg];
-                if (opponentPeg.location === 'track') {
-                  const targetPosition = opponentPeg.position;
-                  const newPegs = pegs.map(p => p.map(pg => ({ ...pg })));
-                  // Bump opponent
-                  newPegs[oppPlayer][oppPeg] = { location: 'start', index: oppPeg };
-                  // Move our peg there
-                  newPegs[aiPlayer][pegIndex].location = 'track';
-                  newPegs[aiPlayer][pegIndex].position = targetPosition;
-                  
-                  const improvement = getTotalDistance(pegs) - getTotalDistance(newPegs);
-                  
-                  // Calculate bonuses and penalties for Joker usage
-                  let jokerBonus = 5; // Base bonus for bumping
-                  
-                  // Bonus for bumping opponent who was close to home (more valuable disruption)
-                  const opponentDistToHome = getDistanceToHome(opponentPeg, oppPlayer);
-                  if (opponentDistToHome < 20) {
-                    jokerBonus += Math.floor((20 - opponentDistToHome) / 2);
-                  }
-                  
-                  // Heavy penalty for landing on the bumped player's come-out spot
-                  // They're very likely to have a start card since we just sent them back
-                  const oppStartPos = getStartPosition(oppPlayer);
-                  if (targetPosition === oppStartPos) {
-                    jokerBonus -= 30; // Major penalty - likely wastes the Joker
-                  }
-                  
-                  // General vulnerability penalty for other come-out spots
-                  const vulnPenalty = getVulnerabilityPenalty(targetPosition, newPegs);
-                  jokerBonus -= vulnPenalty;
-                  
-                  possibleMoves.push({
-                    type: 'joker',
-                    card,
-                    pegIndex,
-                    targetPlayer: oppPlayer,
-                    targetPeg: oppPeg,
-                    newPegs,
-                    improvement,
-                    bonus: jokerBonus
-                  });
-                }
-              }
-            }
-          }
-        }
-      }
-      
-      // Sort moves by improvement + bonus (higher is better)
-      possibleMoves.sort((a, b) => (b.improvement + b.bonus) - (a.improvement + a.bonus));
 
-      // Execute the best move
-      if (possibleMoves.length > 0) {
-        const bestMove = possibleMoves[0];
+      // Pick the best scored move for this hand
+      const bestMove = findBestAIMove(aiPlayer, aiHand, pegs);
 
+      if (bestMove) {
         // Generate move description based on move type
         const getMoveDescription = () => {
           const oldPeg = pegs[aiPlayer][bestMove.pegIndex];
@@ -1346,7 +555,7 @@ export default function PegsAndJokers() {
           if (bestMove.type === 'simple' || bestMove.type === 'start') {
             return describeMoveAction(oldPeg, newPeg, bestMove.card, bestMove.amount);
           } else if (bestMove.type === 'split7' || bestMove.type === 'split9') {
-            const afterFirst = executeMoveInternal(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
+            const afterFirst = applyMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
             const firstDesc = describeMoveAction(oldPeg, afterFirst[aiPlayer][bestMove.pegIndex], bestMove.card, bestMove.amount);
             const secondOldPeg = afterFirst[aiPlayer][bestMove.secondPeg];
             const secondNewPeg = bestMove.newPegs[aiPlayer][bestMove.secondPeg];
@@ -1376,7 +585,7 @@ export default function PegsAndJokers() {
           // Two-part animation for 7 split
           animateMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
             // After first animation, animate second peg
-            const afterFirstPegs = executeMoveInternal(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
+            const afterFirstPegs = applyMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
             animateMove(aiPlayer, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
               completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
             });
@@ -1385,7 +594,7 @@ export default function PegsAndJokers() {
           // Two-part animation for 9 split
           animateMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
             // After first animation, animate second peg
-            const afterFirstPegs = executeMoveInternal(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
+            const afterFirstPegs = applyMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
             animateMove(aiPlayer, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
               completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
             });
@@ -1400,23 +609,23 @@ export default function PegsAndJokers() {
       // No valid move, discard (discardAndDraw handles player transition for AI)
       discardAndDraw(aiPlayer);
     }, 800);
-    
+
     return () => {
       clearTimeout(timer);
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, isValidMove, executeMoveInternal, drawCard, checkWinner, discardAndDraw, animationsEnabled, animateMove]);
+  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove]);
 
   const handleCardClick = (cardIndex) => {
     if (currentPlayer !== 0 || winner !== null) return;
     if (splitRemaining !== 0) return;
-    
+
     // In discard mode, clicking a card discards it
     if (discardMode) {
       discardAndDraw(0, cardIndex);
       return;
     }
-    
+
     // Reset joker mode if selecting a different card
     if (jokerMode) {
       setJokerMode(false);
@@ -1428,7 +637,7 @@ export default function PegsAndJokers() {
 
   const handlePegClick = (player, pegIndex) => {
     if (currentPlayer !== 0 || winner !== null) return;
-    
+
     // In joker mode, clicking your own peg cancels the selection
     if (jokerMode && player === 0) {
       setJokerMode(false);
@@ -1437,9 +646,9 @@ export default function PegsAndJokers() {
       setGameMessage('Joker cancelled. Select a card and peg to move.');
       return;
     }
-    
+
     if (player !== 0) return;
-    
+
     if (splitRemaining !== 0) {
       // For 9 cards only, check if trying to use the same peg
       const cardInfo = CARD_VALUES[splitCard?.rank];
@@ -1450,16 +659,16 @@ export default function PegsAndJokers() {
       completeSplit(pegIndex, splitRemaining);
       return;
     }
-    
+
     if (selectedCard === null) {
       setGameMessage('Select a card first.');
       return;
     }
-    
+
     setSelectedPeg(pegIndex);
     const card = hands[0][selectedCard];
     const cardInfo = CARD_VALUES[card.rank];
-    
+
     // Handle Joker - enter selection mode for target
     if (cardInfo.isJoker) {
       setJokerMode(true);
@@ -1467,7 +676,7 @@ export default function PegsAndJokers() {
       setGameMessage('Now click an opponent\'s peg on the track to bump it.');
       return;
     }
-    
+
     if (cardInfo.canSplit && (pegs[0][pegIndex].location === 'track' || pegs[0][pegIndex].location === 'home')) {
       // For 7, show split options
       setGameMessage('Click Move button to use full 7, or select split amount.');
@@ -1482,20 +691,20 @@ export default function PegsAndJokers() {
   const handleJokerTarget = (targetPlayer, targetPegIndex) => {
     if (!jokerMode || jokerSourcePeg === null || selectedCard === null) return;
     if (targetPlayer === 0) return; // Can't target own pegs
-    
+
     const targetPeg = pegs[targetPlayer][targetPegIndex];
     if (targetPeg.location !== 'track') return; // Can only bump pegs on track
-    
+
     const card = hands[0][selectedCard];
-    
+
     // Execute the joker move
     const newPegs = pegs.map(p => p.map(peg => ({ ...peg })));
     const sourcePeg = newPegs[0][jokerSourcePeg];
     const targetPos = targetPeg.position;
-    
+
     // Bump opponent's peg back to start
     newPegs[targetPlayer][targetPegIndex] = { location: 'start', index: targetPegIndex };
-    
+
     // Move our peg to that position
     sourcePeg.location = 'track';
     sourcePeg.position = targetPos;
@@ -1508,41 +717,41 @@ export default function PegsAndJokers() {
     });
 
     setPegs(newPegs);
-    
+
     // Remove card from hand and draw new one
     const newHands = hands.map(h => [...h]);
     const cardIndex = newHands[0].findIndex(c => c.id === card.id);
     const discarded = newHands[0].splice(cardIndex, 1)[0];
-    
+
     // Add to player 0's discard pile
-    const newDiscardPiles = discardPiles.map((pile, i) => 
+    const newDiscardPiles = discardPiles.map((pile, i) =>
       i === 0 ? [...pile, discarded] : [...pile]
     );
-    
+
     const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
     if (newCard) newHands[0].push(newCard);
-    
+
     setHands(newHands);
     setDeck(newDeck);
     setDiscardPiles(updatedDiscardPiles);
-    
+
     // Reset stuck count on successful move
     const newStuckCounts = [...stuckCounts];
     newStuckCounts[0] = 0;
     setStuckCounts(newStuckCounts);
-    
+
     // Reset state
     setSelectedCard(null);
     setSelectedPeg(null);
     setJokerMode(false);
     setJokerSourcePeg(null);
-    
+
     const w = checkWinner(newPegs);
     if (w !== null) {
       setWinner(w);
       return;
     }
-    
+
     // Next player
     const nextPlayer = 1; // After player 0, always goes to player 1
     setCurrentPlayer(nextPlayer);
@@ -1557,7 +766,6 @@ export default function PegsAndJokers() {
 
   const BOARD_SIZE = 400;
   const MARGIN = 40;
-  const SPACES_PER_SIDE = 18;
 
   const getTrackPosition = (trackIndex) => {
     const side = Math.floor(trackIndex / SPACES_PER_SIDE);
@@ -1846,14 +1054,14 @@ export default function PegsAndJokers() {
                 playerPegs.map((peg, pegIndex) => {
                   // Skip pegs in start or home - they're rendered as filled circles
                   if (peg.location === 'start' || peg.location === 'home') return null;
-                  
+
                   let pos;
                   if (peg.location === 'track') {
                     pos = getTrackPosition(peg.position);
                   }
-                  
+
                   if (!pos) return null;
-                  
+
                   // In joker mode, only OPPONENT pegs on track are valid targets (not player 0)
                   const isJokerTarget = jokerMode && player !== 0 && peg.location === 'track';
                   const isJokerSource = jokerMode && player === 0 && pegIndex === jokerSourcePeg;
@@ -1861,7 +1069,7 @@ export default function PegsAndJokers() {
                   // or their own pegs in joker mode (to cancel)
                   const isClickable = currentPlayer === 0 && (player === 0 || isJokerTarget);
                   const isSelected = player === 0 && (pegIndex === selectedPeg || isJokerSource);
-                  
+
                   return (
                     <circle
                       key={`peg-${player}-${pegIndex}`}
@@ -1940,28 +1148,28 @@ export default function PegsAndJokers() {
                 const pos = positions[player];
                 const lastCard = discardPiles[player]?.[discardPiles[player].length - 1];
                 const stuckCount = stuckCounts[player];
-                
+
                 return (
                   <g key={`discard-${player}`}>
                     {/* Player's last played card (face up) */}
                     {lastCard ? (
                       <g>
                         <rect x={pos.x} y={pos.y} width="22" height="30" rx="2" fill="white" stroke={PLAYER_COLORS[player]} strokeWidth="1.5" />
-                        <text 
-                          x={pos.x + 11} 
-                          y={pos.y + 14} 
-                          textAnchor="middle" 
-                          fill={lastCard.suit === '♥' || lastCard.suit === '♦' ? '#DC2626' : '#1F2937'} 
-                          fontSize="8" 
+                        <text
+                          x={pos.x + 11}
+                          y={pos.y + 14}
+                          textAnchor="middle"
+                          fill={lastCard.suit === '♥' || lastCard.suit === '♦' ? '#DC2626' : '#1F2937'}
+                          fontSize="8"
                           fontWeight="bold"
                         >
                           {lastCard.rank}
                         </text>
-                        <text 
-                          x={pos.x + 11} 
-                          y={pos.y + 25} 
-                          textAnchor="middle" 
-                          fill={lastCard.suit === '♥' || lastCard.suit === '♦' ? '#DC2626' : '#1F2937'} 
+                        <text
+                          x={pos.x + 11}
+                          y={pos.y + 25}
+                          textAnchor="middle"
+                          fill={lastCard.suit === '♥' || lastCard.suit === '♦' ? '#DC2626' : '#1F2937'}
                           fontSize="9"
                         >
                           {lastCard.suit}
@@ -1970,17 +1178,17 @@ export default function PegsAndJokers() {
                     ) : (
                       <rect x={pos.x} y={pos.y} width="22" height="30" rx="2" fill="none" stroke={PLAYER_COLORS[player]} strokeWidth="1" strokeDasharray="3" opacity="0.5" />
                     )}
-                    
+
                     {/* Stuck counter (face down cards) - shows when player has discarded while stuck */}
                     {stuckCount > 0 && (
                       <g>
                         <rect x={pos.x + 26} y={pos.y} width="22" height="30" rx="2" fill="#7C3AED" stroke="#A78BFA" strokeWidth="2" />
-                        <text 
-                          x={pos.x + 37} 
-                          y={pos.y + 20} 
-                          textAnchor="middle" 
-                          fill="white" 
-                          fontSize="14" 
+                        <text
+                          x={pos.x + 37}
+                          y={pos.y + 20}
+                          textAnchor="middle"
+                          fill="white"
+                          fontSize="14"
                           fontWeight="bold"
                         >
                           {stuckCount}
