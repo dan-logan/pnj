@@ -21,11 +21,12 @@ The rules engine is pure JavaScript (no React), separated from the UI so it can 
 
 - **src/game/constants.js** - Card values, board dimensions (72-space track, 18 per side), player colors/names
 - **src/game/deck.js** - Deck creation (two 52-card decks + 4 jokers), shuffling, drawing with discard-pile reshuffle
-- **src/game/engine.js** - Move validation (`isValidMove`, `hasAnyValidMove`), move application (`applyMove`), win detection, animation paths. All functions take the peg state as an argument and return new state without mutating.
+- **src/game/engine.js** - Move validation (`isValidMove`, `hasAnyValidMove`), move application (`applyMove`), win detection, animation paths, UI affordances (`getValidDestinations`, `getMovablePegs`, `findBumps`). All functions take the peg state as an argument and return new state without mutating.
 - **src/game/ai.js** - AI move enumeration and scoring (`getPossibleMoves`, `findBestAIMove`); prioritizes moves that advance toward home, avoids vulnerable positions
-- **src/PegsAndJokers.jsx** - React component: game state via hooks, turn flow, input handlers, SVG board rendering
+- **src/audio.js** - Web Audio synth sound effects + `navigator.vibrate` haptics with a persisted mute setting; all no-ops outside a browser
+- **src/PegsAndJokers.jsx** - React component: game state via hooks, turn flow, input handlers, SVG board rendering. Move input is tap-driven: selecting a card glows the movable pegs (`getMovablePegs`), selecting a peg with a 7/9 renders tappable ghost destination circles (`getValidDestinations`)
 - **src/main.jsx** - React entry point
-- **src/index.css** - Tailwind imports only
+- **src/index.css** - Tailwind imports plus small keyframe animations for peg glow/ghost destinations
 
 Peg state shape: a 4-element array (one per player) of 5 peg objects, each `{ location: 'start' | 'track' | 'home', position?, homePosition?, index }`.
 

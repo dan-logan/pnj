@@ -433,6 +433,92 @@ export function applyMove(player, pegIndex, card, amount, currentPegs) {
   return { newPegs, bumpedOpponent: !!pegAtNewPos };
 }
 
+// Enumerate every legal landing spot for playing `card` with this peg.
+// Returns [{ amount, location: 'track'|'home', position? , homePosition? }] where
+// `amount` is the value to pass to the move executor (null = card's face value).
+// Split amounts (7s and 9s) are only included when another peg can complete the
+// split afterward. Jokers return [] — their targets are opponent pegs, not spaces.
+export function getValidDestinations(player, pegIndex, card, currentPegs) {
+  const cardInfo = CARD_VALUES[card.rank];
+  if (cardInfo.isJoker) return [];
+
+  const candidates = [];
+  if (cardInfo.canSplit) {
+    candidates.push(null); // full 7
+    for (let n = 1; n <= 6; n++) candidates.push(n);
+  } else if (cardInfo.mustSplit) {
+    for (let n = 1; n <= 8; n++) {
+      candidates.push(n);
+      candidates.push(-n);
+    }
+  } else {
+    candidates.push(null);
+  }
+
+  const destinations = [];
+  const seen = new Set();
+  for (const amount of candidates) {
+    if (!isValidMove(player, pegIndex, card, currentPegs, amount)) continue;
+
+    if (amount !== null && (cardInfo.canSplit || cardInfo.mustSplit)) {
+      const remaining = cardInfo.canSplit
+        ? 7 - amount
+        : (amount > 0 ? -(9 - amount) : 9 - Math.abs(amount));
+      const { newPegs: afterFirst } = applyMove(player, pegIndex, card, amount, currentPegs);
+      let completable = false;
+      for (let second = 0; second < PEGS_PER_PLAYER; second++) {
+        if (second === pegIndex) continue;
+        if (isValidMove(player, second, card, afterFirst, remaining)) {
+          completable = true;
+          break;
+        }
+      }
+      if (!completable) continue;
+    }
+
+    const dest = applyMove(player, pegIndex, card, amount, currentPegs).newPegs[player][pegIndex];
+    const key = dest.location === 'home' ? `h${dest.homePosition}` : `t${dest.position}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    destinations.push(
+      dest.location === 'home'
+        ? { amount, location: 'home', homePosition: dest.homePosition }
+        : { amount, location: 'track', position: dest.position }
+    );
+  }
+  return destinations;
+}
+
+// Indices of the player's pegs that have at least one legal play with this card.
+export function getMovablePegs(player, card, currentPegs) {
+  const cardInfo = CARD_VALUES[card.rank];
+  const movable = [];
+  for (let i = 0; i < PEGS_PER_PLAYER; i++) {
+    if (cardInfo.isJoker) {
+      if (isValidMove(player, i, card, currentPegs)) movable.push(i);
+    } else if (getValidDestinations(player, i, card, currentPegs).length > 0) {
+      movable.push(i);
+    }
+  }
+  return movable;
+}
+
+// Diff two peg states and report pegs that were knocked from the track back to
+// start (i.e. bumped), with the track position they were bumped from.
+export function findBumps(oldPegs, newPegs) {
+  const bumps = [];
+  for (let p = 0; p < NUM_PLAYERS; p++) {
+    for (let i = 0; i < PEGS_PER_PLAYER; i++) {
+      const before = oldPegs[p][i];
+      const after = newPegs[p][i];
+      if (before.location === 'track' && after.location === 'start') {
+        bumps.push({ player: p, pegIndex: i, fromPosition: before.position });
+      }
+    }
+  }
+  return bumps;
+}
+
 export function checkWinner(currentPegs) {
   for (let p = 0; p < NUM_PLAYERS; p++) {
     if (currentPegs[p].every(peg => peg.location === 'home')) {

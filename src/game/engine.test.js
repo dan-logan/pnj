@@ -10,7 +10,10 @@ import {
   hasAnyValidMove,
   applyMove,
   checkWinner,
-  calculateMovePath
+  calculateMovePath,
+  getValidDestinations,
+  getMovablePegs,
+  findBumps
 } from './engine.js';
 
 const card = (rank, suit = '♠') => ({ rank, suit, id: `${rank}${suit}test` });
@@ -346,5 +349,144 @@ describe('findPegAtPosition', () => {
   it('returns null for empty spaces and ignores start/home pegs', () => {
     const pegs = pegState([[0, 0, inHome(2)]]);
     expect(findPegAtPosition(10, pegs)).toBeNull();
+  });
+});
+
+describe('getValidDestinations', () => {
+  it('gives a single face-value destination for a simple card on track', () => {
+    const pegs = pegState([[1, 0, onTrack(30)]]);
+    const dests = getValidDestinations(1, 0, card('5'), pegs);
+    expect(dests).toEqual([{ amount: null, location: 'track', position: 35 }]);
+  });
+
+  it('gives the backward destination for an 8, wrapping around 0', () => {
+    const pegs = pegState([[1, 0, onTrack(5)]]);
+    const dests = getValidDestinations(1, 0, card('8'), pegs);
+    expect(dests).toEqual([{ amount: null, location: 'track', position: 69 }]);
+  });
+
+  it('gives the come-out spot for a start card with a peg in start', () => {
+    const pegs = pegState();
+    const dests = getValidDestinations(1, 0, card('K'), pegs);
+    expect(dests).toEqual([{ amount: null, location: 'track', position: getStartPosition(1) }]);
+  });
+
+  it('is empty for a start card when own peg blocks the come-out spot', () => {
+    const pegs = pegState([[1, 1, onTrack(getStartPosition(1))]]);
+    expect(getValidDestinations(1, 0, card('K'), pegs)).toHaveLength(0);
+  });
+
+  it('offers only the full 7 when no second peg can complete a split', () => {
+    const pegs = pegState([[1, 0, onTrack(30)]]);
+    const dests = getValidDestinations(1, 0, card('7'), pegs);
+    expect(dests).toEqual([{ amount: null, location: 'track', position: 37 }]);
+  });
+
+  it('offers the full 7 plus all completable split amounts with two track pegs', () => {
+    const pegs = pegState([[1, 0, onTrack(30)], [1, 1, onTrack(50)]]);
+    const dests = getValidDestinations(1, 0, card('7'), pegs);
+    const amounts = dests.map(d => d.amount).sort((a, b) => (a ?? 7) - (b ?? 7));
+    expect(amounts).toEqual([1, 2, 3, 4, 5, 6, null]);
+    for (const d of dests) {
+      expect(d.position).toBe(30 + (d.amount ?? 7));
+    }
+  });
+
+  it('is empty for a 9 with only one peg out (split cannot be completed)', () => {
+    const pegs = pegState([[1, 0, onTrack(30)]]);
+    expect(getValidDestinations(1, 0, card('9'), pegs)).toHaveLength(0);
+  });
+
+  it('offers both forward and backward 9-split destinations with two pegs out', () => {
+    const pegs = pegState([[1, 0, onTrack(30)], [1, 1, onTrack(50)]]);
+    const dests = getValidDestinations(1, 0, card('9'), pegs);
+    const amounts = dests.map(d => d.amount);
+    expect(amounts).toContain(4);   // forward 4, other peg goes back 5
+    expect(amounts).toContain(-4);  // backward 4, other peg goes forward 5
+    for (const d of dests) {
+      expect(d.position).toBe(30 + d.amount);
+    }
+  });
+
+  it('handles home-corridor pegs (forward only, exact fit)', () => {
+    const pegs = pegState([[1, 0, inHome(0)]]);
+    expect(getValidDestinations(1, 0, card('4'), pegs))
+      .toEqual([{ amount: null, location: 'home', homePosition: 4 }]);
+    expect(getValidDestinations(1, 0, card('5'), pegs)).toHaveLength(0);
+  });
+
+  it('only offers forward 9-splits for a peg in home', () => {
+    const pegs = pegState([[1, 0, inHome(0)], [1, 1, onTrack(50)]]);
+    const dests = getValidDestinations(1, 0, card('9'), pegs);
+    expect(dests.length).toBeGreaterThan(0);
+    for (const d of dests) {
+      expect(d.amount).toBeGreaterThan(0);
+      expect(d.location).toBe('home');
+    }
+  });
+
+  it('returns [] for a joker (targets are pegs, not spaces)', () => {
+    const pegs = pegState([[0, 0, onTrack(10)], [1, 0, onTrack(30)]]);
+    expect(getValidDestinations(1, 0, card('JOKER'), pegs)).toHaveLength(0);
+  });
+
+  it('every returned amount passes isValidMove', () => {
+    const pegs = pegState([[1, 0, onTrack(30)], [1, 1, onTrack(36)], [2, 0, onTrack(33)]]);
+    for (const rank of ['5', '7', '8', '9', 'K']) {
+      for (const d of getValidDestinations(1, 0, card(rank), pegs)) {
+        expect(isValidMove(1, 0, card(rank), pegs, d.amount)).toBe(true);
+      }
+    }
+  });
+});
+
+describe('getMovablePegs', () => {
+  it('lists only pegs that can actually move with the card', () => {
+    // Peg 0 on track can move 5; pegs in start cannot use a 5
+    const pegs = pegState([[1, 0, onTrack(30)]]);
+    expect(getMovablePegs(1, card('5'), pegs)).toEqual([0]);
+  });
+
+  it('lists every start peg for a start card with an open come-out spot', () => {
+    const pegs = pegState();
+    expect(getMovablePegs(1, card('A'), pegs)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it('excludes pegs that cannot complete a mandatory 9 split', () => {
+    const pegs = pegState([[1, 0, onTrack(30)]]);
+    expect(getMovablePegs(1, card('9'), pegs)).toHaveLength(0);
+  });
+
+  it('for a joker, lists start and track pegs when an opponent is on track', () => {
+    const pegs = pegState([[0, 0, onTrack(10)], [1, 0, onTrack(30)], [1, 1, inHome(2)]]);
+    const movable = getMovablePegs(1, card('JOKER'), pegs);
+    expect(movable).toContain(0);       // track peg can be the joker source
+    expect(movable).toContain(2);       // start pegs too
+    expect(movable).not.toContain(1);   // home pegs cannot use a joker
+  });
+
+  it('for a joker, lists nothing when no opponent is on track', () => {
+    const pegs = pegState([[1, 0, onTrack(30)]]);
+    expect(getMovablePegs(1, card('JOKER'), pegs)).toHaveLength(0);
+  });
+});
+
+describe('findBumps', () => {
+  it('reports a peg bumped by landing on it, with its former position', () => {
+    const pegs = pegState([[1, 0, onTrack(30)], [2, 0, onTrack(35)]]);
+    const { newPegs } = applyMove(1, 0, card('5'), null, pegs);
+    expect(findBumps(pegs, newPegs)).toEqual([{ player: 2, pegIndex: 0, fromPosition: 35 }]);
+  });
+
+  it('reports nothing for a move that bumps no one', () => {
+    const pegs = pegState([[1, 0, onTrack(30)]]);
+    const { newPegs } = applyMove(1, 0, card('5'), null, pegs);
+    expect(findBumps(pegs, newPegs)).toHaveLength(0);
+  });
+
+  it('reports a joker bump', () => {
+    const pegs = pegState([[0, 0, onTrack(10)], [1, 0, onTrack(30)]]);
+    const { newPegs } = applyMove(1, 0, card('JOKER'), null, pegs);
+    expect(findBumps(pegs, newPegs)).toEqual([{ player: 0, pegIndex: 0, fromPosition: 10 }]);
   });
 });
