@@ -32,6 +32,8 @@ import {
   formatStreak,
   getNemesis
 } from './game/stats.js';
+import { loadGame, saveGame, clearGame } from './game/persistence.js';
+import InstallPrompt from './InstallPrompt.jsx';
 import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
 
 export default function PegsAndJokers() {
@@ -87,6 +89,11 @@ export default function PegsAndJokers() {
   const [isSpinning, setIsSpinning] = useState(false);
   const [spinningPlayer, setSpinningPlayer] = useState(0);
   const spinIntervalRef = useRef(null);
+
+  // Save/resume state. `pendingResume` holds a saved game found on load until
+  // the player chooses to resume it or start fresh.
+  const [pendingResume, setPendingResume] = useState(null);
+  const [showResumeModal, setShowResumeModal] = useState(false);
 
   const startGameWithPlayer = useCallback((firstPlayer) => {
     const newDeck = createDeck();
@@ -198,8 +205,66 @@ export default function PegsAndJokers() {
     setShowFirstPlayerModal(true);
   }, []);
 
+  // Restore an in-progress game from a saved snapshot. Resets transient UI
+  // state (selections, joker/discard modes) since those aren't persisted.
+  const applySavedGame = useCallback((saved) => {
+    setDeck(saved.deck);
+    setDiscardPiles(saved.discardPiles);
+    setStuckCounts(saved.stuckCounts);
+    setHands(saved.hands);
+    setPegs(saved.pegs);
+    setCurrentPlayer(saved.currentPlayer);
+    setWinner(null);
+    setSplitRemaining(saved.splitRemaining ?? 0);
+    setSplitCard(saved.splitCard ?? null);
+    setSplitPegIndex(saved.splitPegIndex ?? null);
+    setLastMoves(saved.lastMoves ?? [null, null, null, null]);
+    setMoveHistory(saved.moveHistory ?? []);
+
+    // Clear transient selection/interaction state.
+    setSelectedCard(null);
+    setSelectedPeg(null);
+    setJokerMode(false);
+    setJokerSourcePeg(null);
+    setDiscardMode(false);
+    setAnimatingPeg(null);
+    setBumpFx(null);
+
+    // Restore per-game stat tallies so a resumed game still records correctly.
+    const t = saved.tallies || {};
+    turnsRef.current = t.turns ?? 0;
+    jokersThisGameRef.current = t.jokersPlayed ?? 0;
+    bumpsDeliveredThisGameRef.current = t.bumpsDelivered ?? 0;
+    timesBumpedThisGameRef.current = t.timesBumped ?? 0;
+    startModeRef.current = t.startMode ?? 'chosen';
+    gameRecordedRef.current = false;
+
+    // Seed the turn/return trackers to the restored player so resuming doesn't
+    // count a spurious turn or fire a "your turn" chime.
+    prevTurnPlayerRef.current = saved.currentPlayer;
+    prevPlayerRef.current = saved.currentPlayer;
+    aiProcessingRef.current = false;
+
+    setGameMessage(
+      saved.currentPlayer === 0
+        ? 'Welcome back! Your turn — select a card and peg to move.'
+        : `${PLAYER_NAMES[saved.currentPlayer]} is thinking...`
+    );
+
+    setPendingResume(null);
+    setShowResumeModal(false);
+    setShowFirstPlayerModal(false);
+  }, []);
+
+  // On mount, offer to resume a saved game if one exists; otherwise start fresh.
   useEffect(() => {
-    initGame();
+    const saved = loadGame();
+    if (saved) {
+      setPendingResume(saved);
+      setShowResumeModal(true);
+    } else {
+      initGame();
+    }
   }, [initGame]);
 
   // Run animation for a move, then call onComplete when done
@@ -775,6 +840,41 @@ export default function PegsAndJokers() {
     });
   }, [winner]);
 
+  // Persist the in-progress game after every committed change so a mobile tab
+  // eviction (a phone call mid-game) doesn't lose it. Skip while a modal is up
+  // or before cards are dealt, and clear the save once the game is over so we
+  // never offer to resume a finished game.
+  useEffect(() => {
+    if (showFirstPlayerModal || showResumeModal) return;
+    if (!(hands[0]?.length > 0)) return; // no game in progress yet
+    if (winner !== null) {
+      clearGame();
+      return;
+    }
+    saveGame({
+      pegs,
+      hands,
+      deck,
+      discardPiles,
+      stuckCounts,
+      currentPlayer,
+      splitRemaining,
+      splitCard,
+      splitPegIndex,
+      lastMoves,
+      moveHistory,
+      turns: turnsRef.current,
+      jokersPlayed: jokersThisGameRef.current,
+      bumpsDelivered: bumpsDeliveredThisGameRef.current,
+      timesBumped: timesBumpedThisGameRef.current,
+      startMode: startModeRef.current,
+    });
+  }, [
+    pegs, hands, deck, discardPiles, stuckCounts, currentPlayer,
+    splitRemaining, splitCard, splitPegIndex, lastMoves, moveHistory,
+    winner, showFirstPlayerModal, showResumeModal,
+  ]);
+
   const selectedCardObj = selectedCard !== null ? hands[0]?.[selectedCard] ?? null : null;
 
   // Pegs the human can legally move right now (null = highlighting inactive).
@@ -1104,6 +1204,56 @@ export default function PegsAndJokers() {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-2 sm:p-4">
+      <InstallPrompt />
+
+      {/* Resume Saved Game Modal */}
+      {showResumeModal && pendingResume && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
+          <div className="bg-gray-800 p-8 rounded-lg shadow-xl max-w-md w-full mx-4">
+            <h2 className="text-2xl font-bold mb-3 text-center">Resume game?</h2>
+            <p className="text-center text-gray-300 mb-6">
+              You have a game in progress
+              {pendingResume.currentPlayer === 0 ? (
+                <> — it's <span className="font-semibold text-amber-400">your turn</span>.</>
+              ) : (
+                <>
+                  {' — '}
+                  <span
+                    className="font-semibold"
+                    style={{ color: PLAYER_COLORS[pendingResume.currentPlayer] }}
+                  >
+                    {PLAYER_NAMES[pendingResume.currentPlayer]}
+                  </span>{' '}
+                  is up next.
+                </>
+              )}
+            </p>
+            <div className="space-y-4">
+              <button
+                onClick={() => {
+                  unlockAudio();
+                  applySavedGame(pendingResume);
+                }}
+                className="w-full px-6 py-4 bg-amber-600 hover:bg-amber-700 rounded-lg text-lg font-semibold transition-colors"
+              >
+                Resume Game
+              </button>
+              <button
+                onClick={() => {
+                  clearGame();
+                  setPendingResume(null);
+                  setShowResumeModal(false);
+                  initGame();
+                }}
+                className="w-full px-6 py-4 bg-gray-600 hover:bg-gray-700 rounded-lg text-lg font-semibold transition-colors"
+              >
+                Start New Game
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* First Player Selection Modal */}
       {showFirstPlayerModal && (
         <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
