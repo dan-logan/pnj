@@ -26,3 +26,21 @@ export const HOME_SIZE = 5; // Home corridor positions 0-4
 export const HAND_SIZE = 6;
 export const PLAYER_COLORS = ['#F59E0B', '#3B82F6', '#EC4899', '#10B981'];
 export const PLAYER_NAMES = ['Yellow', 'Blue', 'Pink', 'Green'];
+
+// Game modes. Classic is the original 4-way free-for-all; partners pairs
+// players who sit opposite each other into two teams.
+export const GAME_MODES = { CLASSIC: 'classic', PARTNERS: 'partners' };
+
+// Teams for partner mode. Players sit opposite on the board (0 bottom vs 2 top,
+// 1 left vs 3 right), so partners are two apart: Yellow+Pink vs Blue+Green.
+export const TEAMS = [[0, 2], [1, 3]];
+
+// The partner of a given player (the teammate sitting across the board).
+export function getPartner(player) {
+  return (player + 2) % NUM_PLAYERS;
+}
+
+// True when two players are on the same team (including a player with itself).
+export function sameTeam(a, b) {
+  return a === b || getPartner(a) === b;
+}

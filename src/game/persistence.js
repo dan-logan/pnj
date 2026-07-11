@@ -9,7 +9,7 @@
 // render or a private-mode failure).
 
 export const SAVE_STORAGE_KEY = 'pnj:savedGame:v1';
-export const SAVE_VERSION = 1;
+export const SAVE_VERSION = 2;
 
 function resolveStorage(storage) {
   if (storage) return storage;
@@ -23,6 +23,7 @@ export function serializeGame(state) {
   return {
     version: SAVE_VERSION,
     savedAt: Date.now(),
+    mode: state.mode ?? 'classic',
     pegs: state.pegs,
     hands: state.hands,
     deck: state.deck,
@@ -48,7 +49,8 @@ export function serializeGame(state) {
 // True only for a snapshot that represents a live, resumable game.
 export function isResumable(saved) {
   if (!saved || typeof saved !== 'object') return false;
-  if (saved.version !== SAVE_VERSION) return false;
+  // Accept any known save version (v1 predates partner mode and loads as classic).
+  if (!(saved.version >= 1 && saved.version <= SAVE_VERSION)) return false;
   const { pegs, hands, deck, discardPiles, currentPlayer } = saved;
   if (!Array.isArray(pegs) || pegs.length !== 4) return false;
   if (!Array.isArray(hands) || hands.length !== 4) return false;

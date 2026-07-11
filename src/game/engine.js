@@ -9,7 +9,11 @@ import {
   NUM_PLAYERS,
   PEGS_PER_PLAYER,
   HOME_SIZE,
-  PLAYER_NAMES
+  PLAYER_NAMES,
+  GAME_MODES,
+  TEAMS,
+  getPartner,
+  sameTeam
 } from './constants.js';
 
 export function createInitialPegs() {
@@ -89,7 +93,91 @@ export function findPegAtPosition(position, playerPegs) {
   return null;
 }
 
-export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = null) {
+// Resolve where a bumped peg lands, mutating `newPegs` in place. Returns true on
+// success, false if the placement is illegal (so the whole originating move must
+// be rejected).
+//
+// Classic rule (or an opponent bump in partner mode): the peg goes back to its
+// start area. Partner rule: bumping a teammate's peg is a *friendly* bump that
+// sends it to the track space immediately before that owner's home corridor
+// (their home-entrance space), positioning it to go home. If that entrance space
+// is occupied by an opponent, the opponent is bumped by the same rule (cascade);
+// if it is occupied by one of that owner's own pegs, the friendly bump has
+// nowhere to go and the move is illegal — just like landing on your own peg.
+//
+// `reservedPos` is the track space the mover itself will occupy; a friendly bump
+// can never be sent there.
+function resolveDisplacement(newPegs, ownerP, idx, actor, mode, reservedPos, depth = 0) {
+  if (depth > 12) return false; // guard against a pathological cascade cycle
+  const friendly = mode === GAME_MODES.PARTNERS && sameTeam(ownerP, actor);
+  if (!friendly) {
+    newPegs[ownerP][idx] = { location: 'start', index: idx };
+    return true;
+  }
+  const target = getHomeEntrance(ownerP);
+  if (target === reservedPos) return false; // the mover is taking this space
+  // Detach the peg first so a cascade lookup can't treat it as blocking itself.
+  newPegs[ownerP][idx] = { location: 'start', index: idx };
+  const occ = findPegAtPosition(target, newPegs);
+  if (occ) {
+    if (occ.player === ownerP) return false; // this owner's own peg holds the entrance
+    if (!resolveDisplacement(newPegs, occ.player, occ.pegIndex, actor, mode, reservedPos, depth + 1)) {
+      return false;
+    }
+  }
+  newPegs[ownerP][idx] = { location: 'track', position: target, index: idx };
+  return true;
+}
+
+// True when the peg at `position` can be legally bumped by `actor` (used by
+// isValidMove). Opponent bumps are always legal; a friendly partner bump is only
+// illegal when its placement (or cascade) has nowhere to go.
+function canBumpPegAt(position, actor, mode, currentPegs, reservedPos) {
+  const occ = findPegAtPosition(position, currentPegs);
+  if (!occ) return true;
+  const clone = currentPegs.map(p => p.map(pg => ({ ...pg })));
+  return resolveDisplacement(clone, occ.player, occ.pegIndex, actor, mode, reservedPos);
+}
+
+// True when the joker has at least one legally bumpable target: any peg on the
+// track that is not the mover's own and whose bump (friendly or not) is legal.
+function hasLegalJokerTarget(owner, actor, mode, currentPegs) {
+  for (let p = 0; p < NUM_PLAYERS; p++) {
+    if (p === owner) continue; // can't bump the mover's own pegs
+    for (let i = 0; i < PEGS_PER_PLAYER; i++) {
+      const otherPeg = currentPegs[p][i];
+      if (otherPeg.location === 'track' &&
+          canBumpPegAt(otherPeg.position, actor, mode, currentPegs, otherPeg.position)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Apply a joker: the owner's peg jumps to `targetPlayer`/`targetPegIndex`'s
+// track space and that peg is bumped (friendly-bumped to its home entrance for a
+// teammate, back to start otherwise). Shared by the UI and AI so the partner rule
+// stays in one place. Returns { newPegs, bumped, bumpedPlayer }.
+export function applyJoker(owner, pegIndex, targetPlayer, targetPegIndex, currentPegs, options = {}) {
+  const { actor = owner, mode = GAME_MODES.CLASSIC } = options;
+  const newPegs = currentPegs.map(p => p.map(pg => ({ ...pg })));
+  const target = newPegs[targetPlayer][targetPegIndex];
+  if (target.location !== 'track') return { newPegs: currentPegs, bumped: false, bumpedPlayer: null };
+  const targetPos = target.position;
+
+  // Detach the mover during the cascade so it can't block a friendly placement,
+  // then drop it onto the vacated space.
+  const mover = newPegs[owner][pegIndex];
+  newPegs[owner][pegIndex] = { location: 'start', index: pegIndex };
+  const ok = resolveDisplacement(newPegs, targetPlayer, targetPegIndex, actor, mode, targetPos);
+  if (!ok) return { newPegs: currentPegs, bumped: false, bumpedPlayer: null };
+  newPegs[owner][pegIndex] = { ...mover, location: 'track', position: targetPos };
+  return { newPegs, bumped: true, bumpedPlayer: targetPlayer };
+}
+
+export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = null, options = {}) {
+  const { actor = player, mode = GAME_MODES.CLASSIC } = options;
   const peg = currentPegs[player][pegIndex];
   const cardInfo = CARD_VALUES[card.rank];
 
@@ -130,14 +218,7 @@ export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = nu
   if (peg.location === 'start') {
     // Joker can also be used from start
     if (cardInfo.isJoker) {
-      for (let p = 0; p < NUM_PLAYERS; p++) {
-        if (p === player) continue;
-        for (let i = 0; i < PEGS_PER_PLAYER; i++) {
-          const otherPeg = currentPegs[p][i];
-          if (otherPeg.location === 'track') return true;
-        }
-      }
-      return false;
+      return hasLegalJokerTarget(player, actor, mode, currentPegs);
     }
 
     // Check if own peg is already at come-out spot
@@ -147,20 +228,16 @@ export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = nu
         p => p.location === 'track' && p.position === startPos
       );
       if (ownPegAtStart) return false;
+      // A teammate on the come-out spot gets friendly-bumped; reject if that
+      // bump would be illegal (its home entrance is blocked by its own peg).
+      if (!canBumpPegAt(startPos, actor, mode, currentPegs, startPos)) return false;
     }
 
     return cardInfo.canStart;
   }
 
   if (cardInfo.isJoker) {
-    for (let p = 0; p < NUM_PLAYERS; p++) {
-      if (p === player) continue; // Can't bump own pegs
-      for (let i = 0; i < PEGS_PER_PLAYER; i++) {
-        const otherPeg = currentPegs[p][i];
-        if (otherPeg.location === 'track') return true;
-      }
-    }
-    return false;
+    return hasLegalJokerTarget(player, actor, mode, currentPegs);
   }
 
   // For 9 card (mustSplit), moveAmount must be specified - cannot move a single peg 9 spaces
@@ -239,6 +316,10 @@ export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = nu
   if (pegAtNewPos && pegAtNewPos.player === player) {
     return false;
   }
+  // Landing on a teammate friendly-bumps them; reject if that bump is illegal.
+  if (pegAtNewPos && !canBumpPegAt(newPos, actor, mode, currentPegs, newPos)) {
+    return false;
+  }
 
   // Check if jumping over own peg
   const direction = amount > 0 ? 1 : -1;
@@ -253,20 +334,20 @@ export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = nu
   return true;
 }
 
-export function hasAnyValidMove(player, hand, currentPegs) {
+export function hasAnyValidMove(player, hand, currentPegs, options = {}) {
   for (const card of hand) {
     const cardInfo = CARD_VALUES[card.rank];
 
     for (let pegIndex = 0; pegIndex < PEGS_PER_PLAYER; pegIndex++) {
       // Check basic move
-      if (isValidMove(player, pegIndex, card, currentPegs)) {
+      if (isValidMove(player, pegIndex, card, currentPegs, null, options)) {
         return true;
       }
 
       // Check 7 splits
       if (cardInfo.canSplit) {
         for (let split = 1; split <= 6; split++) {
-          if (isValidMove(player, pegIndex, card, currentPegs, split)) {
+          if (isValidMove(player, pegIndex, card, currentPegs, split, options)) {
             return true;
           }
         }
@@ -275,25 +356,23 @@ export function hasAnyValidMove(player, hand, currentPegs) {
       // Check 9 splits (forward/backward combinations)
       if (cardInfo.mustSplit) {
         for (let split = 1; split <= 8; split++) {
-          if (isValidMove(player, pegIndex, card, currentPegs, split)) {
+          if (isValidMove(player, pegIndex, card, currentPegs, split, options)) {
             return true;
           }
-          if (isValidMove(player, pegIndex, card, currentPegs, -split)) {
+          if (isValidMove(player, pegIndex, card, currentPegs, -split, options)) {
             return true;
           }
         }
       }
     }
 
-    // Check Joker - valid if any opponent has a peg on track
+    // Check Joker - valid if any legally bumpable peg is on the track
     if (cardInfo.isJoker) {
-      const hasOpponentOnTrack = currentPegs.some((playerPegs, p) =>
-        p !== player && playerPegs.some(peg => peg.location === 'track')
-      );
       const hasOwnPegToMove = currentPegs[player].some(peg =>
         peg.location === 'start' || peg.location === 'track'
       );
-      if (hasOpponentOnTrack && hasOwnPegToMove) {
+      if (hasOwnPegToMove &&
+          hasLegalJokerTarget(player, options.actor ?? player, options.mode ?? GAME_MODES.CLASSIC, currentPegs)) {
         return true;
       }
     }
@@ -303,7 +382,10 @@ export function hasAnyValidMove(player, hand, currentPegs) {
 
 // Apply a move to the peg state. Returns { newPegs, bumpedOpponent } without
 // mutating the input. Assumes the move has already been validated.
-export function applyMove(player, pegIndex, card, amount, currentPegs) {
+// `options.actor`/`options.mode` drive the partner friendly-bump rule; both
+// default to classic behavior (actor === owner, no friendly bumps).
+export function applyMove(player, pegIndex, card, amount, currentPegs, options = {}) {
+  const { actor = player, mode = GAME_MODES.CLASSIC } = options;
   const newPegs = currentPegs.map(p => p.map(peg => ({ ...peg })));
   const peg = newPegs[player][pegIndex];
   const cardInfo = CARD_VALUES[card.rank];
@@ -324,10 +406,10 @@ export function applyMove(player, pegIndex, card, amount, currentPegs) {
       return { newPegs, bumpedOpponent: false };
     }
 
-    // Bump opponent peg if present
+    // Bump the occupying peg if present (opponent → start, teammate → friendly).
     const bumpedOpponent = pegAtStart && pegAtStart.player !== player;
     if (bumpedOpponent) {
-      newPegs[pegAtStart.player][pegAtStart.pegIndex] = { location: 'start', index: pegAtStart.pegIndex };
+      resolveDisplacement(newPegs, pegAtStart.player, pegAtStart.pegIndex, actor, mode, startPos);
     }
     peg.location = 'track';
     peg.position = startPos;
@@ -335,17 +417,15 @@ export function applyMove(player, pegIndex, card, amount, currentPegs) {
   }
 
   if (cardInfo.isJoker) {
-    // Find any opponent peg on track to bump
+    // Bump the first legally bumpable peg on the track (opponent or teammate).
     for (let p = 0; p < NUM_PLAYERS; p++) {
       if (p === player) continue;
       for (let i = 0; i < PEGS_PER_PLAYER; i++) {
         const otherPeg = newPegs[p][i];
-        if (otherPeg.location === 'track') {
-          const targetPos = otherPeg.position;
-          newPegs[p][i] = { location: 'start', index: i };
-          peg.location = 'track';
-          peg.position = targetPos;
-          return { newPegs, bumpedOpponent: true };
+        if (otherPeg.location === 'track' &&
+            canBumpPegAt(otherPeg.position, actor, mode, newPegs, otherPeg.position)) {
+          const { newPegs: afterJoker, bumped } = applyJoker(player, pegIndex, p, i, newPegs, { actor, mode });
+          return { newPegs: afterJoker, bumpedOpponent: bumped };
         }
       }
     }
@@ -426,7 +506,11 @@ export function applyMove(player, pegIndex, card, amount, currentPegs) {
 
   const pegAtNewPos = findPegAtPosition(newPos, newPegs);
   if (pegAtNewPos && pegAtNewPos.player !== player) {
-    newPegs[pegAtNewPos.player][pegAtNewPos.pegIndex] = { location: 'start', index: pegAtNewPos.pegIndex };
+    // Detach the mover during the cascade so it can't block a friendly bump,
+    // then land it on the vacated space.
+    newPegs[player][pegIndex] = { location: 'start', index: pegIndex };
+    resolveDisplacement(newPegs, pegAtNewPos.player, pegAtNewPos.pegIndex, actor, mode, newPos);
+    newPegs[player][pegIndex] = peg;
   }
 
   peg.position = newPos;
@@ -438,7 +522,7 @@ export function applyMove(player, pegIndex, card, amount, currentPegs) {
 // `amount` is the value to pass to the move executor (null = card's face value).
 // Split amounts (7s and 9s) are only included when another peg can complete the
 // split afterward. Jokers return [] — their targets are opponent pegs, not spaces.
-export function getValidDestinations(player, pegIndex, card, currentPegs) {
+export function getValidDestinations(player, pegIndex, card, currentPegs, options = {}) {
   const cardInfo = CARD_VALUES[card.rank];
   if (cardInfo.isJoker) return [];
 
@@ -458,17 +542,17 @@ export function getValidDestinations(player, pegIndex, card, currentPegs) {
   const destinations = [];
   const seen = new Set();
   for (const amount of candidates) {
-    if (!isValidMove(player, pegIndex, card, currentPegs, amount)) continue;
+    if (!isValidMove(player, pegIndex, card, currentPegs, amount, options)) continue;
 
     if (amount !== null && (cardInfo.canSplit || cardInfo.mustSplit)) {
       const remaining = cardInfo.canSplit
         ? 7 - amount
         : (amount > 0 ? -(9 - amount) : 9 - Math.abs(amount));
-      const { newPegs: afterFirst } = applyMove(player, pegIndex, card, amount, currentPegs);
+      const { newPegs: afterFirst } = applyMove(player, pegIndex, card, amount, currentPegs, options);
       let completable = false;
       for (let second = 0; second < PEGS_PER_PLAYER; second++) {
         if (second === pegIndex) continue;
-        if (isValidMove(player, second, card, afterFirst, remaining)) {
+        if (isValidMove(player, second, card, afterFirst, remaining, options)) {
           completable = true;
           break;
         }
@@ -476,7 +560,7 @@ export function getValidDestinations(player, pegIndex, card, currentPegs) {
       if (!completable) continue;
     }
 
-    const dest = applyMove(player, pegIndex, card, amount, currentPegs).newPegs[player][pegIndex];
+    const dest = applyMove(player, pegIndex, card, amount, currentPegs, options).newPegs[player][pegIndex];
     const key = dest.location === 'home' ? `h${dest.homePosition}` : `t${dest.position}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -490,13 +574,13 @@ export function getValidDestinations(player, pegIndex, card, currentPegs) {
 }
 
 // Indices of the player's pegs that have at least one legal play with this card.
-export function getMovablePegs(player, card, currentPegs) {
+export function getMovablePegs(player, card, currentPegs, options = {}) {
   const cardInfo = CARD_VALUES[card.rank];
   const movable = [];
   for (let i = 0; i < PEGS_PER_PLAYER; i++) {
     if (cardInfo.isJoker) {
-      if (isValidMove(player, i, card, currentPegs)) movable.push(i);
-    } else if (getValidDestinations(player, i, card, currentPegs).length > 0) {
+      if (isValidMove(player, i, card, currentPegs, null, options)) movable.push(i);
+    } else if (getValidDestinations(player, i, card, currentPegs, options).length > 0) {
       movable.push(i);
     }
   }
@@ -519,11 +603,39 @@ export function findBumps(oldPegs, newPegs) {
   return bumps;
 }
 
-export function checkWinner(currentPegs) {
+// Diff two peg states for friendly partner bumps: a peg (other than the mover)
+// that was shoved forward on the track to its own home-entrance space. Returns
+// [{ player, pegIndex, fromPosition, toPosition }]. Used to animate the friendly
+// bump distinctly from a knock-back-to-start.
+export function findFriendlyBumps(oldPegs, newPegs, mover = null) {
+  const bumps = [];
   for (let p = 0; p < NUM_PLAYERS; p++) {
-    if (currentPegs[p].every(peg => peg.location === 'home')) {
-      return p;
+    for (let i = 0; i < PEGS_PER_PLAYER; i++) {
+      if (mover && mover.player === p && mover.pegIndex === i) continue;
+      const before = oldPegs[p][i];
+      const after = newPegs[p][i];
+      if (before.location === 'track' && after.location === 'track' &&
+          before.position !== after.position && after.position === getHomeEntrance(p)) {
+        bumps.push({ player: p, pegIndex: i, fromPosition: before.position, toPosition: after.position });
+      }
     }
+  }
+  return bumps;
+}
+
+// Winner detection. In classic mode returns the first player with all pegs home.
+// In partner mode returns the winning team index (0 or 1) once both partners have
+// all their pegs home, or null.
+export function checkWinner(currentPegs, mode = GAME_MODES.CLASSIC) {
+  const allHome = (p) => currentPegs[p].every(peg => peg.location === 'home');
+  if (mode === GAME_MODES.PARTNERS) {
+    for (let t = 0; t < TEAMS.length; t++) {
+      if (TEAMS[t].every(allHome)) return t;
+    }
+    return null;
+  }
+  for (let p = 0; p < NUM_PLAYERS; p++) {
+    if (allHome(p)) return p;
   }
   return null;
 }

@@ -4,21 +4,27 @@ import {
   TRACK_LENGTH,
   SPACES_PER_SIDE,
   PLAYER_COLORS,
-  PLAYER_NAMES
+  PLAYER_NAMES,
+  GAME_MODES,
+  getPartner,
+  sameTeam
 } from './game/constants.js';
 import { createDeck, drawCard } from './game/deck.js';
 import {
   createInitialPegs,
   getStartPosition,
+  getHomeEntrance,
   describeMoveAction,
   findPegAtPosition,
   isValidMove,
   applyMove,
+  applyJoker,
   checkWinner,
   calculateMovePath,
   getValidDestinations,
   getMovablePegs,
-  findBumps
+  findBumps,
+  findFriendlyBumps
 } from './game/engine.js';
 import { findBestAIMove } from './game/ai.js';
 import {
@@ -37,6 +43,7 @@ import InstallPrompt from './InstallPrompt.jsx';
 import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
 
 export default function PegsAndJokers() {
+  const [gameMode, setGameMode] = useState(GAME_MODES.CLASSIC);
   const [deck, setDeck] = useState([]);
   const [discardPiles, setDiscardPiles] = useState([[], [], [], []]); // Per-player discard piles
   const [stuckCounts, setStuckCounts] = useState([0, 0, 0, 0]); // Track stuck discards per player
@@ -94,6 +101,19 @@ export default function PegsAndJokers() {
   // the player chooses to resume it or start fresh.
   const [pendingResume, setPendingResume] = useState(null);
   const [showResumeModal, setShowResumeModal] = useState(false);
+
+  // In partner mode, once your own pegs are all home you play your hand on your
+  // partner's pegs; otherwise you always control your own (player 0). This is the
+  // "owner" of the pegs the human moves this turn.
+  const controlledOwnerFor = useCallback((pegState) => (
+    gameMode === GAME_MODES.PARTNERS && pegState[0].every(p => p.location === 'home')
+      ? getPartner(0)
+      : 0
+  ), [gameMode]);
+
+  // Options threaded into the engine so it applies the partner friendly-bump rule
+  // (the human always acts as player 0).
+  const moveOptions = useMemo(() => ({ actor: 0, mode: gameMode }), [gameMode]);
 
   const startGameWithPlayer = useCallback((firstPlayer) => {
     const newDeck = createDeck();
@@ -208,6 +228,7 @@ export default function PegsAndJokers() {
   // Restore an in-progress game from a saved snapshot. Resets transient UI
   // state (selections, joker/discard modes) since those aren't persisted.
   const applySavedGame = useCallback((saved) => {
+    setGameMode(saved.mode === GAME_MODES.PARTNERS ? GAME_MODES.PARTNERS : GAME_MODES.CLASSIC);
     setDeck(saved.deck);
     setDiscardPiles(saved.discardPiles);
     setStuckCounts(saved.stuckCounts);
@@ -302,27 +323,11 @@ export default function PegsAndJokers() {
 
   // Compare peg states around a move: if someone got bumped, play the bump
   // sound/haptic and fly the bumped peg back to its start slot.
-  const triggerMoveEffects = useCallback((oldPegs, updatedPegs, mover) => {
-    const bumps = findBumps(oldPegs, updatedPegs);
-    if (bumps.length === 0) return;
-
-    // Tally bumps for stats: pegs you sent home vs. your pegs sent home.
-    for (const b of bumps) {
-      if (mover === 0 && b.player !== 0) bumpsDeliveredThisGameRef.current += 1;
-      if (mover !== 0 && b.player === 0) timesBumpedThisGameRef.current += 1;
-    }
-
-    sfx.bump();
-    if (!animationsEnabled) return;
-
-    const bump = bumps[0];
-    const from = getTrackPosition(bump.fromPosition);
-    const to = getStartAreaPosition(bump.player, bump.pegIndex);
-
+  const runBumpFx = useCallback((player, pegIndex, from, to, kind) => {
     if (bumpFxRef.current) clearInterval(bumpFxRef.current);
     const steps = 14;
     let step = 0;
-    setBumpFx({ player: bump.player, pegIndex: bump.pegIndex, from, to, progress: 0 });
+    setBumpFx({ player, pegIndex, from, to, kind, progress: 0 });
     bumpFxRef.current = setInterval(() => {
       step++;
       if (step >= steps) {
@@ -333,10 +338,44 @@ export default function PegsAndJokers() {
         setBumpFx(prev => (prev ? { ...prev, progress: step / steps } : null));
       }
     }, 40);
-  }, [animationsEnabled]);
+  }, []);
 
-  const executeMove = useCallback((player, pegIndex, card, splitAmount = null) => {
-    if (!isValidMove(player, pegIndex, card, pegs, splitAmount)) {
+  // `mover` is the acting player (for stats); `moverPeg` is the peg that moved
+  // (so a friendly partner bump doesn't flag the mover itself).
+  const triggerMoveEffects = useCallback((oldPegs, updatedPegs, mover, moverPeg = null) => {
+    const bumps = findBumps(oldPegs, updatedPegs);
+    const friendly = gameMode === GAME_MODES.PARTNERS
+      ? findFriendlyBumps(oldPegs, updatedPegs, moverPeg)
+      : [];
+    if (bumps.length === 0 && friendly.length === 0) return;
+
+    // Tally bumps for stats: pegs you sent home vs. your pegs sent home. Friendly
+    // partner bumps are cooperative and don't count.
+    for (const b of bumps) {
+      if (mover === 0 && b.player !== 0) bumpsDeliveredThisGameRef.current += 1;
+      if (mover !== 0 && b.player === 0) timesBumpedThisGameRef.current += 1;
+    }
+
+    sfx.bump();
+    if (!animationsEnabled) return;
+
+    // Prefer animating a knock-back-to-start; otherwise fly a friendly bump forward.
+    if (bumps.length > 0) {
+      const bump = bumps[0];
+      runBumpFx(bump.player, bump.pegIndex, getTrackPosition(bump.fromPosition),
+        getStartAreaPosition(bump.player, bump.pegIndex), 'start');
+    } else {
+      const fb = friendly[0];
+      runBumpFx(fb.player, fb.pegIndex, getTrackPosition(fb.fromPosition),
+        getTrackPosition(fb.toPosition), 'friendly');
+    }
+  }, [animationsEnabled, gameMode, runBumpFx]);
+
+  // `owner` is whose peg moves (the human's partner once the human is all home);
+  // the human always acts as player 0, so the hand, discards and turn are theirs.
+  const executeMove = useCallback((owner, pegIndex, card, splitAmount = null) => {
+    const actor = 0;
+    if (!isValidMove(owner, pegIndex, card, pegs, splitAmount, moveOptions)) {
       setGameMessage('Invalid move. Try again.');
       return false;
     }
@@ -348,13 +387,13 @@ export default function PegsAndJokers() {
       const remaining = splitAmount > 0 ? -(9 - splitAmount) : (9 - Math.abs(splitAmount));
 
       // Simulate the first move to get the intermediate state
-      const { newPegs: afterFirstMove } = applyMove(player, pegIndex, card, splitAmount, pegs);
+      const { newPegs: afterFirstMove } = applyMove(owner, pegIndex, card, splitAmount, pegs, moveOptions);
 
       // Check if there's at least one other peg that can make the second move
       let hasValidSecondPeg = false;
       for (let secondPeg = 0; secondPeg < 5; secondPeg++) {
         if (secondPeg === pegIndex) continue; // Must use a different peg
-        if (isValidMove(player, secondPeg, card, afterFirstMove, remaining)) {
+        if (isValidMove(owner, secondPeg, card, afterFirstMove, remaining, moveOptions)) {
           hasValidSecondPeg = true;
           break;
         }
@@ -371,13 +410,13 @@ export default function PegsAndJokers() {
       const remaining = 7 - splitAmount;
 
       // Simulate the first move to get the intermediate state
-      const { newPegs: afterFirstMove } = applyMove(player, pegIndex, card, splitAmount, pegs);
+      const { newPegs: afterFirstMove } = applyMove(owner, pegIndex, card, splitAmount, pegs, moveOptions);
 
       // Check if there's at least one OTHER peg that can make the second move
       let hasValidSecondPeg = false;
       for (let secondPeg = 0; secondPeg < 5; secondPeg++) {
         if (secondPeg === pegIndex) continue; // Must use a different peg
-        if (isValidMove(player, secondPeg, card, afterFirstMove, remaining)) {
+        if (isValidMove(owner, secondPeg, card, afterFirstMove, remaining, moveOptions)) {
           hasValidSecondPeg = true;
           break;
         }
@@ -389,22 +428,22 @@ export default function PegsAndJokers() {
       }
     }
 
-    const oldPeg = pegs[player][pegIndex];
-    const { newPegs } = applyMove(player, pegIndex, card, splitAmount, pegs);
-    const newPeg = newPegs[player][pegIndex];
+    const oldPeg = pegs[owner][pegIndex];
+    const { newPegs } = applyMove(owner, pegIndex, card, splitAmount, pegs, moveOptions);
+    const newPeg = newPegs[owner][pegIndex];
 
-    triggerMoveEffects(pegs, newPegs, player);
+    triggerMoveEffects(pegs, newPegs, actor, { player: owner, pegIndex });
     if (newPeg.location === 'home') {
       sfx.home();
     } else {
       sfx.cardPlay();
     }
 
-    // Record last move description
+    // Record last move description (under the acting human)
     const moveDescription = describeMoveAction(oldPeg, newPeg, card, splitAmount);
     setLastMoves(prev => {
       const updated = [...prev];
-      updated[player] = moveDescription;
+      updated[actor] = moveDescription;
       return updated;
     });
 
@@ -433,24 +472,24 @@ export default function PegsAndJokers() {
       return true;
     }
 
-    const w = checkWinner(newPegs);
+    const w = checkWinner(newPegs, gameMode);
     if (w !== null) {
       setWinner(w);
       return true;
     }
 
-    // Remove card from hand and draw new one
+    // Remove card from the human's hand and draw new one
     const newHands = hands.map(h => [...h]);
-    const cardIndex = newHands[player].findIndex(c => c.id === card.id);
-    const discarded = newHands[player].splice(cardIndex, 1)[0];
+    const cardIndex = newHands[actor].findIndex(c => c.id === card.id);
+    const discarded = newHands[actor].splice(cardIndex, 1)[0];
 
-    // Add to player's discard pile
+    // Add to the human's discard pile
     const newDiscardPiles = discardPiles.map((pile, i) =>
-      i === player ? [...pile, discarded] : [...pile]
+      i === actor ? [...pile, discarded] : [...pile]
     );
 
     const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
-    if (newCard) newHands[player].push(newCard);
+    if (newCard) newHands[actor].push(newCard);
 
     setHands(newHands);
     setDeck(newDeck);
@@ -458,7 +497,7 @@ export default function PegsAndJokers() {
 
     // Reset stuck count on successful move
     const newStuckCounts = [...stuckCounts];
-    newStuckCounts[player] = 0;
+    newStuckCounts[actor] = 0;
     setStuckCounts(newStuckCounts);
 
     setSelectedCard(null);
@@ -468,14 +507,16 @@ export default function PegsAndJokers() {
     setSplitPegIndex(null);
 
     // Switch to next player
-    const nextPlayer = (player + 1) % 4;
+    const nextPlayer = (actor + 1) % 4;
     setCurrentPlayer(nextPlayer);
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
 
     return true;
-  }, [pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects]);
+  }, [pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, moveOptions, gameMode]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
+    const actor = 0;
+    const owner = controlledOwnerFor(pegs);
     // For both 7 and 9 cards, ensure different pegs are used
     const cardInfo = CARD_VALUES[splitCard?.rank];
     if ((cardInfo?.mustSplit || cardInfo?.canSplit) && pegIndex === splitPegIndex) {
@@ -484,16 +525,16 @@ export default function PegsAndJokers() {
       return false;
     }
 
-    if (!isValidMove(currentPlayer, pegIndex, splitCard, pegs, amount)) {
+    if (!isValidMove(owner, pegIndex, splitCard, pegs, amount, moveOptions)) {
       setGameMessage('Invalid move for split. Try again.');
       return false;
     }
 
-    const oldPeg = pegs[currentPlayer][pegIndex];
-    const { newPegs } = applyMove(currentPlayer, pegIndex, splitCard, amount, pegs);
-    const newPeg = newPegs[currentPlayer][pegIndex];
+    const oldPeg = pegs[owner][pegIndex];
+    const { newPegs } = applyMove(owner, pegIndex, splitCard, amount, pegs, moveOptions);
+    const newPeg = newPegs[owner][pegIndex];
 
-    triggerMoveEffects(pegs, newPegs, currentPlayer);
+    triggerMoveEffects(pegs, newPegs, actor, { player: owner, pegIndex });
     if (newPeg.location === 'home') {
       sfx.home();
     } else {
@@ -504,29 +545,29 @@ export default function PegsAndJokers() {
     const secondMoveDesc = describeMoveAction(oldPeg, newPeg, splitCard, amount);
     setLastMoves(prev => {
       const updated = [...prev];
-      updated[currentPlayer] = `Split: ${prev[currentPlayer]}, ${secondMoveDesc}`;
+      updated[actor] = `Split: ${prev[actor]}, ${secondMoveDesc}`;
       return updated;
     });
 
     setPegs(newPegs);
 
-    const w = checkWinner(newPegs);
+    const w = checkWinner(newPegs, gameMode);
     if (w !== null) {
       setWinner(w);
       return true;
     }
 
     const newHands = hands.map(h => [...h]);
-    const cardIndex = newHands[currentPlayer].findIndex(c => c.id === splitCard.id);
-    const discarded = newHands[currentPlayer].splice(cardIndex, 1)[0];
+    const cardIndex = newHands[actor].findIndex(c => c.id === splitCard.id);
+    const discarded = newHands[actor].splice(cardIndex, 1)[0];
 
-    // Add to player's discard pile
+    // Add to the human's discard pile
     const newDiscardPiles = discardPiles.map((pile, i) =>
-      i === currentPlayer ? [...pile, discarded] : [...pile]
+      i === actor ? [...pile, discarded] : [...pile]
     );
 
     const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
-    if (newCard) newHands[currentPlayer].push(newCard);
+    if (newCard) newHands[actor].push(newCard);
 
     setHands(newHands);
     setDeck(newDeck);
@@ -534,7 +575,7 @@ export default function PegsAndJokers() {
 
     // Reset stuck count on successful move
     const newStuckCounts = [...stuckCounts];
-    newStuckCounts[currentPlayer] = 0;
+    newStuckCounts[actor] = 0;
     setStuckCounts(newStuckCounts);
 
     setSelectedCard(null);
@@ -542,12 +583,12 @@ export default function PegsAndJokers() {
     setSplitRemaining(0);
     setSplitCard(null);
     setSplitPegIndex(null);
-    const nextPlayer = (currentPlayer + 1) % 4;
+    const nextPlayer = (actor + 1) % 4;
     setCurrentPlayer(nextPlayer);
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
 
     return true;
-  }, [currentPlayer, splitCard, splitPegIndex, pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects]);
+  }, [splitCard, splitPegIndex, pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode]);
 
   const discardAndDraw = useCallback((player, cardIndex = 0) => {
     if (hands[player].length === 0) return;
@@ -668,7 +709,7 @@ export default function PegsAndJokers() {
       const aiHand = hands[aiPlayer];
 
       // Helper function to complete AI move
-      const completeAIMove = (newPegs, card, moveDescription) => {
+      const completeAIMove = (newPegs, card, moveDescription, moverPeg = null) => {
         // Record last move description for AI
         setLastMoves(prev => {
           const updated = [...prev];
@@ -676,7 +717,7 @@ export default function PegsAndJokers() {
           return updated;
         });
 
-        triggerMoveEffects(pegs, newPegs, aiPlayer);
+        triggerMoveEffects(pegs, newPegs, aiPlayer, moverPeg);
         sfx.peg();
 
         setPegs(newPegs);
@@ -702,7 +743,7 @@ export default function PegsAndJokers() {
         newStuckCounts[aiPlayer] = 0;
         setStuckCounts(newStuckCounts);
 
-        const w = checkWinner(newPegs);
+        const w = checkWinner(newPegs, gameMode);
         if (w !== null) {
           setWinner(w);
           aiProcessingRef.current = false;
@@ -720,21 +761,25 @@ export default function PegsAndJokers() {
       };
 
       // Pick the best scored move for this hand
-      const bestMove = findBestAIMove(aiPlayer, aiHand, pegs);
+      const bestMove = findBestAIMove(aiPlayer, aiHand, pegs, { mode: gameMode });
 
       if (bestMove) {
+        // `owner` is whose peg moves — the AI's own, or its partner's once the
+        // AI has finished (partner mode).
+        const owner = bestMove.owner;
+        const moverPeg = { player: owner, pegIndex: bestMove.pegIndex };
         // Generate move description based on move type
         const getMoveDescription = () => {
-          const oldPeg = pegs[aiPlayer][bestMove.pegIndex];
-          const newPeg = bestMove.newPegs[aiPlayer][bestMove.pegIndex];
+          const oldPeg = pegs[owner][bestMove.pegIndex];
+          const newPeg = bestMove.newPegs[owner][bestMove.pegIndex];
 
           if (bestMove.type === 'simple' || bestMove.type === 'start') {
             return describeMoveAction(oldPeg, newPeg, bestMove.card, bestMove.amount);
           } else if (bestMove.type === 'split7' || bestMove.type === 'split9') {
-            const afterFirst = applyMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
-            const firstDesc = describeMoveAction(oldPeg, afterFirst[aiPlayer][bestMove.pegIndex], bestMove.card, bestMove.amount);
-            const secondOldPeg = afterFirst[aiPlayer][bestMove.secondPeg];
-            const secondNewPeg = bestMove.newPegs[aiPlayer][bestMove.secondPeg];
+            const afterFirst = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
+            const firstDesc = describeMoveAction(oldPeg, afterFirst[owner][bestMove.pegIndex], bestMove.card, bestMove.amount);
+            const secondOldPeg = afterFirst[owner][bestMove.secondPeg];
+            const secondNewPeg = bestMove.newPegs[owner][bestMove.secondPeg];
             const secondDesc = describeMoveAction(secondOldPeg, secondNewPeg, bestMove.card, bestMove.remaining);
             return `Split: ${firstDesc}, ${secondDesc}`;
           } else if (bestMove.type === 'joker') {
@@ -747,37 +792,37 @@ export default function PegsAndJokers() {
 
         // If animations disabled, just complete immediately
         if (!animationsEnabled) {
-          if (completeAIMove(bestMove.newPegs, bestMove.card, moveDescription)) return;
+          if (completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg)) return;
           return;
         }
 
         // Animate the move before completing
         if (bestMove.type === 'simple' || bestMove.type === 'start') {
           // Single move animation
-          animateMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
-            completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
+          animateMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
+            completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg);
           });
         } else if (bestMove.type === 'split7') {
           // Two-part animation for 7 split
-          animateMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
+          animateMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
             // After first animation, animate second peg
-            const afterFirstPegs = applyMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
-            animateMove(aiPlayer, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
-              completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
+            const afterFirstPegs = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
+            animateMove(owner, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
+              completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg);
             });
           });
         } else if (bestMove.type === 'split9') {
           // Two-part animation for 9 split
-          animateMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
+          animateMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
             // After first animation, animate second peg
-            const afterFirstPegs = applyMove(aiPlayer, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).newPegs;
-            animateMove(aiPlayer, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
-              completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
+            const afterFirstPegs = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
+            animateMove(owner, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
+              completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg);
             });
           });
         } else if (bestMove.type === 'joker') {
           // Joker - just complete (animation path is empty for jokers)
-          completeAIMove(bestMove.newPegs, bestMove.card, moveDescription);
+          completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg);
         }
         return;
       }
@@ -790,7 +835,7 @@ export default function PegsAndJokers() {
       clearTimeout(timer);
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects]);
+  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, gameMode]);
 
   // Chime + gentle buzz when control passes back to the human player
   useEffect(() => {
@@ -852,6 +897,7 @@ export default function PegsAndJokers() {
       return;
     }
     saveGame({
+      mode: gameMode,
       pegs,
       hands,
       deck,
@@ -872,10 +918,14 @@ export default function PegsAndJokers() {
   }, [
     pegs, hands, deck, discardPiles, stuckCounts, currentPlayer,
     splitRemaining, splitCard, splitPegIndex, lastMoves, moveHistory,
-    winner, showFirstPlayerModal, showResumeModal,
+    winner, showFirstPlayerModal, showResumeModal, gameMode,
   ]);
 
   const selectedCardObj = selectedCard !== null ? hands[0]?.[selectedCard] ?? null : null;
+
+  // Whose pegs the human is moving this turn (their own, or their partner's once
+  // they've finished in partner mode).
+  const controlledOwner = controlledOwnerFor(pegs);
 
   // Pegs the human can legally move right now (null = highlighting inactive).
   // During the second half of a split this is the set of pegs that can finish it.
@@ -885,13 +935,13 @@ export default function PegsAndJokers() {
       const set = new Set();
       for (let i = 0; i < 5; i++) {
         if (i === splitPegIndex) continue;
-        if (isValidMove(0, i, splitCard, pegs, splitRemaining)) set.add(i);
+        if (isValidMove(controlledOwner, i, splitCard, pegs, splitRemaining, moveOptions)) set.add(i);
       }
       return set;
     }
     if (!selectedCardObj) return null;
-    return new Set(getMovablePegs(0, selectedCardObj, pegs));
-  }, [currentPlayer, winner, discardMode, jokerMode, splitRemaining, splitCard, splitPegIndex, selectedCardObj, pegs]);
+    return new Set(getMovablePegs(controlledOwner, selectedCardObj, pegs, moveOptions));
+  }, [currentPlayer, winner, discardMode, jokerMode, splitRemaining, splitCard, splitPegIndex, selectedCardObj, pegs, controlledOwner, moveOptions]);
 
   // Tappable destination spaces for the selected peg with a 7 or 9 (ghost
   // circles on the board — tapping one picks that split amount)
@@ -900,15 +950,15 @@ export default function PegsAndJokers() {
     if (splitRemaining !== 0 || !selectedCardObj || selectedPeg === null) return [];
     const info = CARD_VALUES[selectedCardObj.rank];
     if (!info.canSplit && !info.mustSplit) return [];
-    return getValidDestinations(0, selectedPeg, selectedCardObj, pegs);
-  }, [currentPlayer, winner, jokerMode, discardMode, splitRemaining, selectedCardObj, selectedPeg, pegs]);
+    return getValidDestinations(controlledOwner, selectedPeg, selectedCardObj, pegs, moveOptions);
+  }, [currentPlayer, winner, jokerMode, discardMode, splitRemaining, selectedCardObj, selectedPeg, pegs, controlledOwner, moveOptions]);
 
   // Which cards in hand have at least one fully playable move (used to dim
   // dead cards; unlike hasAnyValidMove this requires splits to be completable)
   const playableCards = useMemo(() => {
     if (currentPlayer !== 0 || winner !== null) return hands[0].map(() => true);
-    return hands[0].map(c => getMovablePegs(0, c, pegs).length > 0);
-  }, [currentPlayer, winner, hands, pegs]);
+    return hands[0].map(c => getMovablePegs(controlledOwner, c, pegs, moveOptions).length > 0);
+  }, [currentPlayer, winner, hands, pegs, controlledOwner, moveOptions]);
 
   const handleCardClick = (cardIndex) => {
     if (currentPlayer !== 0 || winner !== null) return;
@@ -934,7 +984,7 @@ export default function PegsAndJokers() {
     if (currentPlayer !== 0 || winner !== null) return;
 
     // In joker mode, clicking your own peg cancels the selection
-    if (jokerMode && player === 0) {
+    if (jokerMode && player === controlledOwner) {
       setJokerMode(false);
       setJokerSourcePeg(null);
       setSelectedPeg(null);
@@ -942,7 +992,7 @@ export default function PegsAndJokers() {
       return;
     }
 
-    if (player !== 0) return;
+    if (player !== controlledOwner) return;
 
     if (splitRemaining !== 0) {
       const cardInfo = CARD_VALUES[splitCard?.rank];
@@ -977,64 +1027,68 @@ export default function PegsAndJokers() {
     if (cardInfo.isJoker) {
       setJokerMode(true);
       setJokerSourcePeg(pegIndex);
-      setGameMessage('Now click an opponent\'s peg on the track to bump it.');
+      setGameMessage(
+        gameMode === GAME_MODES.PARTNERS
+          ? "Click a peg on the track to bump — hit your partner to send them to their home stretch."
+          : "Now click an opponent's peg on the track to bump it."
+      );
       return;
     }
 
     if ((cardInfo.canSplit || cardInfo.mustSplit) &&
-        (pegs[0][pegIndex].location === 'track' || pegs[0][pegIndex].location === 'home')) {
+        (pegs[controlledOwner][pegIndex].location === 'track' || pegs[controlledOwner][pegIndex].location === 'home')) {
       // 7s and 9s: tap one of the ghost destination spaces to pick the amount
       setGameMessage('Tap a pulsing space on the board to move this peg there.');
     } else {
-      executeMove(0, pegIndex, card);
+      executeMove(controlledOwner, pegIndex, card);
     }
   };
 
   const handleJokerTarget = (targetPlayer, targetPegIndex) => {
     if (!jokerMode || jokerSourcePeg === null || selectedCard === null) return;
-    if (targetPlayer === 0) return; // Can't target own pegs
+    const actor = 0;
+    const owner = controlledOwnerFor(pegs);
+    if (targetPlayer === owner) return; // Can't target the mover's own pegs
 
     const targetPeg = pegs[targetPlayer][targetPegIndex];
     if (targetPeg.location !== 'track') return; // Can only bump pegs on track
 
-    const card = hands[0][selectedCard];
+    const card = hands[actor][selectedCard];
 
-    // Execute the joker move
-    const newPegs = pegs.map(p => p.map(peg => ({ ...peg })));
-    const sourcePeg = newPegs[0][jokerSourcePeg];
-    const targetPos = targetPeg.position;
-
-    // Bump opponent's peg back to start
-    newPegs[targetPlayer][targetPegIndex] = { location: 'start', index: targetPegIndex };
-
-    // Move our peg to that position
-    sourcePeg.location = 'track';
-    sourcePeg.position = targetPos;
+    // Execute the joker via the engine so the partner friendly-bump rule applies.
+    const { newPegs, bumped } = applyJoker(owner, jokerSourcePeg, targetPlayer, targetPegIndex, pegs, moveOptions);
+    if (!bumped) {
+      setGameMessage('That joker bump is not legal. Pick another target.');
+      return;
+    }
 
     // Record last move for Joker
+    const friendly = gameMode === GAME_MODES.PARTNERS && sameTeam(targetPlayer, actor);
     setLastMoves(prev => {
       const updated = [...prev];
-      updated[0] = `Joker bumped ${PLAYER_NAMES[targetPlayer]}`;
+      updated[actor] = friendly
+        ? `Joker sent ${PLAYER_NAMES[targetPlayer]} to home stretch`
+        : `Joker bumped ${PLAYER_NAMES[targetPlayer]}`;
       return updated;
     });
 
     jokersThisGameRef.current += 1;
-    triggerMoveEffects(pegs, newPegs, 0);
+    triggerMoveEffects(pegs, newPegs, actor, { player: owner, pegIndex: jokerSourcePeg });
 
     setPegs(newPegs);
 
-    // Remove card from hand and draw new one
+    // Remove card from the human's hand and draw new one
     const newHands = hands.map(h => [...h]);
-    const cardIndex = newHands[0].findIndex(c => c.id === card.id);
-    const discarded = newHands[0].splice(cardIndex, 1)[0];
+    const cardIndex = newHands[actor].findIndex(c => c.id === card.id);
+    const discarded = newHands[actor].splice(cardIndex, 1)[0];
 
-    // Add to player 0's discard pile
+    // Add to the human's discard pile
     const newDiscardPiles = discardPiles.map((pile, i) =>
-      i === 0 ? [...pile, discarded] : [...pile]
+      i === actor ? [...pile, discarded] : [...pile]
     );
 
     const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
-    if (newCard) newHands[0].push(newCard);
+    if (newCard) newHands[actor].push(newCard);
 
     setHands(newHands);
     setDeck(newDeck);
@@ -1042,7 +1096,7 @@ export default function PegsAndJokers() {
 
     // Reset stuck count on successful move
     const newStuckCounts = [...stuckCounts];
-    newStuckCounts[0] = 0;
+    newStuckCounts[actor] = 0;
     setStuckCounts(newStuckCounts);
 
     // Reset state
@@ -1051,7 +1105,7 @@ export default function PegsAndJokers() {
     setJokerMode(false);
     setJokerSourcePeg(null);
 
-    const w = checkWinner(newPegs);
+    const w = checkWinner(newPegs, gameMode);
     if (w !== null) {
       setWinner(w);
       return;
@@ -1068,7 +1122,7 @@ export default function PegsAndJokers() {
   const handleGhostClick = (dest) => {
     if (selectedCard === null || selectedPeg === null) return;
     const card = hands[0][selectedCard];
-    executeMove(0, selectedPeg, card, dest.amount);
+    executeMove(controlledOwnerFor(pegs), selectedPeg, card, dest.amount);
   };
 
   const BOARD_SIZE = 400;
@@ -1170,6 +1224,15 @@ export default function PegsAndJokers() {
     }
 
     return { x, y };
+  };
+
+  // Board label for a seat: "You", partner or opponent in partner mode, else AI.
+  const roleLabel = (player) => {
+    if (player === 0) return 'You (Yellow)';
+    if (gameMode === GAME_MODES.PARTNERS) {
+      return `${PLAYER_NAMES[player]} (${sameTeam(player, 0) ? 'Partner' : 'Opponent'})`;
+    }
+    return `${PLAYER_NAMES[player]} (AI)`;
   };
 
   const renderCard = (card, index, isSelected, isPlayable = true) => {
@@ -1275,6 +1338,32 @@ export default function PegsAndJokers() {
                     {formatStreak(stats.currentStreak)}
                   </div>
                   <div className="text-xs text-gray-400">Streak</div>
+                </div>
+              </div>
+            )}
+
+            {!isSpinning && (
+              <div className="mb-6">
+                <div className="text-sm text-gray-400 mb-2 text-center">Game mode</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => setGameMode(GAME_MODES.CLASSIC)}
+                    className={`px-4 py-3 rounded-lg text-sm font-semibold transition-colors ${
+                      gameMode === GAME_MODES.CLASSIC ? 'bg-amber-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    }`}
+                  >
+                    Classic
+                    <span className="block text-xs font-normal opacity-80">Every player for themselves</span>
+                  </button>
+                  <button
+                    onClick={() => setGameMode(GAME_MODES.PARTNERS)}
+                    className={`px-4 py-3 rounded-lg text-sm font-semibold transition-colors ${
+                      gameMode === GAME_MODES.PARTNERS ? 'bg-amber-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    }`}
+                  >
+                    Partners
+                    <span className="block text-xs font-normal opacity-80">You + Pink vs Blue + Green</span>
+                  </button>
                 </div>
               </div>
             )}
@@ -1516,7 +1605,9 @@ export default function PegsAndJokers() {
 
         {winner !== null && (
           <div className="text-center text-2xl font-bold mb-4 p-4 bg-green-600 rounded">
-            {winner === 0 ? 'You Win!' : 'Opponent Wins!'}
+            {gameMode === GAME_MODES.PARTNERS
+              ? (winner === 0 ? 'Your team wins! 🎉' : 'Opponents win!')
+              : (winner === 0 ? 'You Win!' : 'Opponent Wins!')}
           </div>
         )}
 
@@ -1554,10 +1645,10 @@ export default function PegsAndJokers() {
                     // While a bumped peg is flying back, its start slot renders empty
                     const isFlyingBack = bumpFx && bumpFx.player === player && bumpFx.pegIndex === i;
                     const hasPeg = pegs[player][i]?.location === 'start' && !isFlyingBack;
-                    const isClickable = currentPlayer === 0 && player === 0 && hasPeg && !jokerMode;
-                    const isSelected = player === 0 && (i === selectedPeg || i === jokerSourcePeg) && pegs[player][i]?.location === 'start';
-                    const isMovable = player === 0 && hasPeg && movablePegSet != null && movablePegSet.has(i);
-                    const isDimmed = player === 0 && hasPeg && movablePegSet != null && !movablePegSet.has(i);
+                    const isClickable = currentPlayer === 0 && player === controlledOwner && hasPeg && !jokerMode;
+                    const isSelected = player === controlledOwner && (i === selectedPeg || i === jokerSourcePeg) && pegs[player][i]?.location === 'start';
+                    const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(i);
+                    const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(i);
                     return (
                       <g
                         key={`start-${player}-${i}`}
@@ -1588,10 +1679,10 @@ export default function PegsAndJokers() {
                     const { x, y } = getHomePosition(player, i);
                     const hasPeg = pegs[player].some(p => p.location === 'home' && p.homePosition === i);
                     const pegIndex = pegs[player].findIndex(p => p.location === 'home' && p.homePosition === i);
-                    const isClickable = currentPlayer === 0 && player === 0 && hasPeg && i < 4 && !jokerMode;
-                    const isSelected = player === 0 && pegIndex === selectedPeg && hasPeg;
-                    const isMovable = player === 0 && hasPeg && movablePegSet != null && movablePegSet.has(pegIndex);
-                    const isDimmed = player === 0 && hasPeg && movablePegSet != null && !movablePegSet.has(pegIndex);
+                    const isClickable = currentPlayer === 0 && player === controlledOwner && hasPeg && i < 4 && !jokerMode;
+                    const isSelected = player === controlledOwner && pegIndex === selectedPeg && hasPeg;
+                    const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(pegIndex);
+                    const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(pegIndex);
                     return (
                       <g
                         key={`home-${player}-${i}`}
@@ -1628,15 +1719,16 @@ export default function PegsAndJokers() {
 
                   if (!pos) return null;
 
-                  // In joker mode, only OPPONENT pegs on track are valid targets (not player 0)
-                  const isJokerTarget = jokerMode && player !== 0 && peg.location === 'track';
-                  const isJokerSource = jokerMode && player === 0 && pegIndex === jokerSourcePeg;
-                  // Player can click their own pegs when not in joker mode, opponent pegs in joker mode,
-                  // or their own pegs in joker mode (to cancel)
-                  const isClickable = currentPlayer === 0 && (player === 0 || isJokerTarget);
-                  const isSelected = player === 0 && (pegIndex === selectedPeg || isJokerSource);
-                  const isMovable = player === 0 && !jokerMode && movablePegSet != null && movablePegSet.has(pegIndex);
-                  const isDimmed = player === 0 && !jokerMode && movablePegSet != null && !movablePegSet.has(pegIndex);
+                  // In joker mode, any track peg the mover doesn't own is a target
+                  // (an opponent to bump, or a partner for a friendly bump).
+                  const isJokerTarget = jokerMode && player !== controlledOwner && peg.location === 'track';
+                  const isJokerSource = jokerMode && player === controlledOwner && pegIndex === jokerSourcePeg;
+                  // The human can click the pegs they control when not in joker mode,
+                  // target pegs in joker mode, or their controlled pegs to cancel.
+                  const isClickable = currentPlayer === 0 && (player === controlledOwner || isJokerTarget);
+                  const isSelected = player === controlledOwner && (pegIndex === selectedPeg || isJokerSource);
+                  const isMovable = player === controlledOwner && !jokerMode && movablePegSet != null && movablePegSet.has(pegIndex);
+                  const isDimmed = player === controlledOwner && !jokerMode && movablePegSet != null && !movablePegSet.has(pegIndex);
 
                   return (
                     <g
@@ -1644,9 +1736,9 @@ export default function PegsAndJokers() {
                       style={{ cursor: isClickable ? 'pointer' : 'default' }}
                       onClick={() => {
                         if (!isClickable) return;
-                        if (isJokerTarget && player !== 0) {
+                        if (isJokerTarget && player !== controlledOwner) {
                           handleJokerTarget(player, pegIndex);
-                        } else if (player === 0) {
+                        } else if (player === controlledOwner) {
                           if (jokerMode) {
                             // Clicking own peg in joker mode cancels it
                             setJokerMode(false);
@@ -1678,7 +1770,7 @@ export default function PegsAndJokers() {
               {/* Ghost destinations - tappable landing spots for the selected 7/9 */}
               {ghostDestinations.map((dest) => {
                 const pos = dest.location === 'home'
-                  ? getHomePosition(0, dest.homePosition)
+                  ? getHomePosition(controlledOwner, dest.homePosition)
                   : getTrackPosition(dest.position);
                 const key = dest.location === 'home' ? `ghost-h${dest.homePosition}` : `ghost-t${dest.position}`;
                 return (
@@ -1687,9 +1779,9 @@ export default function PegsAndJokers() {
                       cx={pos.x}
                       cy={pos.y}
                       r={8}
-                      fill={PLAYER_COLORS[0]}
+                      fill={PLAYER_COLORS[controlledOwner]}
                       fillOpacity={0.3}
-                      stroke={PLAYER_COLORS[0]}
+                      stroke={PLAYER_COLORS[controlledOwner]}
                       strokeWidth={2}
                       strokeDasharray="4 2"
                       className="ghost-dest"
@@ -1704,15 +1796,20 @@ export default function PegsAndJokers() {
                 const t = 1 - Math.pow(1 - bumpFx.progress, 3); // ease-out
                 const x = bumpFx.from.x + (bumpFx.to.x - bumpFx.from.x) * t;
                 const y = bumpFx.from.y + (bumpFx.to.y - bumpFx.from.y) * t;
+                // Friendly partner bumps fly forward (green); knock-backs fly to start (red).
+                const glow = bumpFx.kind === 'friendly' ? '#22C55E' : '#EF4444';
+                const shadow = bumpFx.kind === 'friendly'
+                  ? 'drop-shadow(0 0 4px rgba(34, 197, 94, 0.9))'
+                  : 'drop-shadow(0 0 4px rgba(239, 68, 68, 0.9))';
                 return (
                   <circle
                     cx={x}
                     cy={y}
                     r={7}
                     fill={PLAYER_COLORS[bumpFx.player]}
-                    stroke="#EF4444"
+                    stroke={glow}
                     strokeWidth={2}
-                    style={{ filter: 'drop-shadow(0 0 4px rgba(239, 68, 68, 0.9))' }}
+                    style={{ filter: shadow }}
                   />
                 );
               })()}
@@ -1817,19 +1914,19 @@ export default function PegsAndJokers() {
 
               {/* Labels with last move - rotated so Yellow (player 0) is at bottom */}
               <g>
-                <text x="200" y="20" textAnchor="middle" fill={PLAYER_COLORS[2]} fontSize="11" fontWeight="bold">Pink (AI)</text>
+                <text x="200" y="20" textAnchor="middle" fill={PLAYER_COLORS[2]} fontSize="11" fontWeight="bold">{roleLabel(2)}</text>
                 {lastMoves[2] && <text x="200" y="31" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[2]}</text>}
               </g>
               <g transform="rotate(90 378 205)">
-                <text x="378" y="200" textAnchor="middle" fill={PLAYER_COLORS[3]} fontSize="11" fontWeight="bold">Green (AI)</text>
+                <text x="378" y="200" textAnchor="middle" fill={PLAYER_COLORS[3]} fontSize="11" fontWeight="bold">{roleLabel(3)}</text>
                 {lastMoves[3] && <text x="378" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[3]}</text>}
               </g>
               <g>
-                <text x="200" y="383" textAnchor="middle" fill={PLAYER_COLORS[0]} fontSize="11" fontWeight="bold">You (Yellow)</text>
+                <text x="200" y="383" textAnchor="middle" fill={PLAYER_COLORS[0]} fontSize="11" fontWeight="bold">{roleLabel(0)}</text>
                 {lastMoves[0] && <text x="200" y="394" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[0]}</text>}
               </g>
               <g transform="rotate(-90 22 205)">
-                <text x="22" y="200" textAnchor="middle" fill={PLAYER_COLORS[1]} fontSize="11" fontWeight="bold">Blue (AI)</text>
+                <text x="22" y="200" textAnchor="middle" fill={PLAYER_COLORS[1]} fontSize="11" fontWeight="bold">{roleLabel(1)}</text>
                 {lastMoves[1] && <text x="22" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[1]}</text>}
               </g>
             </svg>
@@ -1939,6 +2036,13 @@ export default function PegsAndJokers() {
                 <li>• Joker: Bump any opponent peg</li>
                 <li>• Cannot jump or land on your own pegs</li>
                 <li>• <span className="text-yellow-400">Stuck 3 turns in a row = auto-start a peg!</span></li>
+                {gameMode === GAME_MODES.PARTNERS && (
+                  <>
+                    <li>• <span className="text-pink-400">Partners:</span> you and Pink are a team — win when both of you are all home</li>
+                    <li>• Bumping your partner sends them to their home stretch (a boost, not a setback)</li>
+                    <li>• Once your pegs are all home, your cards move your partner's pegs</li>
+                  </>
+                )}
               </ul>
             </div>
           </div>
