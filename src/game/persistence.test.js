@@ -50,7 +50,7 @@ const sampleState = (over = {}) => ({
 describe('serializeGame', () => {
   it('captures all the fields needed to resume', () => {
     const snap = serializeGame(sampleState());
-    expect(snap.version).toBe(1);
+    expect(snap.version).toBe(2);
     expect(typeof snap.savedAt).toBe('number');
     expect(snap.currentPlayer).toBe(2);
     expect(snap.splitRemaining).toBe(3);
@@ -83,6 +83,17 @@ describe('serializeGame', () => {
 describe('isResumable', () => {
   it('accepts a well-formed snapshot with dealt hands', () => {
     expect(isResumable(serializeGame(sampleState()))).toBe(true);
+  });
+
+  it('defaults mode to classic and records partner mode when set', () => {
+    expect(serializeGame(sampleState()).mode).toBe('classic');
+    expect(serializeGame(sampleState({ mode: 'partners' })).mode).toBe('partners');
+  });
+
+  it('still accepts a legacy v1 snapshot (loads as classic)', () => {
+    const legacy = { ...serializeGame(sampleState()), version: 1 };
+    delete legacy.mode;
+    expect(isResumable(legacy)).toBe(true);
   });
 
   it('rejects junk and wrong versions', () => {

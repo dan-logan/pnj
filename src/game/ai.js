@@ -1,10 +1,11 @@
 // AI move selection — pure functions over the peg/hand state.
-import { CARD_VALUES, NUM_PLAYERS, PEGS_PER_PLAYER } from './constants.js';
+import { CARD_VALUES, NUM_PLAYERS, PEGS_PER_PLAYER, GAME_MODES, getPartner, sameTeam } from './constants.js';
 import {
   getStartPosition,
   getDistanceToHome,
   isValidMove,
-  applyMove
+  applyMove,
+  applyJoker
 } from './engine.js';
 
 // Calculate total distance for all of a player's pegs (lower is better)
@@ -12,11 +13,31 @@ function getTotalDistance(pegState, player) {
   return pegState[player].reduce((sum, peg) => sum + getDistanceToHome(peg, player), 0);
 }
 
-// Calculate vulnerability penalty for a position (landing on opponent's come-out spot is risky)
-function getVulnerabilityPenalty(position, pegState, player) {
+// The distance the AI is trying to minimize: its own pegs in classic mode, or
+// the whole team's pegs in partner mode (so it values advancing its partner too).
+function getReferenceDistance(pegState, actor, mode) {
+  if (mode === GAME_MODES.PARTNERS) {
+    return getTotalDistance(pegState, actor) + getTotalDistance(pegState, getPartner(actor));
+  }
+  return getTotalDistance(pegState, actor);
+}
+
+// Whose peg the AI moves this turn: normally its own, but once its own pegs are
+// all home in partner mode it plays its hand on its partner's pegs.
+function getControlledOwner(actor, mode, pegs) {
+  if (mode === GAME_MODES.PARTNERS && pegs[actor].every(p => p.location === 'home')) {
+    return getPartner(actor);
+  }
+  return actor;
+}
+
+// Calculate vulnerability penalty for a position (landing on an enemy's come-out
+// spot is risky). Teammates can't bump us, so they don't count as threats.
+function getVulnerabilityPenalty(position, pegState, owner, mode) {
   let penalty = 0;
   for (let p = 0; p < NUM_PLAYERS; p++) {
-    if (p === player) continue;
+    const ally = mode === GAME_MODES.PARTNERS ? sameTeam(p, owner) : p === owner;
+    if (ally) continue;
     const opponentStartPos = getStartPosition(p);
     if (position === opponentStartPos) {
       // Landing on opponent's come-out spot - they have ~30% chance to bump us back
@@ -30,11 +51,15 @@ function getVulnerabilityPenalty(position, pegState, player) {
 }
 
 // Enumerate and score every legal move for the given hand.
-// Move shapes:
-//   { type: 'simple'|'start', card, pegIndex, amount, newPegs, improvement, bonus }
-//   { type: 'split7'|'split9', card, pegIndex, amount, secondPeg, remaining, newPegs, improvement, bonus }
-//   { type: 'joker', card, pegIndex, targetPlayer, targetPeg, newPegs, improvement, bonus }
-export function getPossibleMoves(player, hand, pegs) {
+// Move shapes carry `owner` (whose peg moves — the partner once the AI is home):
+//   { type: 'simple'|'start', owner, card, pegIndex, amount, newPegs, improvement, bonus }
+//   { type: 'split7'|'split9', owner, card, pegIndex, amount, secondPeg, remaining, newPegs, improvement, bonus }
+//   { type: 'joker', owner, card, pegIndex, targetPlayer, targetPeg, newPegs, improvement, bonus }
+export function getPossibleMoves(actor, hand, pegs, options = {}) {
+  const { mode = GAME_MODES.CLASSIC } = options;
+  const owner = getControlledOwner(actor, mode, pegs);
+  const moveOpts = { actor, mode };
+  const distBefore = getReferenceDistance(pegs, actor, mode);
   const possibleMoves = [];
 
   for (const card of hand) {
@@ -42,27 +67,26 @@ export function getPossibleMoves(player, hand, pegs) {
 
     // Try each peg
     for (let pegIndex = 0; pegIndex < PEGS_PER_PLAYER; pegIndex++) {
-      const peg = pegs[player][pegIndex];
+      const peg = pegs[owner][pegIndex];
 
       // Skip pegs in final home position
       if (peg.location === 'home' && peg.homePosition === 4) continue;
 
       // For non-split cards
       if (!cardInfo.canSplit && !cardInfo.mustSplit && !cardInfo.isJoker) {
-        if (isValidMove(player, pegIndex, card, pegs)) {
-          const { newPegs } = applyMove(player, pegIndex, card, null, pegs);
-          const currentDist = getTotalDistance(pegs, player);
-          const newDist = getTotalDistance(newPegs, player);
-          const improvement = currentDist - newDist;
+        if (isValidMove(owner, pegIndex, card, pegs, null, moveOpts)) {
+          const { newPegs } = applyMove(owner, pegIndex, card, null, pegs, moveOpts);
+          const improvement = distBefore - getReferenceDistance(newPegs, actor, mode);
 
           // Calculate vulnerability penalty for landing position
-          const movedPeg = newPegs[player][pegIndex];
+          const movedPeg = newPegs[owner][pegIndex];
           const vulnPenalty = movedPeg.location === 'track'
-            ? getVulnerabilityPenalty(movedPeg.position, newPegs, player)
+            ? getVulnerabilityPenalty(movedPeg.position, newPegs, owner, mode)
             : 0;
 
           possibleMoves.push({
             type: 'simple',
+            owner,
             card,
             pegIndex,
             amount: null,
@@ -77,15 +101,16 @@ export function getPossibleMoves(player, hand, pegs) {
       // For 7 card (can split forward)
       if (cardInfo.canSplit) {
         // Try full 7 first
-        if (isValidMove(player, pegIndex, card, pegs, 7)) {
-          const { newPegs } = applyMove(player, pegIndex, card, 7, pegs);
-          const improvement = getTotalDistance(pegs, player) - getTotalDistance(newPegs, player);
-          const movedPeg = newPegs[player][pegIndex];
+        if (isValidMove(owner, pegIndex, card, pegs, 7, moveOpts)) {
+          const { newPegs } = applyMove(owner, pegIndex, card, 7, pegs, moveOpts);
+          const improvement = distBefore - getReferenceDistance(newPegs, actor, mode);
+          const movedPeg = newPegs[owner][pegIndex];
           const vulnPenalty = movedPeg.location === 'track'
-            ? getVulnerabilityPenalty(movedPeg.position, newPegs, player)
+            ? getVulnerabilityPenalty(movedPeg.position, newPegs, owner, mode)
             : 0;
           possibleMoves.push({
             type: 'simple',
+            owner,
             card,
             pegIndex,
             amount: 7,
@@ -97,25 +122,26 @@ export function getPossibleMoves(player, hand, pegs) {
 
         // Try splits
         for (let split = 1; split <= 6; split++) {
-          if (isValidMove(player, pegIndex, card, pegs, split)) {
-            const { newPegs: afterFirst } = applyMove(player, pegIndex, card, split, pegs);
+          if (isValidMove(owner, pegIndex, card, pegs, split, moveOpts)) {
+            const { newPegs: afterFirst } = applyMove(owner, pegIndex, card, split, pegs, moveOpts);
             const remaining = 7 - split;
 
             // Find another peg for the remaining
             for (let secondPeg = 0; secondPeg < PEGS_PER_PLAYER; secondPeg++) {
               if (secondPeg === pegIndex) continue;
-              if (isValidMove(player, secondPeg, card, afterFirst, remaining)) {
-                const { newPegs: finalPegs } = applyMove(player, secondPeg, card, remaining, afterFirst);
-                const improvement = getTotalDistance(pegs, player) - getTotalDistance(finalPegs, player);
+              if (isValidMove(owner, secondPeg, card, afterFirst, remaining, moveOpts)) {
+                const { newPegs: finalPegs } = applyMove(owner, secondPeg, card, remaining, afterFirst, moveOpts);
+                const improvement = distBefore - getReferenceDistance(finalPegs, actor, mode);
 
                 // Calculate vulnerability for both moved pegs
-                const peg1 = finalPegs[player][pegIndex];
-                const peg2 = finalPegs[player][secondPeg];
-                const vuln1 = peg1.location === 'track' ? getVulnerabilityPenalty(peg1.position, finalPegs, player) : 0;
-                const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs, player) : 0;
+                const peg1 = finalPegs[owner][pegIndex];
+                const peg2 = finalPegs[owner][secondPeg];
+                const vuln1 = peg1.location === 'track' ? getVulnerabilityPenalty(peg1.position, finalPegs, owner, mode) : 0;
+                const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs, owner, mode) : 0;
 
                 possibleMoves.push({
                   type: 'split7',
+                  owner,
                   card,
                   pegIndex,
                   amount: split,
@@ -123,8 +149,8 @@ export function getPossibleMoves(player, hand, pegs) {
                   remaining,
                   newPegs: finalPegs,
                   improvement,
-                  bonus: (pegs[player][pegIndex].location === 'home' ? 10 : 0) +
-                         (afterFirst[player][secondPeg].location === 'home' ? 10 : 0) -
+                  bonus: (pegs[owner][pegIndex].location === 'home' ? 10 : 0) +
+                         (afterFirst[owner][secondPeg].location === 'home' ? 10 : 0) -
                          vuln1 - vuln2
                 });
               }
@@ -139,24 +165,25 @@ export function getPossibleMoves(player, hand, pegs) {
           const backward = -(9 - forward);
 
           // Try this peg forward
-          if (isValidMove(player, pegIndex, card, pegs, forward)) {
-            const { newPegs: afterFirst } = applyMove(player, pegIndex, card, forward, pegs);
+          if (isValidMove(owner, pegIndex, card, pegs, forward, moveOpts)) {
+            const { newPegs: afterFirst } = applyMove(owner, pegIndex, card, forward, pegs, moveOpts);
 
             // Find another peg for backward
             for (let secondPeg = 0; secondPeg < PEGS_PER_PLAYER; secondPeg++) {
               if (secondPeg === pegIndex) continue;
-              if (isValidMove(player, secondPeg, card, afterFirst, backward)) {
-                const { newPegs: finalPegs } = applyMove(player, secondPeg, card, backward, afterFirst);
-                const improvement = getTotalDistance(pegs, player) - getTotalDistance(finalPegs, player);
+              if (isValidMove(owner, secondPeg, card, afterFirst, backward, moveOpts)) {
+                const { newPegs: finalPegs } = applyMove(owner, secondPeg, card, backward, afterFirst, moveOpts);
+                const improvement = distBefore - getReferenceDistance(finalPegs, actor, mode);
 
                 // Calculate vulnerability for both moved pegs
-                const peg1 = finalPegs[player][pegIndex];
-                const peg2 = finalPegs[player][secondPeg];
-                const vuln1 = peg1.location === 'track' ? getVulnerabilityPenalty(peg1.position, finalPegs, player) : 0;
-                const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs, player) : 0;
+                const peg1 = finalPegs[owner][pegIndex];
+                const peg2 = finalPegs[owner][secondPeg];
+                const vuln1 = peg1.location === 'track' ? getVulnerabilityPenalty(peg1.position, finalPegs, owner, mode) : 0;
+                const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs, owner, mode) : 0;
 
                 possibleMoves.push({
                   type: 'split9',
+                  owner,
                   card,
                   pegIndex,
                   amount: forward,
@@ -164,7 +191,7 @@ export function getPossibleMoves(player, hand, pegs) {
                   remaining: backward,
                   newPegs: finalPegs,
                   improvement,
-                  bonus: (pegs[player][pegIndex].location === 'home' ? 10 : 0) - vuln1 - vuln2
+                  bonus: (pegs[owner][pegIndex].location === 'home' ? 10 : 0) - vuln1 - vuln2
                 });
               }
             }
@@ -174,13 +201,14 @@ export function getPossibleMoves(player, hand, pegs) {
 
       // For starting cards (A, J, Q, K) - try to get pegs out of start
       if (cardInfo.canStart && peg.location === 'start') {
-        if (isValidMove(player, pegIndex, card, pegs)) {
-          const { newPegs } = applyMove(player, pegIndex, card, null, pegs);
-          const improvement = getTotalDistance(pegs, player) - getTotalDistance(newPegs, player);
-          const startPos = getStartPosition(player);
-          const vulnPenalty = getVulnerabilityPenalty(startPos, newPegs, player);
+        if (isValidMove(owner, pegIndex, card, pegs, null, moveOpts)) {
+          const { newPegs } = applyMove(owner, pegIndex, card, null, pegs, moveOpts);
+          const improvement = distBefore - getReferenceDistance(newPegs, actor, mode);
+          const startPos = getStartPosition(owner);
+          const vulnPenalty = getVulnerabilityPenalty(startPos, newPegs, owner, mode);
           possibleMoves.push({
             type: 'start',
+            owner,
             card,
             pegIndex,
             amount: null,
@@ -191,55 +219,53 @@ export function getPossibleMoves(player, hand, pegs) {
         }
       }
 
-      // For Joker - bump opponent pegs
+      // For Joker - bump a peg on the track (an opponent, or a partner for a
+      // strategic friendly bump to their home entrance)
       if (cardInfo.isJoker && (peg.location === 'start' || peg.location === 'track')) {
-        // Find opponent pegs to bump
-        for (let oppPlayer = 0; oppPlayer < NUM_PLAYERS; oppPlayer++) {
-          if (oppPlayer === player) continue;
-          for (let oppPeg = 0; oppPeg < PEGS_PER_PLAYER; oppPeg++) {
-            const opponentPeg = pegs[oppPlayer][oppPeg];
-            if (opponentPeg.location === 'track') {
-              const targetPosition = opponentPeg.position;
-              const newPegs = pegs.map(p => p.map(pg => ({ ...pg })));
-              // Bump opponent
-              newPegs[oppPlayer][oppPeg] = { location: 'start', index: oppPeg };
-              // Move our peg there
-              newPegs[player][pegIndex].location = 'track';
-              newPegs[player][pegIndex].position = targetPosition;
+        for (let targetPlayer = 0; targetPlayer < NUM_PLAYERS; targetPlayer++) {
+          if (targetPlayer === owner) continue;
+          for (let targetPeg = 0; targetPeg < PEGS_PER_PLAYER; targetPeg++) {
+            const opponentPeg = pegs[targetPlayer][targetPeg];
+            if (opponentPeg.location !== 'track') continue;
 
-              const improvement = getTotalDistance(pegs, player) - getTotalDistance(newPegs, player);
+            const { newPegs, bumped } = applyJoker(owner, pegIndex, targetPlayer, targetPeg, pegs, moveOpts);
+            if (!bumped) continue; // illegal (e.g. friendly bump with a blocked entrance)
 
-              // Calculate bonuses and penalties for Joker usage
-              let jokerBonus = 5; // Base bonus for bumping
+            const improvement = distBefore - getReferenceDistance(newPegs, actor, mode);
+            const friendly = mode === GAME_MODES.PARTNERS && sameTeam(targetPlayer, actor);
 
-              // Bonus for bumping opponent who was close to home (more valuable disruption)
-              const opponentDistToHome = getDistanceToHome(opponentPeg, oppPlayer);
+            let jokerBonus;
+            if (friendly) {
+              // Value comes from the team-distance improvement; no bump bonus.
+              jokerBonus = 0;
+            } else {
+              jokerBonus = 5; // Base bonus for bumping an opponent
+
+              // Bonus for bumping an opponent who was close to home
+              const opponentDistToHome = getDistanceToHome(opponentPeg, targetPlayer);
               if (opponentDistToHome < 20) {
                 jokerBonus += Math.floor((20 - opponentDistToHome) / 2);
               }
 
               // Heavy penalty for landing on the bumped player's come-out spot
-              // They're very likely to have a start card since we just sent them back
-              const oppStartPos = getStartPosition(oppPlayer);
-              if (targetPosition === oppStartPos) {
-                jokerBonus -= 30; // Major penalty - likely wastes the Joker
+              const oppStartPos = getStartPosition(targetPlayer);
+              if (opponentPeg.position === oppStartPos) {
+                jokerBonus -= 30;
               }
-
-              // General vulnerability penalty for other come-out spots
-              const vulnPenalty = getVulnerabilityPenalty(targetPosition, newPegs, player);
-              jokerBonus -= vulnPenalty;
-
-              possibleMoves.push({
-                type: 'joker',
-                card,
-                pegIndex,
-                targetPlayer: oppPlayer,
-                targetPeg: oppPeg,
-                newPegs,
-                improvement,
-                bonus: jokerBonus
-              });
+              jokerBonus -= getVulnerabilityPenalty(opponentPeg.position, newPegs, owner, mode);
             }
+
+            possibleMoves.push({
+              type: 'joker',
+              owner,
+              card,
+              pegIndex,
+              targetPlayer,
+              targetPeg,
+              newPegs,
+              improvement,
+              bonus: jokerBonus
+            });
           }
         }
       }
@@ -250,8 +276,8 @@ export function getPossibleMoves(player, hand, pegs) {
 }
 
 // Pick the highest-scoring move, or null if no move is possible (caller should discard).
-export function findBestAIMove(player, hand, pegs) {
-  const possibleMoves = getPossibleMoves(player, hand, pegs);
+export function findBestAIMove(player, hand, pegs, options = {}) {
+  const possibleMoves = getPossibleMoves(player, hand, pegs, options);
   if (possibleMoves.length === 0) return null;
   possibleMoves.sort((a, b) => (b.improvement + b.bonus) - (a.improvement + a.bonus));
   return possibleMoves[0];
