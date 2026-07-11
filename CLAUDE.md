@@ -19,10 +19,10 @@ A digital implementation of the Pegs and Jokers board game built with React, Vit
 
 The rules engine is pure JavaScript (no React), separated from the UI so it can be unit-tested and reused:
 
-- **src/game/constants.js** - Card values, board dimensions (72-space track, 18 per side), player colors/names
+- **src/game/constants.js** - Card values, board dimensions (72-space track, 18 per side), player colors/names. Also `GAME_MODES`, `TEAMS` (partners 0+2 vs 1+3) and the `getPartner`/`sameTeam` helpers used by partner mode
 - **src/game/deck.js** - Deck creation (two 52-card decks + 4 jokers), shuffling, drawing with discard-pile reshuffle
-- **src/game/engine.js** - Move validation (`isValidMove`, `hasAnyValidMove`), move application (`applyMove`), win detection, animation paths, UI affordances (`getValidDestinations`, `getMovablePegs`, `findBumps`). All functions take the peg state as an argument and return new state without mutating.
-- **src/game/ai.js** - AI move enumeration and scoring (`getPossibleMoves`, `findBestAIMove`); prioritizes moves that advance toward home, avoids vulnerable positions
+- **src/game/engine.js** - Move validation (`isValidMove`, `hasAnyValidMove`), move application (`applyMove`), win detection, animation paths, UI affordances (`getValidDestinations`, `getMovablePegs`, `findBumps`). All functions take the peg state as an argument and return new state without mutating. Movement functions accept an `options` arg (`{ actor, mode }`) so a player can move a partner's pegs and so the partner friendly-bump rule applies; `applyJoker` and `findFriendlyBumps` support partner mode, and `checkWinner(pegs, mode)` returns a team index in partner mode
+- **src/game/ai.js** - AI move enumeration and scoring (`getPossibleMoves`, `findBestAIMove`); prioritizes moves that advance toward home, avoids vulnerable positions. In partner mode it scores by team distance, plays for its partner once its own pegs are all home, and values friendly-bump jokers
 - **src/game/stats.js** - Persistent player statistics in localStorage; pure record/derive logic with an optional injectable storage backend
 - **src/game/persistence.js** - Save/resume of an in-progress game to localStorage (`serializeGame`, `saveGame`, `loadGame`, `clearGame`, `isResumable`). Snapshots pegs/hands/deck/discards/currentPlayer plus split state and per-game stat tallies as plain JSON. Same injectable-storage pattern as stats.js; no-ops without storage
 - **src/audio.js** - Web Audio synth sound effects + `navigator.vibrate` haptics with a persisted mute setting; all no-ops outside a browser
@@ -47,6 +47,10 @@ Tests live next to the modules they cover (`src/game/*.test.js`) and run with Vi
 - Start position: `player * 18 + 8` (position 8 on each player's side)
 - Home entrance: `player * 18 + 3` (position 3 on each player's side)
 - Cards A/J/Q/K allow moving from start; 7 can split forward; 8 moves backward; 9 must split (forward + backward); Joker bumps opponent
+
+### Partner mode
+
+Selectable at game start (Classic is the default). Players sit opposite in teams — you (Yellow) + Pink vs Blue + Green. The team wins when both partners have all pegs home. Bumping a partner is legal and *strategic*: instead of going to start, a friendly-bumped peg lands on its owner's home-entrance space (`player*18+3`), ready to go home. If that entrance is occupied by an opponent it cascades (opponent → start); if occupied by that owner's own peg the whole move is illegal (like landing on your own peg). Once your own pegs are all home, your cards move your partner's pegs. Classic mode is unchanged — the engine `options` default (`actor === owner`, `mode: 'classic'`) preserves the original behavior.
 
 ## Deployment
 
