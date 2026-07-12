@@ -42,6 +42,12 @@ import { loadGame, saveGame, clearGame } from './game/persistence.js';
 import InstallPrompt from './InstallPrompt.jsx';
 import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
 
+// Instant-replay pacing. Deliberately slower than the 150ms live step so a
+// round of AI moves is easy to follow when it's played back.
+const REPLAY_SEG_MS = 280;      // per-step while a peg animates during replay
+const REPLAY_LEADIN_MS = 320;   // beat on the "before" board so the start registers
+const REPLAY_FRAME_PAUSE_MS = 600; // pause after each move before the next one
+
 export default function PegsAndJokers() {
   const [gameMode, setGameMode] = useState(GAME_MODES.CLASSIC);
   const [deck, setDeck] = useState([]);
@@ -90,6 +96,38 @@ export default function PegsAndJokers() {
   // Bump fly-back animation: { player, pegIndex, from: {x,y}, to: {x,y}, progress: 0-1 }
   const [bumpFx, setBumpFx] = useState(null);
   const bumpFxRef = useRef(null);
+
+  // Instant replay: a buffer of the AI moves made since your last turn, plus the
+  // playback state. Frames live in a ref (they hold peg snapshots and don't need
+  // to trigger renders); `replayReady` mirrors the count so the button can show.
+  const [isReplaying, setIsReplaying] = useState(false);
+  const [replayInfo, setReplayInfo] = useState(null); // { player, description, index, total }
+  const [replayReady, setReplayReady] = useState(0);
+  const replayLogRef = useRef([]);        // recorded frames for the current round
+  const replayCancelRef = useRef(false);  // set to abort an in-flight replay
+  const replaySegTimerRef = useRef(null); // per-step interval
+  const replayFrameTimerRef = useRef(null); // between-frame / lead-in timeout
+  const replayRestoreRef = useRef(null);  // true current board, restored when replay ends
+  const replayPrevPlayerRef = useRef(0);  // detect the human handing off to start a fresh round
+
+  // Append an AI move to the replay buffer. Peg snapshots are immutable (the
+  // engine never mutates), so storing references is safe.
+  const recordReplayFrame = useCallback((frame) => {
+    replayLogRef.current = [...replayLogRef.current, frame];
+    setReplayReady(replayLogRef.current.length);
+  }, []);
+
+  // Tear down any in-flight replay and empty the buffer (used on new game / load).
+  const resetReplay = useCallback(() => {
+    replayCancelRef.current = true;
+    if (replaySegTimerRef.current) { clearInterval(replaySegTimerRef.current); replaySegTimerRef.current = null; }
+    if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
+    replayRestoreRef.current = null;
+    replayLogRef.current = [];
+    setReplayReady(0);
+    setReplayInfo(null);
+    setIsReplaying(false);
+  }, []);
 
   // First player selection state
   const [showFirstPlayerModal, setShowFirstPlayerModal] = useState(false);
@@ -150,6 +188,8 @@ export default function PegsAndJokers() {
       clearInterval(bumpFxRef.current);
       bumpFxRef.current = null;
     }
+    resetReplay();
+    replayPrevPlayerRef.current = firstPlayer;
     // Reset per-game stat tallies for the new game
     turnsRef.current = 0;
     prevTurnPlayerRef.current = null;
@@ -158,7 +198,7 @@ export default function PegsAndJokers() {
     timesBumpedThisGameRef.current = 0;
     gameRecordedRef.current = false;
     setShowFirstPlayerModal(false);
-  }, []);
+  }, [resetReplay]);
 
   const handleGoFirst = useCallback(() => {
     unlockAudio();
@@ -220,10 +260,11 @@ export default function PegsAndJokers() {
     setSpinningPlayer(0);
     setWinner(null);
     aiProcessingRef.current = false;
+    resetReplay();
 
     // Show the modal to choose first player
     setShowFirstPlayerModal(true);
-  }, []);
+  }, [resetReplay]);
 
   // Restore an in-progress game from a saved snapshot. Resets transient UI
   // state (selections, joker/discard modes) since those aren't persisted.
@@ -266,6 +307,10 @@ export default function PegsAndJokers() {
     prevPlayerRef.current = saved.currentPlayer;
     aiProcessingRef.current = false;
 
+    // No replay is available for a freshly resumed game until a new AI round runs.
+    resetReplay();
+    replayPrevPlayerRef.current = saved.currentPlayer;
+
     setGameMessage(
       saved.currentPlayer === 0
         ? 'Welcome back! Your turn — select a card and peg to move.'
@@ -275,7 +320,7 @@ export default function PegsAndJokers() {
     setPendingResume(null);
     setShowResumeModal(false);
     setShowFirstPlayerModal(false);
-  }, []);
+  }, [resetReplay]);
 
   // On mount, offer to resume a saved game if one exists; otherwise start fresh.
   useEffect(() => {
@@ -338,6 +383,129 @@ export default function PegsAndJokers() {
         setBumpFx(prev => (prev ? { ...prev, progress: step / steps } : null));
       }
     }, 40);
+  }, []);
+
+  // When you finish your turn and control passes to the AI, start recording a
+  // fresh round so the replay buffer only ever holds the moves made since your
+  // last turn.
+  useEffect(() => {
+    const prev = replayPrevPlayerRef.current;
+    if (prev === 0 && currentPlayer !== 0) {
+      replayLogRef.current = [];
+      setReplayReady(0);
+    }
+    replayPrevPlayerRef.current = currentPlayer;
+  }, [currentPlayer]);
+
+  // Play back the buffered AI moves, slowed down, as an "instant replay". The
+  // board is driven from the recorded snapshots and restored to the live state
+  // when the replay finishes or is stopped, so nothing else in the game changes.
+  const startReplay = useCallback(() => {
+    const frames = replayLogRef.current;
+    if (!frames.length || isReplaying) return;
+    unlockAudio();
+
+    replayCancelRef.current = false;
+    replayRestoreRef.current = pegs; // true current board (== last frame's pegsAfter)
+    setIsReplaying(true);
+    setSelectedCard(null);
+    setSelectedPeg(null);
+    setJokerMode(false);
+    setJokerSourcePeg(null);
+    setDiscardMode(false);
+
+    const total = frames.length;
+
+    const finish = () => {
+      if (replaySegTimerRef.current) { clearInterval(replaySegTimerRef.current); replaySegTimerRef.current = null; }
+      if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
+      setAnimatingPeg(null);
+      setReplayInfo(null);
+      setIsReplaying(false);
+      if (replayRestoreRef.current) {
+        setPegs(replayRestoreRef.current);
+        replayRestoreRef.current = null;
+      }
+    };
+
+    // Animate one segment (a single peg gliding), then advance to the next.
+    const animateSegments = (segments, idx, done) => {
+      if (replayCancelRef.current) return;
+      if (idx >= segments.length) { done(); return; }
+      const seg = segments[idx];
+      setPegs(seg.fromPegs);
+      const path = calculateMovePath(seg.owner, seg.pegIndex, seg.card, seg.amount, seg.fromPegs);
+      if (!path.length) {
+        setPegs(seg.toPegs);
+        animateSegments(segments, idx + 1, done);
+        return;
+      }
+      setAnimatingPeg({ player: seg.owner, pegIndex: seg.pegIndex, path, currentStep: 0 });
+      let step = 0;
+      replaySegTimerRef.current = setInterval(() => {
+        if (replayCancelRef.current) {
+          clearInterval(replaySegTimerRef.current);
+          replaySegTimerRef.current = null;
+          return;
+        }
+        step++;
+        if (step >= path.length) {
+          clearInterval(replaySegTimerRef.current);
+          replaySegTimerRef.current = null;
+          setAnimatingPeg(null);
+          setPegs(seg.toPegs);
+          animateSegments(segments, idx + 1, done);
+        } else {
+          setAnimatingPeg(prev => prev ? { ...prev, currentStep: step } : null);
+        }
+      }, REPLAY_SEG_MS);
+    };
+
+    const playFrame = (i) => {
+      if (replayCancelRef.current) return;
+      if (i >= total) { finish(); return; }
+      const frame = frames[i];
+      setReplayInfo({ player: frame.player, description: frame.description, index: i + 1, total });
+      setPegs(frame.pegsBefore);
+      // Hold on the starting position, then animate (or snap, for jokers/discards).
+      replayFrameTimerRef.current = setTimeout(() => {
+        if (replayCancelRef.current) return;
+        const advance = () => {
+          setPegs(frame.pegsAfter);
+          replayFrameTimerRef.current = setTimeout(() => {
+            if (replayCancelRef.current) return;
+            playFrame(i + 1);
+          }, REPLAY_FRAME_PAUSE_MS);
+        };
+        if (frame.segments && frame.segments.length) {
+          animateSegments(frame.segments, 0, advance);
+        } else {
+          advance();
+        }
+      }, REPLAY_LEADIN_MS);
+    };
+
+    playFrame(0);
+  }, [isReplaying, pegs]);
+
+  // Abort an in-flight replay and snap the board back to the live state.
+  const stopReplay = useCallback(() => {
+    replayCancelRef.current = true;
+    if (replaySegTimerRef.current) { clearInterval(replaySegTimerRef.current); replaySegTimerRef.current = null; }
+    if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
+    setAnimatingPeg(null);
+    setReplayInfo(null);
+    setIsReplaying(false);
+    if (replayRestoreRef.current) {
+      setPegs(replayRestoreRef.current);
+      replayRestoreRef.current = null;
+    }
+  }, []);
+
+  // Clean up replay timers if the component unmounts mid-playback.
+  useEffect(() => () => {
+    if (replaySegTimerRef.current) clearInterval(replaySegTimerRef.current);
+    if (replayFrameTimerRef.current) clearTimeout(replayFrameTimerRef.current);
   }, []);
 
   // `mover` is the acting player (for stats); `moverPeg` is the peg that moved
@@ -652,6 +820,18 @@ export default function PegsAndJokers() {
       return updated;
     });
 
+    // Log AI discards into the replay buffer too, so a stuck opponent's turn is
+    // still accounted for when you watch the replay.
+    if (player !== 0) {
+      recordReplayFrame({
+        player,
+        description: autoStarted ? 'Stuck 3x — started a peg' : 'No move — discarded',
+        pegsBefore: pegs,
+        pegsAfter: newPegs,
+        segments: [],
+      });
+    }
+
     if (autoStarted) triggerMoveEffects(pegs, newPegs, player);
 
     setPegs(newPegs);
@@ -694,7 +874,7 @@ export default function PegsAndJokers() {
         // If next is AI, the useEffect will set the message
       }, 1200);
     }
-  }, [hands, deck, discardPiles, stuckCounts, pegs, triggerMoveEffects]);
+  }, [hands, deck, discardPiles, stuckCounts, pegs, triggerMoveEffects, recordReplayFrame]);
 
   // AI logic - handles players 1, 2, 3
   useEffect(() => {
@@ -790,6 +970,25 @@ export default function PegsAndJokers() {
 
         const moveDescription = getMoveDescription();
 
+        // Record this move for the instant-replay buffer. Segments capture the
+        // per-peg animation (two for a split); jokers/starts-from-nowhere snap
+        // straight to the result via pegsBefore/pegsAfter.
+        const replaySegments = [];
+        if (bestMove.type === 'split7' || bestMove.type === 'split9') {
+          const afterFirst = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
+          replaySegments.push({ owner, pegIndex: bestMove.pegIndex, card: bestMove.card, amount: bestMove.amount, fromPegs: pegs, toPegs: afterFirst });
+          replaySegments.push({ owner, pegIndex: bestMove.secondPeg, card: bestMove.card, amount: bestMove.remaining, fromPegs: afterFirst, toPegs: bestMove.newPegs });
+        } else if (bestMove.type === 'simple' || bestMove.type === 'start') {
+          replaySegments.push({ owner, pegIndex: bestMove.pegIndex, card: bestMove.card, amount: bestMove.amount, fromPegs: pegs, toPegs: bestMove.newPegs });
+        }
+        recordReplayFrame({
+          player: aiPlayer,
+          description: moveDescription,
+          pegsBefore: pegs,
+          pegsAfter: bestMove.newPegs,
+          segments: replaySegments,
+        });
+
         // If animations disabled, just complete immediately
         if (!animationsEnabled) {
           if (completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg)) return;
@@ -835,7 +1034,7 @@ export default function PegsAndJokers() {
       clearTimeout(timer);
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, gameMode]);
+  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode]);
 
   // Chime + gentle buzz when control passes back to the human player
   useEffect(() => {
@@ -891,6 +1090,7 @@ export default function PegsAndJokers() {
   // never offer to resume a finished game.
   useEffect(() => {
     if (showFirstPlayerModal || showResumeModal) return;
+    if (isReplaying) return; // don't persist the rewound board during a replay
     if (!(hands[0]?.length > 0)) return; // no game in progress yet
     if (winner !== null) {
       clearGame();
@@ -918,7 +1118,7 @@ export default function PegsAndJokers() {
   }, [
     pegs, hands, deck, discardPiles, stuckCounts, currentPlayer,
     splitRemaining, splitCard, splitPegIndex, lastMoves, moveHistory,
-    winner, showFirstPlayerModal, showResumeModal, gameMode,
+    winner, showFirstPlayerModal, showResumeModal, gameMode, isReplaying,
   ]);
 
   const selectedCardObj = selectedCard !== null ? hands[0]?.[selectedCard] ?? null : null;
@@ -930,7 +1130,7 @@ export default function PegsAndJokers() {
   // Pegs the human can legally move right now (null = highlighting inactive).
   // During the second half of a split this is the set of pegs that can finish it.
   const movablePegSet = useMemo(() => {
-    if (currentPlayer !== 0 || winner !== null || discardMode || jokerMode) return null;
+    if (currentPlayer !== 0 || winner !== null || discardMode || jokerMode || isReplaying) return null;
     if (splitRemaining !== 0 && splitCard) {
       const set = new Set();
       for (let i = 0; i < 5; i++) {
@@ -941,17 +1141,17 @@ export default function PegsAndJokers() {
     }
     if (!selectedCardObj) return null;
     return new Set(getMovablePegs(controlledOwner, selectedCardObj, pegs, moveOptions));
-  }, [currentPlayer, winner, discardMode, jokerMode, splitRemaining, splitCard, splitPegIndex, selectedCardObj, pegs, controlledOwner, moveOptions]);
+  }, [currentPlayer, winner, discardMode, jokerMode, isReplaying, splitRemaining, splitCard, splitPegIndex, selectedCardObj, pegs, controlledOwner, moveOptions]);
 
   // Tappable destination spaces for the selected peg with a 7 or 9 (ghost
   // circles on the board — tapping one picks that split amount)
   const ghostDestinations = useMemo(() => {
-    if (currentPlayer !== 0 || winner !== null || jokerMode || discardMode) return [];
+    if (currentPlayer !== 0 || winner !== null || jokerMode || discardMode || isReplaying) return [];
     if (splitRemaining !== 0 || !selectedCardObj || selectedPeg === null) return [];
     const info = CARD_VALUES[selectedCardObj.rank];
     if (!info.canSplit && !info.mustSplit) return [];
     return getValidDestinations(controlledOwner, selectedPeg, selectedCardObj, pegs, moveOptions);
-  }, [currentPlayer, winner, jokerMode, discardMode, splitRemaining, selectedCardObj, selectedPeg, pegs, controlledOwner, moveOptions]);
+  }, [currentPlayer, winner, jokerMode, discardMode, isReplaying, splitRemaining, selectedCardObj, selectedPeg, pegs, controlledOwner, moveOptions]);
 
   // Which cards in hand have at least one fully playable move (used to dim
   // dead cards; unlike hasAnyValidMove this requires splits to be completable)
@@ -961,7 +1161,7 @@ export default function PegsAndJokers() {
   }, [currentPlayer, winner, hands, pegs, controlledOwner, moveOptions]);
 
   const handleCardClick = (cardIndex) => {
-    if (currentPlayer !== 0 || winner !== null) return;
+    if (currentPlayer !== 0 || winner !== null || isReplaying) return;
     if (splitRemaining !== 0) return;
     unlockAudio();
 
@@ -981,7 +1181,7 @@ export default function PegsAndJokers() {
   };
 
   const handlePegClick = (player, pegIndex) => {
-    if (currentPlayer !== 0 || winner !== null) return;
+    if (currentPlayer !== 0 || winner !== null || isReplaying) return;
 
     // In joker mode, clicking your own peg cancels the selection
     if (jokerMode && player === controlledOwner) {
@@ -1045,6 +1245,7 @@ export default function PegsAndJokers() {
   };
 
   const handleJokerTarget = (targetPlayer, targetPegIndex) => {
+    if (isReplaying) return;
     if (!jokerMode || jokerSourcePeg === null || selectedCard === null) return;
     const actor = 0;
     const owner = controlledOwnerFor(pegs);
@@ -1120,6 +1321,7 @@ export default function PegsAndJokers() {
   // Tap on a ghost destination circle: play the selected card with the amount
   // that lands the selected peg on that space
   const handleGhostClick = (dest) => {
+    if (isReplaying) return;
     if (selectedCard === null || selectedPeg === null) return;
     const card = hands[0][selectedCard];
     executeMove(controlledOwnerFor(pegs), selectedPeg, card, dest.amount);
@@ -1615,6 +1817,40 @@ export default function PegsAndJokers() {
           {gameMessage}
         </div>
 
+        {/* Instant replay: offer a rewind when it's your turn and the AI just moved */}
+        {!isReplaying && replayReady > 0 && currentPlayer === 0 && winner === null && (
+          <div className="text-center mb-4">
+            <button
+              onClick={startReplay}
+              className="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded font-semibold"
+            >
+              📺 Instant Replay ({replayReady} {replayReady === 1 ? 'move' : 'moves'})
+            </button>
+          </div>
+        )}
+
+        {/* Playback banner while the replay runs */}
+        {isReplaying && replayInfo && (
+          <div className="mb-4 p-3 rounded flex items-center justify-between gap-3 bg-purple-900">
+            <div className="text-sm min-w-0">
+              <span className="font-bold">📺 Instant Replay</span>{' '}
+              <span className="text-gray-300">({replayInfo.index}/{replayInfo.total})</span>
+              <div className="truncate">
+                <span className="font-semibold" style={{ color: PLAYER_COLORS[replayInfo.player] }}>
+                  {PLAYER_NAMES[replayInfo.player]}
+                </span>
+                <span className="text-gray-200"> — {replayInfo.description}</span>
+              </div>
+            </div>
+            <button
+              onClick={stopReplay}
+              className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm flex-shrink-0"
+            >
+              Stop
+            </button>
+          </div>
+        )}
+
         <div className="flex flex-col lg:flex-row gap-4 items-center lg:items-start">
           {/* Game Board */}
           <div className="flex-shrink-0 w-full max-w-[400px]">
@@ -1990,7 +2226,7 @@ export default function PegsAndJokers() {
               </div>
             )}
 
-            {currentPlayer === 0 && !jokerMode && !splitRemaining && !discardMode && hands[0]?.length > 0 && (
+            {currentPlayer === 0 && !jokerMode && !splitRemaining && !discardMode && !isReplaying && hands[0]?.length > 0 && (
               <div className="mb-4">
                 {!playableCards.some(Boolean) ? (
                   <div>
