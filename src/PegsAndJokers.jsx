@@ -61,6 +61,10 @@ export default function PegsAndJokers() {
   const [splitRemaining, setSplitRemaining] = useState(0);
   const [splitCard, setSplitCard] = useState(null);
   const [splitPegIndex, setSplitPegIndex] = useState(null); // Track which peg was moved in first part of split
+  // Snapshot of the board taken right before the first half of a split is played,
+  // so the player can undo a mis-tapped split and start their turn over. Held
+  // only while a split is half-finished; cleared once the second peg commits it.
+  const [splitUndo, setSplitUndo] = useState(null); // { pegs, lastMoves } | null
   const [jokerMode, setJokerMode] = useState(false); // true when waiting for target selection
   const [jokerSourcePeg, setJokerSourcePeg] = useState(null); // which of player's pegs to move
   const [discardMode, setDiscardMode] = useState(false); // true when player is selecting a card to discard
@@ -170,6 +174,7 @@ export default function PegsAndJokers() {
     setSplitRemaining(0);
     setSplitCard(null);
     setSplitPegIndex(null);
+    setSplitUndo(null);
     setJokerMode(false);
     setJokerSourcePeg(null);
     setDiscardMode(false);
@@ -280,6 +285,7 @@ export default function PegsAndJokers() {
     setSplitRemaining(saved.splitRemaining ?? 0);
     setSplitCard(saved.splitCard ?? null);
     setSplitPegIndex(saved.splitPegIndex ?? null);
+    setSplitUndo(null); // no undo snapshot survives a save/resume
     setLastMoves(saved.lastMoves ?? [null, null, null, null]);
     setMoveHistory(saved.moveHistory ?? []);
 
@@ -623,8 +629,9 @@ export default function PegsAndJokers() {
       setSplitRemaining(remaining);
       setSplitCard(card);
       setSplitPegIndex(pegIndex); // Track which peg was moved first
+      setSplitUndo({ pegs, lastMoves }); // pre-move board, so a mis-tap can be undone
       setSelectedPeg(null);
-      setGameMessage(`Tap a glowing peg to move the remaining ${remaining} spaces.`);
+      setGameMessage(`Tap a glowing peg to move the remaining ${remaining} spaces (or Undo).`);
       return true;
     }
 
@@ -635,8 +642,9 @@ export default function PegsAndJokers() {
       setSplitRemaining(splitAmount > 0 ? -remaining : remaining);
       setSplitCard(card);
       setSplitPegIndex(pegIndex); // Track which peg was moved first
+      setSplitUndo({ pegs, lastMoves }); // pre-move board, so a mis-tap can be undone
       setSelectedPeg(null);
-      setGameMessage(`Tap a glowing peg to move ${remaining} spaces ${direction}.`);
+      setGameMessage(`Tap a glowing peg to move ${remaining} spaces ${direction} (or Undo).`);
       return true;
     }
 
@@ -680,7 +688,7 @@ export default function PegsAndJokers() {
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
 
     return true;
-  }, [pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, moveOptions, gameMode]);
+  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
     const actor = 0;
@@ -751,12 +759,36 @@ export default function PegsAndJokers() {
     setSplitRemaining(0);
     setSplitCard(null);
     setSplitPegIndex(null);
+    setSplitUndo(null);
     const nextPlayer = (actor + 1) % 4;
     setCurrentPlayer(nextPlayer);
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
 
     return true;
   }, [splitCard, splitPegIndex, pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode]);
+
+  // Undo a half-finished split: restore the board (and anything the first half
+  // bumped) to the snapshot taken before it, and return the turn to the point
+  // where the card is selected and pegs are glowing, ready to try again. This is
+  // only available between the two halves of a split — once the second peg is
+  // played the move is committed and there's nothing to undo.
+  const undoSplit = useCallback(() => {
+    if (!splitUndo) return;
+    // Cancel any in-flight bump fly-back from the first half before restoring.
+    if (bumpFxRef.current) {
+      clearInterval(bumpFxRef.current);
+      bumpFxRef.current = null;
+    }
+    setBumpFx(null);
+    setPegs(splitUndo.pegs);
+    setLastMoves(splitUndo.lastMoves);
+    setSplitRemaining(0);
+    setSplitCard(null);
+    setSplitPegIndex(null);
+    setSplitUndo(null);
+    setSelectedPeg(null); // keep the card selected so pegs re-glow for another try
+    setGameMessage('Split undone. Select a peg to move.');
+  }, [splitUndo]);
 
   const discardAndDraw = useCallback((player, cardIndex = 0) => {
     if (hands[player].length === 0) return;
@@ -1816,6 +1848,19 @@ export default function PegsAndJokers() {
         <div className="text-center mb-4 p-2 bg-gray-800 rounded">
           {gameMessage}
         </div>
+
+        {/* Undo a mis-tapped split: only available between the two halves of a
+            split, before the second peg commits the move */}
+        {splitUndo && splitRemaining !== 0 && currentPlayer === 0 && winner === null && !isReplaying && (
+          <div className="text-center mb-4">
+            <button
+              onClick={undoSplit}
+              className="px-4 py-2 bg-amber-600 hover:bg-amber-700 rounded font-semibold"
+            >
+              ↩️ Undo Split
+            </button>
+          </div>
+        )}
 
         {/* Instant replay: offer a rewind when it's your turn and the AI just moved */}
         {!isReplaying && replayReady > 0 && currentPlayer === 0 && winner === null && (
