@@ -2271,26 +2271,12 @@ export default function PegsAndJokers() {
               </div>
             )}
 
-            {currentPlayer === 0 && !jokerMode && !splitRemaining && !discardMode && !isReplaying && hands[0]?.length > 0 && (
+            {/* Discarding is only allowed when the player is genuinely stuck (no
+                legal move). If any card can be played, no discard option is shown
+                so the player can't skip a turn they're required to play. */}
+            {currentPlayer === 0 && !jokerMode && !splitRemaining && !discardMode && !isReplaying && hands[0]?.length > 0 && !playableCards.some(Boolean) && (
               <div className="mb-4">
-                {!playableCards.some(Boolean) ? (
-                  <div>
-                    <button
-                      onClick={() => {
-                        setDiscardMode(true);
-                        setSelectedCard(null);
-                        setSelectedPeg(null);
-                        setGameMessage('Select a card to discard.');
-                      }}
-                      className="px-4 py-2 bg-red-600 rounded hover:bg-red-700 font-bold"
-                    >
-                      No Valid Move - Select Card to Discard {stuckCounts[0] > 0 && `(${stuckCounts[0]}/3)`}
-                    </button>
-                    {stuckCounts[0] === 2 && (
-                      <p className="text-yellow-400 text-sm mt-1">Next stuck discard will let you start a peg!</p>
-                    )}
-                  </div>
-                ) : (
+                <div>
                   <button
                     onClick={() => {
                       setDiscardMode(true);
@@ -2298,11 +2284,14 @@ export default function PegsAndJokers() {
                       setSelectedPeg(null);
                       setGameMessage('Select a card to discard.');
                     }}
-                    className="px-4 py-2 bg-gray-600 rounded hover:bg-gray-700 text-sm"
+                    className="px-4 py-2 bg-red-600 rounded hover:bg-red-700 font-bold"
                   >
-                    Discard & Pass (if stuck)
+                    No Valid Move - Select Card to Discard {stuckCounts[0] > 0 && `(${stuckCounts[0]}/3)`}
                   </button>
-                )}
+                  {stuckCounts[0] === 2 && (
+                    <p className="text-yellow-400 text-sm mt-1">Next stuck discard will let you start a peg!</p>
+                  )}
+                </div>
               </div>
             )}
 
