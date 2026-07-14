@@ -102,6 +102,16 @@ describe('recordGame', () => {
     expect(s.randomFirst).toEqual({ games: 1, wins: 1 });
   });
 
+  it('splits games by game mode, defaulting to solo', () => {
+    let s = createEmptyStats();
+    s = recordGame(s, win()); // no mode -> solo
+    s = recordGame(s, loss({ mode: 'classic' }));
+    s = recordGame(s, win({ mode: 'partners' }));
+    s = recordGame(s, win({ mode: 'partners' }));
+    expect(s.soloGames).toEqual({ games: 2, wins: 1 });
+    expect(s.partnerGames).toEqual({ games: 2, wins: 2 });
+  });
+
   it('attributes losses to the winning opponent', () => {
     let s = createEmptyStats();
     s = recordGame(s, loss({ winner: 2 }));

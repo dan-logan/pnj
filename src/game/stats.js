@@ -24,6 +24,8 @@ export function createEmptyStats() {
     timesBumped: 0, // your pegs opponents sent home
     chosenFirst: { games: 0, wins: 0 }, // games where you took the first turn
     randomFirst: { games: 0, wins: 0 }, // games where first player was random
+    soloGames: { games: 0, wins: 0 }, // classic mode (you vs 3 AI)
+    partnerGames: { games: 0, wins: 0 }, // partner mode (you + partner vs 2 AI)
     lossesByOpponent: { 1: 0, 2: 0, 3: 0 }, // Blue, Pink, Green
   };
 }
@@ -48,6 +50,8 @@ export function loadStats(storage) {
       ...parsed,
       chosenFirst: { ...base.chosenFirst, ...(parsed.chosenFirst || {}) },
       randomFirst: { ...base.randomFirst, ...(parsed.randomFirst || {}) },
+      soloGames: { ...base.soloGames, ...(parsed.soloGames || {}) },
+      partnerGames: { ...base.partnerGames, ...(parsed.partnerGames || {}) },
       lossesByOpponent: { ...base.lossesByOpponent, ...(parsed.lossesByOpponent || {}) },
     };
   } catch {
@@ -85,6 +89,7 @@ export function resetStats(storage) {
 //   winner: number,          // 0 = you, 1/2/3 = the AI that won
 //   turns: number,           // total turns taken in the game
 //   startMode: 'chosen' | 'random',
+//   mode: 'classic' | 'partners', // which game mode was played
 //   jokersPlayed: number,    // jokers you played this game
 //   bumpsDelivered: number,  // opponent pegs you bumped this game
 //   timesBumped: number,     // your pegs bumped this game
@@ -95,6 +100,7 @@ export function recordGame(stats, result) {
     winner,
     turns = 0,
     startMode = 'chosen',
+    mode = 'classic',
     jokersPlayed = 0,
     bumpsDelivered = 0,
     timesBumped = 0,
@@ -104,6 +110,8 @@ export function recordGame(stats, result) {
     ...stats,
     chosenFirst: { ...stats.chosenFirst },
     randomFirst: { ...stats.randomFirst },
+    soloGames: { ...stats.soloGames },
+    partnerGames: { ...stats.partnerGames },
     lossesByOpponent: { ...stats.lossesByOpponent },
   };
 
@@ -133,6 +141,10 @@ export function recordGame(stats, result) {
   const bucket = startMode === 'random' ? next.randomFirst : next.chosenFirst;
   bucket.games += 1;
   if (won) bucket.wins += 1;
+
+  const modeBucket = mode === 'partners' ? next.partnerGames : next.soloGames;
+  modeBucket.games += 1;
+  if (won) modeBucket.wins += 1;
 
   return next;
 }

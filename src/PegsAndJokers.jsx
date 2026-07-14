@@ -1105,6 +1105,7 @@ export default function PegsAndJokers() {
       winner,
       turns: turnsRef.current + 1, // include the winning turn
       startMode: startModeRef.current,
+      mode: gameMode,
       jokersPlayed: jokersThisGameRef.current,
       bumpsDelivered: bumpsDeliveredThisGameRef.current,
       timesBumped: timesBumpedThisGameRef.current
@@ -1747,6 +1748,29 @@ export default function PegsAndJokers() {
                       <span className="font-semibold">
                         {stats.randomFirst.games > 0
                           ? `${Math.round(bucketWinRate(stats.randomFirst) * 100)}% (${stats.randomFirst.games})`
+                          : '—'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Win rate by game mode */}
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-300 mb-2">Solo vs partner</h3>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div className="flex justify-between bg-gray-700/50 rounded px-3 py-2">
+                      <span className="text-gray-400">Solo</span>
+                      <span className="font-semibold">
+                        {stats.soloGames.games > 0
+                          ? `${Math.round(bucketWinRate(stats.soloGames) * 100)}% (${stats.soloGames.games})`
+                          : '—'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between bg-gray-700/50 rounded px-3 py-2">
+                      <span className="text-gray-400">Partner</span>
+                      <span className="font-semibold">
+                        {stats.partnerGames.games > 0
+                          ? `${Math.round(bucketWinRate(stats.partnerGames) * 100)}% (${stats.partnerGames.games})`
                           : '—'}
                       </span>
                     </div>
