@@ -6,6 +6,7 @@ import {
   getHomeEntrance,
   isValidMove,
   applyMove,
+  applyComeOut,
   applyJoker,
   checkWinner,
   getValidDestinations,
@@ -149,6 +150,102 @@ describe('friendly partner bump: illegal when the entrance is blocked by a sibli
     // The friendly bump would need to send the partner to the space it already
     // occupies, which the mover is taking → no legal target.
     expect(isValidMove(0, 0, card('JOKER'), pegs, null, P0)).toBe(false);
+  });
+});
+
+describe('friendly partner bump: landing on a partner already on its own entrance', () => {
+  // A partner sitting on its own home-entrance space can still be bumped: it
+  // keeps that space (a peg can't block itself) and the mover is friendly-bumped
+  // on to its own home entrance instead.
+  const entrance2 = getHomeEntrance(2); // 39, the partner's home entrance
+
+  it('lets a backward move land on a partner sitting on its entrance', () => {
+    // Yellow eight spaces past the partner's entrance; partner is on the entrance.
+    const pegs = pegState([[0, 0, onTrack(entrance2 + 8)], [2, 0, onTrack(entrance2)]]);
+    expect(isValidMove(0, 0, card('8'), pegs, null, P0)).toBe(true);
+    const { newPegs, bumpedOpponent } = applyMove(0, 0, card('8'), null, pegs, P0);
+    expect(bumpedOpponent).toBe(true);
+    // Partner stays put on its entrance; the mover is shoved to its own entrance.
+    expect(newPegs[2][0]).toMatchObject({ location: 'track', position: entrance2 });
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: getHomeEntrance(0) });
+  });
+
+  it('cascades an opponent off the mover’s own entrance during the swap', () => {
+    const pegs = pegState([
+      [0, 0, onTrack(entrance2 + 8)],
+      [2, 0, onTrack(entrance2)],
+      [1, 0, onTrack(getHomeEntrance(0))], // opponent squatting on the mover's entrance
+    ]);
+    const { newPegs } = applyMove(0, 0, card('8'), null, pegs, P0);
+    expect(newPegs[2][0]).toMatchObject({ location: 'track', position: entrance2 });
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: getHomeEntrance(0) });
+    expect(newPegs[1][0]).toMatchObject({ location: 'start' });
+  });
+
+  it('rejects the swap when the mover’s own entrance is held by its own peg', () => {
+    const pegs = pegState([
+      [0, 0, onTrack(entrance2 + 8)],
+      [0, 1, onTrack(getHomeEntrance(0))], // mover's own peg blocks its entrance
+      [2, 0, onTrack(entrance2)],
+    ]);
+    expect(isValidMove(0, 0, card('8'), pegs, null, P0)).toBe(false);
+  });
+
+  it('still knocks a non-partner off that space back to start in classic mode', () => {
+    const pegs = pegState([[0, 0, onTrack(entrance2 + 8)], [2, 0, onTrack(entrance2)]]);
+    const { newPegs } = applyMove(0, 0, card('8'), null, pegs); // classic
+    expect(newPegs[2][0]).toMatchObject({ location: 'start' });
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: entrance2 });
+  });
+});
+
+describe('applyComeOut (stuck-3 mercy start) keeps partner rules', () => {
+  const startPos0 = getStartPosition(0);
+
+  it('friendly-bumps a partner off the come-out space to its home entrance', () => {
+    const pegs = pegState([[2, 0, onTrack(startPos0)]]);
+    const { newPegs, ok } = applyComeOut(0, 0, pegs, { actor: 0, mode: GAME_MODES.PARTNERS });
+    expect(ok).toBe(true);
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: startPos0 });
+    expect(newPegs[2][0]).toMatchObject({ location: 'track', position: getHomeEntrance(2) });
+  });
+
+  it('falls back to start only when the partner’s entrance is blocked by its own peg', () => {
+    const pegs = pegState([
+      [2, 0, onTrack(startPos0)],
+      [2, 1, onTrack(getHomeEntrance(2))], // blocks the friendly bump
+    ]);
+    const { newPegs, ok } = applyComeOut(0, 0, pegs, { actor: 0, mode: GAME_MODES.PARTNERS });
+    expect(ok).toBe(true);
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: startPos0 });
+    expect(newPegs[2][0]).toMatchObject({ location: 'start' });
+    expect(newPegs[2][1]).toMatchObject({ location: 'track', position: getHomeEntrance(2) });
+  });
+
+  it('knocks an opponent on the come-out space back to start', () => {
+    const pegs = pegState([[1, 0, onTrack(startPos0)]]);
+    const { newPegs, ok, bumpedOpponent } = applyComeOut(0, 0, pegs, { actor: 0, mode: GAME_MODES.PARTNERS });
+    expect(ok).toBe(true);
+    expect(bumpedOpponent).toBe(true);
+    expect(newPegs[1][0]).toMatchObject({ location: 'start' });
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: startPos0 });
+  });
+
+  it('refuses when one of the player’s own pegs already holds the come-out space', () => {
+    const pegs = pegState([[0, 1, onTrack(startPos0)]]);
+    const { ok } = applyComeOut(0, 0, pegs, { actor: 0, mode: GAME_MODES.PARTNERS });
+    expect(ok).toBe(false);
+  });
+
+  it('a normal validated come-out is still blocked when the partner’s entrance is jammed', () => {
+    // The scenario that used to silently revert to solo rules: partner on your
+    // come-out space, its entrance held by its own peg. A face-card start is
+    // rejected; only the mercy start (applyComeOut) may force it.
+    const pegs = pegState([
+      [2, 0, onTrack(startPos0)],
+      [2, 1, onTrack(getHomeEntrance(2))],
+    ]);
+    expect(isValidMove(0, 0, card('K'), pegs, null, P0)).toBe(false);
   });
 });
 
