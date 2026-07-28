@@ -7,6 +7,15 @@
 
 export const STATS_STORAGE_KEY = 'pnj:playerStats:v1';
 
+// The fewest turns any real game can possibly last. Winning means bringing all
+// five of your pegs out of start and all the way home, so a genuine game runs
+// well into the dozens (usually hundreds) of turns. A recorded "win" shorter
+// than this can only mean the per-game turn tally was lost or corrupted — e.g. a
+// game resumed from a snapshot whose stored turn count was missing or zero, which
+// records `turns` as `1`. We refuse to let such a value poison the "fastest win"
+// record (Topher's bug report: a fastest win of one turn, which is impossible).
+export const MIN_PLAUSIBLE_WIN_TURNS = 5;
+
 // A fresh stats object. Every field the app reads is defined here so that
 // loadStats can safely merge older/partial saved data over this shape.
 export function createEmptyStats() {
@@ -127,7 +136,10 @@ export function recordGame(stats, result) {
     if (next.currentStreak > next.longestWinStreak) {
       next.longestWinStreak = next.currentStreak;
     }
-    if (next.fastestWinTurns === null || turns < next.fastestWinTurns) {
+    // Only count plausible game lengths toward the fastest-win record. A turn
+    // count below the floor is corrupt tally data, not a real lightning victory.
+    if (turns >= MIN_PLAUSIBLE_WIN_TURNS &&
+        (next.fastestWinTurns === null || turns < next.fastestWinTurns)) {
       next.fastestWinTurns = turns;
     }
   } else {
