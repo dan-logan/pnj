@@ -105,9 +105,10 @@ export function findPegAtPosition(position, playerPegs) {
 // if it is occupied by one of that owner's own pegs, the friendly bump has
 // nowhere to go and the move is illegal — just like landing on your own peg.
 //
-// `reservedPos` is the track space the mover itself will occupy; a friendly bump
-// can never be sent there.
-function resolveDisplacement(newPegs, ownerP, idx, actor, mode, reservedPos, depth = 0) {
+// `reservedPos` is the track space the mover itself will occupy. `mover`
+// (`{ player, pegIndex }` or null) identifies that moving peg so the "peg on its
+// own entrance" swap below can relocate it.
+function resolveDisplacement(newPegs, ownerP, idx, actor, mode, reservedPos, mover = null, depth = 0) {
   if (depth > 12) return false; // guard against a pathological cascade cycle
   const friendly = mode === GAME_MODES.PARTNERS && sameTeam(ownerP, actor);
   if (!friendly) {
@@ -115,13 +116,23 @@ function resolveDisplacement(newPegs, ownerP, idx, actor, mode, reservedPos, dep
     return true;
   }
   const target = getHomeEntrance(ownerP);
-  if (target === reservedPos) return false; // the mover is taking this space
+  if (target === reservedPos) {
+    // The friendly-bump destination is exactly the space the mover is taking.
+    // This only happens when the bumped peg is already sitting on its own home
+    // entrance and the mover lands on it. A peg can't block itself: the bumped
+    // peg keeps that space and instead shoves the mover onward — a friendly bump
+    // of the mover to its own home entrance (cascading from there). Without a
+    // mover to relocate (e.g. the joker path, which we don't support here) the
+    // bump has nowhere to resolve and is illegal.
+    if (!mover) return false;
+    return resolveDisplacement(newPegs, mover.player, mover.pegIndex, actor, mode, reservedPos, null, depth + 1);
+  }
   // Detach the peg first so a cascade lookup can't treat it as blocking itself.
   newPegs[ownerP][idx] = { location: 'start', index: idx };
   const occ = findPegAtPosition(target, newPegs);
   if (occ) {
     if (occ.player === ownerP) return false; // this owner's own peg holds the entrance
-    if (!resolveDisplacement(newPegs, occ.player, occ.pegIndex, actor, mode, reservedPos, depth + 1)) {
+    if (!resolveDisplacement(newPegs, occ.player, occ.pegIndex, actor, mode, reservedPos, mover, depth + 1)) {
       return false;
     }
   }
@@ -132,11 +143,11 @@ function resolveDisplacement(newPegs, ownerP, idx, actor, mode, reservedPos, dep
 // True when the peg at `position` can be legally bumped by `actor` (used by
 // isValidMove). Opponent bumps are always legal; a friendly partner bump is only
 // illegal when its placement (or cascade) has nowhere to go.
-function canBumpPegAt(position, actor, mode, currentPegs, reservedPos) {
+function canBumpPegAt(position, actor, mode, currentPegs, reservedPos, mover = null) {
   const occ = findPegAtPosition(position, currentPegs);
   if (!occ) return true;
   const clone = currentPegs.map(p => p.map(pg => ({ ...pg })));
-  return resolveDisplacement(clone, occ.player, occ.pegIndex, actor, mode, reservedPos);
+  return resolveDisplacement(clone, occ.player, occ.pegIndex, actor, mode, reservedPos, mover);
 }
 
 // True when the joker has at least one legally bumpable target: any peg on the
@@ -317,7 +328,9 @@ export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = nu
     return false;
   }
   // Landing on a teammate friendly-bumps them; reject if that bump is illegal.
-  if (pegAtNewPos && !canBumpPegAt(newPos, actor, mode, currentPegs, newPos)) {
+  // Pass the mover so a landing on a partner sitting on its own home entrance
+  // (which shoves the mover onward instead) can be resolved.
+  if (pegAtNewPos && !canBumpPegAt(newPos, actor, mode, currentPegs, newPos, { player, pegIndex })) {
     return false;
   }
 
@@ -409,7 +422,12 @@ export function applyMove(player, pegIndex, card, amount, currentPegs, options =
     // Bump the occupying peg if present (opponent → start, teammate → friendly).
     const bumpedOpponent = pegAtStart && pegAtStart.player !== player;
     if (bumpedOpponent) {
-      resolveDisplacement(newPegs, pegAtStart.player, pegAtStart.pegIndex, actor, mode, startPos);
+      // If the friendly bump is illegal (a partner whose entrance is blocked by
+      // its own peg), the come-out is illegal too — leave the state untouched.
+      // isValidMove already guards this, so this is defensive.
+      if (!resolveDisplacement(newPegs, pegAtStart.player, pegAtStart.pegIndex, actor, mode, startPos)) {
+        return { newPegs: currentPegs, bumpedOpponent: false };
+      }
     }
     peg.location = 'track';
     peg.position = startPos;
@@ -506,15 +524,55 @@ export function applyMove(player, pegIndex, card, amount, currentPegs, options =
 
   const pegAtNewPos = findPegAtPosition(newPos, newPegs);
   if (pegAtNewPos && pegAtNewPos.player !== player) {
-    // Detach the mover during the cascade so it can't block a friendly bump,
-    // then land it on the vacated space.
+    const swap = mode === GAME_MODES.PARTNERS
+      && sameTeam(pegAtNewPos.player, actor)
+      && getHomeEntrance(pegAtNewPos.player) === newPos;
+    // Detach the mover during the cascade so it can't block a friendly bump.
     newPegs[player][pegIndex] = { location: 'start', index: pegIndex };
-    resolveDisplacement(newPegs, pegAtNewPos.player, pegAtNewPos.pegIndex, actor, mode, newPos);
+    resolveDisplacement(newPegs, pegAtNewPos.player, pegAtNewPos.pegIndex, actor, mode, newPos, { player, pegIndex });
+    if (swap) {
+      // Landed on a partner sitting on its own home entrance: the partner keeps
+      // that space and the mover was friendly-bumped on to its own home entrance
+      // by resolveDisplacement, so don't re-place the mover at newPos.
+      return { newPegs, bumpedOpponent: true };
+    }
+    // Otherwise land the mover on the vacated space.
     newPegs[player][pegIndex] = peg;
   }
 
   peg.position = newPos;
   return { newPegs, bumpedOpponent: !!pegAtNewPos };
+}
+
+// Move a peg out of the start area onto its come-out space, applying the partner
+// friendly-bump rule to whatever occupies that space. Used by the "stuck 3 turns"
+// mercy start, which frees a player regardless of the cards in hand and so isn't
+// routed through applyMove. In partner mode a teammate on the come-out space is
+// friendly-bumped to its home entrance (cascading) exactly like any other move.
+// The one concession to keeping a stuck player moving: if that friendly bump is
+// illegal because the teammate's entrance is blocked by its own peg, the occupant
+// is sent back to start rather than aborting the mercy start. Returns
+// { newPegs, ok, bumpedOpponent }; ok is false only when one of the player's own
+// pegs already holds the come-out space.
+export function applyComeOut(player, pegIndex, currentPegs, options = {}) {
+  const { actor = player, mode = GAME_MODES.CLASSIC } = options;
+  const newPegs = currentPegs.map(p => p.map(pg => ({ ...pg })));
+  const startPos = getStartPosition(player);
+  const occ = findPegAtPosition(startPos, newPegs);
+  if (occ && occ.player === player) {
+    return { newPegs: currentPegs, ok: false, bumpedOpponent: false };
+  }
+  let bumpedOpponent = false;
+  if (occ) {
+    bumpedOpponent = mode !== GAME_MODES.PARTNERS || !sameTeam(occ.player, actor);
+    if (!resolveDisplacement(newPegs, occ.player, occ.pegIndex, actor, mode, startPos)) {
+      // Partner's entrance is blocked; fall back to a plain send-to-start so the
+      // stuck player can still break free.
+      newPegs[occ.player][occ.pegIndex] = { location: 'start', index: occ.pegIndex };
+    }
+  }
+  newPegs[player][pegIndex] = { location: 'track', position: startPos, index: pegIndex };
+  return { newPegs, ok: true, bumpedOpponent };
 }
 
 // Enumerate every legal landing spot for playing `card` with this peg.

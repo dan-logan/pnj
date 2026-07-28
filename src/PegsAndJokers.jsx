@@ -12,12 +12,11 @@ import {
 import { createDeck, drawCard } from './game/deck.js';
 import {
   createInitialPegs,
-  getStartPosition,
   getHomeEntrance,
   describeMoveAction,
-  findPegAtPosition,
   isValidMove,
   applyMove,
+  applyComeOut,
   applyJoker,
   checkWinner,
   calculateMovePath,
@@ -813,30 +812,17 @@ export default function PegsAndJokers() {
     let newPegs = pegs;
     let autoStarted = false;
     if (newStuckCounts[player] >= 3) {
-      // Find a peg in start and move it to come-out position
+      // Find a peg in start and move it to come-out position. applyComeOut keeps
+      // partner-mode rules intact: a teammate on the come-out space is
+      // friendly-bumped to its home entrance (not knocked to start) exactly like
+      // any other move, so this mercy start doesn't quietly fall back to solo
+      // rules for the rest of the game.
       const pegInStart = pegs[player].findIndex(p => p.location === 'start');
       if (pegInStart !== -1) {
-        const startPos = getStartPosition(player);
-        const pegAtStart = findPegAtPosition(startPos, pegs);
-
-        // Only auto-start if come-out spot is free of own peg
-        const ownPegAtStart = pegs[player].some(p => p.location === 'track' && p.position === startPos);
-
-        if (!ownPegAtStart) {
-          newPegs = pegs.map((playerPegs) => playerPegs.map(peg => ({ ...peg })));
-
-          // Bump opponent if present
-          if (pegAtStart && pegAtStart.player !== player) {
-            newPegs[pegAtStart.player][pegAtStart.pegIndex] = { location: 'start', index: pegAtStart.pegIndex };
-          }
-
-          // Move our peg out
-          newPegs[player][pegInStart].location = 'track';
-          newPegs[player][pegInStart].position = startPos;
-
-          newStuckCounts[player] = 0;
+        const { newPegs: afterStart, ok } = applyComeOut(player, pegInStart, pegs, { actor: player, mode: gameMode });
+        if (ok) {
+          newPegs = afterStart;
           autoStarted = true;
-
           if (player === 0) {
             setGameMessage('After 3 stuck turns, you start a peg!');
           }
@@ -906,7 +892,7 @@ export default function PegsAndJokers() {
         // If next is AI, the useEffect will set the message
       }, 1200);
     }
-  }, [hands, deck, discardPiles, stuckCounts, pegs, triggerMoveEffects, recordReplayFrame]);
+  }, [hands, deck, discardPiles, stuckCounts, pegs, triggerMoveEffects, recordReplayFrame, gameMode]);
 
   // AI logic - handles players 1, 2, 3
   useEffect(() => {
