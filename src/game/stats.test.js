@@ -84,6 +84,19 @@ describe('recordGame', () => {
     expect(s.fastestWinTurns).toBe(25);
   });
 
+  it('ignores an impossibly short win (corrupt turn tally) for fastest win', () => {
+    let s = createEmptyStats();
+    s = recordGame(s, win({ turns: 30 }));
+    // A game resumed from a snapshot with a lost turn tally records turns: 1.
+    // That's shorter than any real game and must not become the fastest win.
+    s = recordGame(s, win({ turns: 1 }));
+    expect(s.fastestWinTurns).toBe(30);
+    // Even from a clean slate, a bogus 1-turn win leaves fastest win unset.
+    let fresh = createEmptyStats();
+    fresh = recordGame(fresh, win({ turns: 1 }));
+    expect(fresh.fastestWinTurns).toBeNull();
+  });
+
   it('accumulates joker and bump tallies', () => {
     let s = createEmptyStats();
     s = recordGame(s, win({ jokersPlayed: 2, bumpsDelivered: 3, timesBumped: 1 }));

@@ -194,9 +194,12 @@ export default function PegsAndJokers() {
     }
     resetReplay();
     replayPrevPlayerRef.current = firstPlayer;
-    // Reset per-game stat tallies for the new game
+    // Reset per-game stat tallies for the new game. Seed the turn tracker to the
+    // first player (not null) so the very first hand-off is counted — otherwise a
+    // game the first player wins is under-counted by one turn. (applySavedGame
+    // seeds it the same way when resuming.)
     turnsRef.current = 0;
-    prevTurnPlayerRef.current = null;
+    prevTurnPlayerRef.current = firstPlayer;
     jokersThisGameRef.current = 0;
     bumpsDeliveredThisGameRef.current = 0;
     timesBumpedThisGameRef.current = 0;
