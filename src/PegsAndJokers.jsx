@@ -23,7 +23,8 @@ import {
   getValidDestinations,
   getMovablePegs,
   findBumps,
-  findFriendlyBumps
+  findFriendlyBumps,
+  splitCompleter
 } from './game/engine.js';
 import { findBestAIMove } from './game/ai.js';
 import {
@@ -60,6 +61,7 @@ export default function PegsAndJokers() {
   const [splitRemaining, setSplitRemaining] = useState(0);
   const [splitCard, setSplitCard] = useState(null);
   const [splitPegIndex, setSplitPegIndex] = useState(null); // Track which peg was moved in first part of split
+  const [splitOwner, setSplitOwner] = useState(null); // Owner of the first-half peg (may differ from the completer when your last peg goes home)
   // Snapshot of the board taken right before the first half of a split is played,
   // so the player can undo a mis-tapped split and start their turn over. Held
   // only while a split is half-finished; cleared once the second peg commits it.
@@ -173,6 +175,7 @@ export default function PegsAndJokers() {
     setSplitRemaining(0);
     setSplitCard(null);
     setSplitPegIndex(null);
+    setSplitOwner(null);
     setSplitUndo(null);
     setJokerMode(false);
     setJokerSourcePeg(null);
@@ -287,6 +290,7 @@ export default function PegsAndJokers() {
     setSplitRemaining(saved.splitRemaining ?? 0);
     setSplitCard(saved.splitCard ?? null);
     setSplitPegIndex(saved.splitPegIndex ?? null);
+    setSplitOwner(saved.splitOwner ?? null);
     setSplitUndo(null); // no undo snapshot survives a save/resume
     setLastMoves(saved.lastMoves ?? [null, null, null, null]);
     setMoveHistory(saved.moveHistory ?? []);
@@ -565,11 +569,13 @@ export default function PegsAndJokers() {
       // Simulate the first move to get the intermediate state
       const { newPegs: afterFirstMove } = applyMove(owner, pegIndex, card, splitAmount, pegs, moveOptions);
 
-      // Check if there's at least one other peg that can make the second move
+      // The completing peg is normally the same owner, but a first half that
+      // brings your last peg home hands the remainder to your partner.
+      const completer = splitCompleter(owner, afterFirstMove, moveOptions);
       let hasValidSecondPeg = false;
       for (let secondPeg = 0; secondPeg < 5; secondPeg++) {
-        if (secondPeg === pegIndex) continue; // Must use a different peg
-        if (isValidMove(owner, secondPeg, card, afterFirstMove, remaining, moveOptions)) {
+        if (completer === owner && secondPeg === pegIndex) continue; // Must use a different peg
+        if (isValidMove(completer, secondPeg, card, afterFirstMove, remaining, moveOptions)) {
           hasValidSecondPeg = true;
           break;
         }
@@ -588,11 +594,13 @@ export default function PegsAndJokers() {
       // Simulate the first move to get the intermediate state
       const { newPegs: afterFirstMove } = applyMove(owner, pegIndex, card, splitAmount, pegs, moveOptions);
 
-      // Check if there's at least one OTHER peg that can make the second move
+      // The completing peg is normally the same owner, but a first half that
+      // brings your last peg home hands the remainder to your partner.
+      const completer = splitCompleter(owner, afterFirstMove, moveOptions);
       let hasValidSecondPeg = false;
       for (let secondPeg = 0; secondPeg < 5; secondPeg++) {
-        if (secondPeg === pegIndex) continue; // Must use a different peg
-        if (isValidMove(owner, secondPeg, card, afterFirstMove, remaining, moveOptions)) {
+        if (completer === owner && secondPeg === pegIndex) continue; // Must use a different peg
+        if (isValidMove(completer, secondPeg, card, afterFirstMove, remaining, moveOptions)) {
           hasValidSecondPeg = true;
           break;
         }
@@ -631,6 +639,7 @@ export default function PegsAndJokers() {
       setSplitRemaining(remaining);
       setSplitCard(card);
       setSplitPegIndex(pegIndex); // Track which peg was moved first
+      setSplitOwner(owner); // and whose peg it was, so the completer collision check is owner-aware
       setSplitUndo({ pegs, lastMoves }); // pre-move board, so a mis-tap can be undone
       setSelectedPeg(null);
       setGameMessage(`Tap a glowing peg to move the remaining ${remaining} spaces (or Undo).`);
@@ -644,6 +653,7 @@ export default function PegsAndJokers() {
       setSplitRemaining(splitAmount > 0 ? -remaining : remaining);
       setSplitCard(card);
       setSplitPegIndex(pegIndex); // Track which peg was moved first
+      setSplitOwner(owner); // and whose peg it was, so the completer collision check is owner-aware
       setSplitUndo({ pegs, lastMoves }); // pre-move board, so a mis-tap can be undone
       setSelectedPeg(null);
       setGameMessage(`Tap a glowing peg to move ${remaining} spaces ${direction} (or Undo).`);
@@ -683,6 +693,7 @@ export default function PegsAndJokers() {
     setSplitRemaining(0);
     setSplitCard(null);
     setSplitPegIndex(null);
+    setSplitOwner(null);
 
     // Switch to next player
     const nextPlayer = (actor + 1) % 4;
@@ -695,9 +706,12 @@ export default function PegsAndJokers() {
   const completeSplit = useCallback((pegIndex, amount) => {
     const actor = 0;
     const owner = controlledOwnerFor(pegs);
-    // For both 7 and 9 cards, ensure different pegs are used
+    // For both 7 and 9 cards, ensure different pegs are used — but only when the
+    // completing peg is the same owner. A handoff split that finished your last
+    // peg home plays the remainder on your partner's pegs, where a matching
+    // index is a genuinely different peg.
     const cardInfo = CARD_VALUES[splitCard?.rank];
-    if ((cardInfo?.mustSplit || cardInfo?.canSplit) && pegIndex === splitPegIndex) {
+    if ((cardInfo?.mustSplit || cardInfo?.canSplit) && owner === splitOwner && pegIndex === splitPegIndex) {
       const cardName = cardInfo?.mustSplit ? 'Nine' : 'Seven';
       setGameMessage(`${cardName} card must use two different pegs. Try again.`);
       return false;
@@ -761,13 +775,14 @@ export default function PegsAndJokers() {
     setSplitRemaining(0);
     setSplitCard(null);
     setSplitPegIndex(null);
+    setSplitOwner(null);
     setSplitUndo(null);
     const nextPlayer = (actor + 1) % 4;
     setCurrentPlayer(nextPlayer);
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
 
     return true;
-  }, [splitCard, splitPegIndex, pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode]);
+  }, [splitCard, splitPegIndex, splitOwner, pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode]);
 
   // Undo a half-finished split: restore the board (and anything the first half
   // bumped) to the snapshot taken before it, and return the turn to the point
@@ -787,6 +802,7 @@ export default function PegsAndJokers() {
     setSplitRemaining(0);
     setSplitCard(null);
     setSplitPegIndex(null);
+    setSplitOwner(null);
     setSplitUndo(null);
     setSelectedPeg(null); // keep the card selected so pegs re-glow for another try
     setGameMessage('Split undone. Select a peg to move.');
@@ -1129,6 +1145,7 @@ export default function PegsAndJokers() {
       splitRemaining,
       splitCard,
       splitPegIndex,
+      splitOwner,
       lastMoves,
       moveHistory,
       turns: turnsRef.current,
@@ -1139,7 +1156,7 @@ export default function PegsAndJokers() {
     });
   }, [
     pegs, hands, deck, discardPiles, stuckCounts, currentPlayer,
-    splitRemaining, splitCard, splitPegIndex, lastMoves, moveHistory,
+    splitRemaining, splitCard, splitPegIndex, splitOwner, lastMoves, moveHistory,
     winner, showFirstPlayerModal, showResumeModal, gameMode, isReplaying,
   ]);
 
@@ -1156,14 +1173,17 @@ export default function PegsAndJokers() {
     if (splitRemaining !== 0 && splitCard) {
       const set = new Set();
       for (let i = 0; i < 5; i++) {
-        if (i === splitPegIndex) continue;
+        // Only the first peg is off-limits, and only when the completing peg is
+        // the same owner (a cross-team handoff split uses the partner's pegs, so
+        // a matching index there is a different peg).
+        if (controlledOwner === splitOwner && i === splitPegIndex) continue;
         if (isValidMove(controlledOwner, i, splitCard, pegs, splitRemaining, moveOptions)) set.add(i);
       }
       return set;
     }
     if (!selectedCardObj) return null;
     return new Set(getMovablePegs(controlledOwner, selectedCardObj, pegs, moveOptions));
-  }, [currentPlayer, winner, discardMode, jokerMode, isReplaying, splitRemaining, splitCard, splitPegIndex, selectedCardObj, pegs, controlledOwner, moveOptions]);
+  }, [currentPlayer, winner, discardMode, jokerMode, isReplaying, splitRemaining, splitCard, splitPegIndex, splitOwner, selectedCardObj, pegs, controlledOwner, moveOptions]);
 
   // Tappable destination spaces for the selected peg with a 7 or 9 (ghost
   // circles on the board — tapping one picks that split amount)
@@ -1218,7 +1238,7 @@ export default function PegsAndJokers() {
 
     if (splitRemaining !== 0) {
       const cardInfo = CARD_VALUES[splitCard?.rank];
-      if (pegIndex === splitPegIndex) {
+      if (controlledOwner === splitOwner && pegIndex === splitPegIndex) {
         const cardName = cardInfo?.mustSplit ? 'Nine' : 'Seven';
         setGameMessage(`${cardName} card must use two different pegs. Try again.`);
         return;

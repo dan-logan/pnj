@@ -152,14 +152,28 @@ function canBumpPegAt(position, actor, mode, currentPegs, reservedPos, mover = n
 
 // True when the joker has at least one legally bumpable target: any peg on the
 // track that is not the mover's own and whose bump (friendly or not) is legal.
+// A teammate sitting on its own home entrance is a legal target only via the
+// "swap" (the mover is shoved to its own entrance instead), which needs a
+// concrete mover peg — so for that case we try each of the owner's movable pegs.
 function hasLegalJokerTarget(owner, actor, mode, currentPegs) {
+  const movers = [];
+  for (let i = 0; i < PEGS_PER_PLAYER; i++) {
+    const pg = currentPegs[owner][i];
+    if (pg.location === 'track' || pg.location === 'start') movers.push(i);
+  }
   for (let p = 0; p < NUM_PLAYERS; p++) {
     if (p === owner) continue; // can't bump the mover's own pegs
     for (let i = 0; i < PEGS_PER_PLAYER; i++) {
       const otherPeg = currentPegs[p][i];
-      if (otherPeg.location === 'track' &&
-          canBumpPegAt(otherPeg.position, actor, mode, currentPegs, otherPeg.position)) {
-        return true;
+      if (otherPeg.location !== 'track') continue;
+      // Opponent bump, or a plain friendly bump that needs no swap.
+      if (canBumpPegAt(otherPeg.position, actor, mode, currentPegs, otherPeg.position)) return true;
+      // Otherwise it may be a teammate on its own entrance: legal if some mover
+      // peg can take the swap (its own entrance clears / cascades).
+      for (const m of movers) {
+        if (canBumpPegAt(otherPeg.position, actor, mode, currentPegs, otherPeg.position, { player: owner, pegIndex: m })) {
+          return true;
+        }
       }
     }
   }
@@ -177,12 +191,26 @@ export function applyJoker(owner, pegIndex, targetPlayer, targetPegIndex, curren
   if (target.location !== 'track') return { newPegs: currentPegs, bumped: false, bumpedPlayer: null };
   const targetPos = target.position;
 
+  // Jokering a teammate that's sitting on its own home entrance is the same
+  // "a peg can't block itself" swap as a track move landing there: the teammate
+  // keeps that space and the mover is friendly-bumped on to its own home
+  // entrance (cascading from there) instead of onto the target's space.
+  const swap = mode === GAME_MODES.PARTNERS
+    && sameTeam(targetPlayer, actor)
+    && getHomeEntrance(targetPlayer) === targetPos;
+
   // Detach the mover during the cascade so it can't block a friendly placement,
-  // then drop it onto the vacated space.
+  // then drop it onto the vacated space. Passing the mover lets resolveDisplacement
+  // perform the entrance swap above (which needs a peg to shove onward).
   const mover = newPegs[owner][pegIndex];
   newPegs[owner][pegIndex] = { location: 'start', index: pegIndex };
-  const ok = resolveDisplacement(newPegs, targetPlayer, targetPegIndex, actor, mode, targetPos);
+  const ok = resolveDisplacement(newPegs, targetPlayer, targetPegIndex, actor, mode, targetPos, { player: owner, pegIndex });
   if (!ok) return { newPegs: currentPegs, bumped: false, bumpedPlayer: null };
+  if (swap) {
+    // The teammate kept its entrance and resolveDisplacement friendly-bumped the
+    // mover on to its own home entrance; don't re-place it at targetPos.
+    return { newPegs, bumped: true, bumpedPlayer: targetPlayer };
+  }
   newPegs[owner][pegIndex] = { ...mover, location: 'track', position: targetPos };
   return { newPegs, bumped: true, bumpedPlayer: targetPlayer };
 }
@@ -441,7 +469,7 @@ export function applyMove(player, pegIndex, card, amount, currentPegs, options =
       for (let i = 0; i < PEGS_PER_PLAYER; i++) {
         const otherPeg = newPegs[p][i];
         if (otherPeg.location === 'track' &&
-            canBumpPegAt(otherPeg.position, actor, mode, newPegs, otherPeg.position)) {
+            canBumpPegAt(otherPeg.position, actor, mode, newPegs, otherPeg.position, { player, pegIndex })) {
           const { newPegs: afterJoker, bumped } = applyJoker(player, pegIndex, p, i, newPegs, { actor, mode });
           return { newPegs: afterJoker, bumpedOpponent: bumped };
         }
@@ -575,6 +603,22 @@ export function applyComeOut(player, pegIndex, currentPegs, options = {}) {
   return { newPegs, ok: true, bumpedOpponent };
 }
 
+// Who owns the peg that completes a 7/9 split. Normally the same player who
+// played the first half. In partner mode there's one exception: if that first
+// half brought the player's *last* peg home (all of their pegs are now home in
+// `afterFirst`, but the partner still has pegs on the board), the remainder is
+// played on the partner's pegs — the same "your last peg home hands control to
+// your partner" boundary the UI uses. This lets a split double as the handoff
+// move: one part finishes you, the rest advances your partner.
+export function splitCompleter(player, afterFirst, options = {}) {
+  const { mode = GAME_MODES.CLASSIC } = options;
+  if (mode !== GAME_MODES.PARTNERS) return player;
+  const partner = getPartner(player);
+  const playerAllHome = afterFirst[player].every(p => p.location === 'home');
+  const partnerAllHome = afterFirst[partner].every(p => p.location === 'home');
+  return playerAllHome && !partnerAllHome ? partner : player;
+}
+
 // Enumerate every legal landing spot for playing `card` with this peg.
 // Returns [{ amount, location: 'track'|'home', position? , homePosition? }] where
 // `amount` is the value to pass to the move executor (null = card's face value).
@@ -607,10 +651,11 @@ export function getValidDestinations(player, pegIndex, card, currentPegs, option
         ? 7 - amount
         : (amount > 0 ? -(9 - amount) : 9 - Math.abs(amount));
       const { newPegs: afterFirst } = applyMove(player, pegIndex, card, amount, currentPegs, options);
+      const completer = splitCompleter(player, afterFirst, options);
       let completable = false;
       for (let second = 0; second < PEGS_PER_PLAYER; second++) {
-        if (second === pegIndex) continue;
-        if (isValidMove(player, second, card, afterFirst, remaining, options)) {
+        if (completer === player && second === pegIndex) continue;
+        if (isValidMove(completer, second, card, afterFirst, remaining, options)) {
           completable = true;
           break;
         }
