@@ -5,7 +5,8 @@ import {
   getDistanceToHome,
   isValidMove,
   applyMove,
-  applyJoker
+  applyJoker,
+  splitCompleter
 } from './engine.js';
 
 // Calculate total distance for all of a player's pegs (lower is better)
@@ -53,7 +54,9 @@ function getVulnerabilityPenalty(position, pegState, owner, mode) {
 // Enumerate and score every legal move for the given hand.
 // Move shapes carry `owner` (whose peg moves — the partner once the AI is home):
 //   { type: 'simple'|'start', owner, card, pegIndex, amount, newPegs, improvement, bonus }
-//   { type: 'split7'|'split9', owner, card, pegIndex, amount, secondPeg, remaining, newPegs, improvement, bonus }
+//   { type: 'split7'|'split9', owner, card, pegIndex, amount, secondPeg, secondOwner, remaining, newPegs, improvement, bonus }
+//     (secondOwner is the owner of the completing peg — the partner when a
+//      handoff split finishes the AI's last peg home; otherwise === owner)
 //   { type: 'joker', owner, card, pegIndex, targetPlayer, targetPeg, newPegs, improvement, bonus }
 export function getPossibleMoves(actor, hand, pegs, options = {}) {
   const { mode = GAME_MODES.CLASSIC } = options;
@@ -125,19 +128,23 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
           if (isValidMove(owner, pegIndex, card, pegs, split, moveOpts)) {
             const { newPegs: afterFirst } = applyMove(owner, pegIndex, card, split, pegs, moveOpts);
             const remaining = 7 - split;
+            // Normally the same owner finishes the split, but a first half that
+            // brings the AI's last peg home hands the remainder to its partner —
+            // letting a split both finish the AI and advance its partner.
+            const completer = splitCompleter(owner, afterFirst, moveOpts);
 
             // Find another peg for the remaining
             for (let secondPeg = 0; secondPeg < PEGS_PER_PLAYER; secondPeg++) {
-              if (secondPeg === pegIndex) continue;
-              if (isValidMove(owner, secondPeg, card, afterFirst, remaining, moveOpts)) {
-                const { newPegs: finalPegs } = applyMove(owner, secondPeg, card, remaining, afterFirst, moveOpts);
+              if (completer === owner && secondPeg === pegIndex) continue;
+              if (isValidMove(completer, secondPeg, card, afterFirst, remaining, moveOpts)) {
+                const { newPegs: finalPegs } = applyMove(completer, secondPeg, card, remaining, afterFirst, moveOpts);
                 const improvement = distBefore - getReferenceDistance(finalPegs, actor, mode);
 
                 // Calculate vulnerability for both moved pegs
                 const peg1 = finalPegs[owner][pegIndex];
-                const peg2 = finalPegs[owner][secondPeg];
+                const peg2 = finalPegs[completer][secondPeg];
                 const vuln1 = peg1.location === 'track' ? getVulnerabilityPenalty(peg1.position, finalPegs, owner, mode) : 0;
-                const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs, owner, mode) : 0;
+                const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs, completer, mode) : 0;
 
                 possibleMoves.push({
                   type: 'split7',
@@ -146,11 +153,12 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
                   pegIndex,
                   amount: split,
                   secondPeg,
+                  secondOwner: completer,
                   remaining,
                   newPegs: finalPegs,
                   improvement,
                   bonus: (pegs[owner][pegIndex].location === 'home' ? 10 : 0) +
-                         (afterFirst[owner][secondPeg].location === 'home' ? 10 : 0) -
+                         (afterFirst[completer][secondPeg].location === 'home' ? 10 : 0) -
                          vuln1 - vuln2
                 });
               }
@@ -167,19 +175,22 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
           // Try this peg forward
           if (isValidMove(owner, pegIndex, card, pegs, forward, moveOpts)) {
             const { newPegs: afterFirst } = applyMove(owner, pegIndex, card, forward, pegs, moveOpts);
+            // A forward half that brings the AI's last peg home hands the
+            // backward half to its partner (same handoff boundary as the 7).
+            const completer = splitCompleter(owner, afterFirst, moveOpts);
 
             // Find another peg for backward
             for (let secondPeg = 0; secondPeg < PEGS_PER_PLAYER; secondPeg++) {
-              if (secondPeg === pegIndex) continue;
-              if (isValidMove(owner, secondPeg, card, afterFirst, backward, moveOpts)) {
-                const { newPegs: finalPegs } = applyMove(owner, secondPeg, card, backward, afterFirst, moveOpts);
+              if (completer === owner && secondPeg === pegIndex) continue;
+              if (isValidMove(completer, secondPeg, card, afterFirst, backward, moveOpts)) {
+                const { newPegs: finalPegs } = applyMove(completer, secondPeg, card, backward, afterFirst, moveOpts);
                 const improvement = distBefore - getReferenceDistance(finalPegs, actor, mode);
 
                 // Calculate vulnerability for both moved pegs
                 const peg1 = finalPegs[owner][pegIndex];
-                const peg2 = finalPegs[owner][secondPeg];
+                const peg2 = finalPegs[completer][secondPeg];
                 const vuln1 = peg1.location === 'track' ? getVulnerabilityPenalty(peg1.position, finalPegs, owner, mode) : 0;
-                const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs, owner, mode) : 0;
+                const vuln2 = peg2.location === 'track' ? getVulnerabilityPenalty(peg2.position, finalPegs, completer, mode) : 0;
 
                 possibleMoves.push({
                   type: 'split9',
@@ -188,6 +199,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
                   pegIndex,
                   amount: forward,
                   secondPeg,
+                  secondOwner: completer,
                   remaining: backward,
                   newPegs: finalPegs,
                   improvement,

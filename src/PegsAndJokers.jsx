@@ -984,6 +984,9 @@ export default function PegsAndJokers() {
         // `owner` is whose peg moves — the AI's own, or its partner's once the
         // AI has finished (partner mode).
         const owner = bestMove.owner;
+        // The second half of a split may play on the partner (a handoff split
+        // that brought the AI's last peg home); default to the same owner.
+        const secondOwner = bestMove.secondOwner ?? owner;
         const moverPeg = { player: owner, pegIndex: bestMove.pegIndex };
         // Generate move description based on move type
         const getMoveDescription = () => {
@@ -995,8 +998,8 @@ export default function PegsAndJokers() {
           } else if (bestMove.type === 'split7' || bestMove.type === 'split9') {
             const afterFirst = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
             const firstDesc = describeMoveAction(oldPeg, afterFirst[owner][bestMove.pegIndex], bestMove.card, bestMove.amount);
-            const secondOldPeg = afterFirst[owner][bestMove.secondPeg];
-            const secondNewPeg = bestMove.newPegs[owner][bestMove.secondPeg];
+            const secondOldPeg = afterFirst[secondOwner][bestMove.secondPeg];
+            const secondNewPeg = bestMove.newPegs[secondOwner][bestMove.secondPeg];
             const secondDesc = describeMoveAction(secondOldPeg, secondNewPeg, bestMove.card, bestMove.remaining);
             return `Split: ${firstDesc}, ${secondDesc}`;
           } else if (bestMove.type === 'joker') {
@@ -1014,7 +1017,7 @@ export default function PegsAndJokers() {
         if (bestMove.type === 'split7' || bestMove.type === 'split9') {
           const afterFirst = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
           replaySegments.push({ owner, pegIndex: bestMove.pegIndex, card: bestMove.card, amount: bestMove.amount, fromPegs: pegs, toPegs: afterFirst });
-          replaySegments.push({ owner, pegIndex: bestMove.secondPeg, card: bestMove.card, amount: bestMove.remaining, fromPegs: afterFirst, toPegs: bestMove.newPegs });
+          replaySegments.push({ owner: secondOwner, pegIndex: bestMove.secondPeg, card: bestMove.card, amount: bestMove.remaining, fromPegs: afterFirst, toPegs: bestMove.newPegs });
         } else if (bestMove.type === 'simple' || bestMove.type === 'start') {
           replaySegments.push({ owner, pegIndex: bestMove.pegIndex, card: bestMove.card, amount: bestMove.amount, fromPegs: pegs, toPegs: bestMove.newPegs });
         }
@@ -1041,18 +1044,18 @@ export default function PegsAndJokers() {
         } else if (bestMove.type === 'split7') {
           // Two-part animation for 7 split
           animateMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
-            // After first animation, animate second peg
+            // After first animation, animate second peg (may be the partner's)
             const afterFirstPegs = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
-            animateMove(owner, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
+            animateMove(secondOwner, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
               completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg);
             });
           });
         } else if (bestMove.type === 'split9') {
           // Two-part animation for 9 split
           animateMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
-            // After first animation, animate second peg
+            // After first animation, animate second peg (may be the partner's)
             const afterFirstPegs = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
-            animateMove(owner, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
+            animateMove(secondOwner, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
               completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg);
             });
           });

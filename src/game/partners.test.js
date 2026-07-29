@@ -430,3 +430,35 @@ describe('cross-team 7 split: your last peg home + partner takes the rest (Tophe
     expect(afterSecond[2][0]).toMatchObject({ location: 'track', position: 26 });
   });
 });
+
+describe('AI handoff split: finish your last peg home, advance your partner', () => {
+  const allHomeExceptLast = [
+    [0, 0, inHome(1)],
+    [0, 1, inHome(2)],
+    [0, 2, inHome(3)],
+    [0, 3, inHome(4)],
+    [0, 4, onTrack(getHomeEntrance(0))], // last peg on its own entrance (space 3)
+  ];
+
+  it('enumerates a 7 split whose remainder is played on the partner', () => {
+    const pegs = pegState([...allHomeExceptLast, [2, 0, onTrack(20)]]);
+    const moves = getPossibleMoves(0, [card('7')], pegs, { mode: GAME_MODES.PARTNERS });
+    const handoff = moves.find(
+      (m) => m.type === 'split7' && m.amount === 1 && m.secondOwner === 2
+    );
+    expect(handoff).toBeTruthy();
+    expect(handoff.secondPeg).toBe(0);
+    expect(handoff.remaining).toBe(6);
+    // Result: your last peg is home and the partner advanced 6.
+    expect(handoff.newPegs[0].every((p) => p.location === 'home')).toBe(true);
+    expect(handoff.newPegs[2][0]).toMatchObject({ location: 'track', position: 26 });
+  });
+
+  it('prefers the handoff split when it advances the team most', () => {
+    const pegs = pegState([...allHomeExceptLast, [2, 0, onTrack(20)]]);
+    const best = findBestAIMove(0, [card('7')], pegs, { mode: GAME_MODES.PARTNERS });
+    expect(best.type).toBe('split7');
+    expect(best.secondOwner).toBe(2);
+    expect(best.newPegs[0].every((p) => p.location === 'home')).toBe(true);
+  });
+});
