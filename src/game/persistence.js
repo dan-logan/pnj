@@ -33,6 +33,7 @@ export function serializeGame(state) {
     splitRemaining: state.splitRemaining ?? 0,
     splitCard: state.splitCard ?? null,
     splitPegIndex: state.splitPegIndex ?? null,
+    splitOwner: state.splitOwner ?? null,
     lastMoves: state.lastMoves ?? [null, null, null, null],
     moveHistory: state.moveHistory ?? [],
     // Per-game stat tallies so a resumed game still records correct stats.

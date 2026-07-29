@@ -11,7 +11,8 @@ import {
   checkWinner,
   getValidDestinations,
   getMovablePegs,
-  findFriendlyBumps
+  findFriendlyBumps,
+  splitCompleter
 } from './engine.js';
 import { getPossibleMoves, findBestAIMove } from './ai.js';
 
@@ -145,11 +146,15 @@ describe('friendly partner bump: illegal when the entrance is blocked by a sibli
     expect(isValidMove(0, 0, card('3'), pegs)).toBe(true);
   });
 
-  it('rejects a joker whose only target is a partner already on their entrance', () => {
+  it('allows a joker whose only target is a partner already on their entrance', () => {
     const pegs = pegState([[0, 0, onTrack(10)], [2, 0, onTrack(getHomeEntrance(2))]]);
-    // The friendly bump would need to send the partner to the space it already
-    // occupies, which the mover is taking → no legal target.
-    expect(isValidMove(0, 0, card('JOKER'), pegs, null, P0)).toBe(false);
+    // The partner keeps its entrance and the mover is friendly-bumped on to its
+    // own home entrance instead (the "swap"), so the joker is a legal play.
+    expect(isValidMove(0, 0, card('JOKER'), pegs, null, P0)).toBe(true);
+    const { newPegs, bumped } = applyJoker(0, 0, 2, 0, pegs, P0);
+    expect(bumped).toBe(true);
+    expect(newPegs[2][0]).toMatchObject({ location: 'track', position: getHomeEntrance(2) });
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: getHomeEntrance(0) });
   });
 });
 
@@ -313,5 +318,147 @@ describe('findFriendlyBumps', () => {
     expect(bumps).toEqual([
       { player: 2, pegIndex: 0, fromPosition: 35, toPosition: getHomeEntrance(2) },
     ]);
+  });
+});
+
+describe('joker onto a partner sitting on its own home entrance (Topher/Sara bug)', () => {
+  // Jokering a teammate that's parked on its own home entrance used to be
+  // rejected ("That joker bump is not legal"). It's the same swap as a track
+  // move that lands there: the partner keeps its entrance and the mover is
+  // friendly-bumped on to its own home entrance instead.
+  const entrance0 = getHomeEntrance(0); // 3
+  const entrance2 = getHomeEntrance(2); // 39, the partner's entrance
+
+  it('is legal: partner keeps its entrance, the mover swaps to its own entrance', () => {
+    const pegs = pegState([[0, 0, onTrack(50)], [2, 0, onTrack(entrance2)]]);
+    const { newPegs, bumped, bumpedPlayer } = applyJoker(0, 0, 2, 0, pegs, P0);
+    expect(bumped).toBe(true);
+    expect(bumpedPlayer).toBe(2);
+    expect(newPegs[2][0]).toMatchObject({ location: 'track', position: entrance2 });
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: entrance0 });
+  });
+
+  it('cascades an opponent off the mover’s own entrance during the swap', () => {
+    const pegs = pegState([
+      [0, 0, onTrack(50)],
+      [2, 0, onTrack(entrance2)],
+      [1, 0, onTrack(entrance0)], // opponent squatting on the mover's entrance
+    ]);
+    const { newPegs, bumped } = applyJoker(0, 0, 2, 0, pegs, P0);
+    expect(bumped).toBe(true);
+    expect(newPegs[2][0]).toMatchObject({ location: 'track', position: entrance2 });
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: entrance0 });
+    expect(newPegs[1][0]).toMatchObject({ location: 'start' });
+  });
+
+  it('is illegal when the mover’s own entrance is blocked by its own peg', () => {
+    const pegs = pegState([
+      [0, 0, onTrack(50)],
+      [0, 1, onTrack(entrance0)], // mover's own peg blocks its entrance
+      [2, 0, onTrack(entrance2)],
+    ]);
+    const { bumped } = applyJoker(0, 0, 2, 0, pegs, P0);
+    expect(bumped).toBe(false);
+  });
+
+  it('still sends a non-partner back to start in classic mode (no swap)', () => {
+    const pegs = pegState([[0, 0, onTrack(50)], [2, 0, onTrack(entrance2)]]);
+    const { newPegs, bumped } = applyJoker(0, 0, 2, 0, pegs); // classic
+    expect(bumped).toBe(true);
+    expect(newPegs[2][0]).toMatchObject({ location: 'start' });
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: entrance2 });
+  });
+});
+
+describe('splitCompleter: who finishes a 7/9 split', () => {
+  const allHome = (player) => [0, 1, 2, 3, 4].map((i) => [player, i, inHome(i)]);
+
+  it('hands the remainder to the partner once your last peg reaches home', () => {
+    const afterFirst = pegState([...allHome(0), [2, 0, onTrack(20)]]);
+    expect(splitCompleter(0, afterFirst, P0)).toBe(2);
+  });
+
+  it('keeps the split within your own pegs while any are still out', () => {
+    const afterFirst = pegState([[0, 0, onTrack(20)], [2, 0, onTrack(20)]]);
+    expect(splitCompleter(0, afterFirst, P0)).toBe(0);
+  });
+
+  it('never hands off in classic mode', () => {
+    const afterFirst = pegState([...allHome(0), [2, 0, onTrack(20)]]);
+    expect(splitCompleter(0, afterFirst, { mode: GAME_MODES.CLASSIC })).toBe(0);
+  });
+
+  it('does not hand off when both partners are already home (that is a win)', () => {
+    const afterFirst = pegState([...allHome(0), ...allHome(2)]);
+    expect(splitCompleter(0, afterFirst, P0)).toBe(0);
+  });
+});
+
+describe('cross-team 7 split: your last peg home + partner takes the rest (Topher/Sara bug)', () => {
+  const allHomeExceptLast = [
+    [0, 0, inHome(1)],
+    [0, 1, inHome(2)],
+    [0, 2, inHome(3)],
+    [0, 3, inHome(4)],
+    [0, 4, onTrack(getHomeEntrance(0))], // last peg on its own entrance (space 3)
+  ];
+
+  it('offers the 1-into-home split when a partner peg can absorb the remaining 6', () => {
+    const pegs = pegState([...allHomeExceptLast, [2, 0, onTrack(20)]]);
+    const dests = getValidDestinations(0, 4, card('7'), pegs, P0);
+    // amount 1 sends the last peg to Home 0 and hands the remaining 6 to Pink.
+    expect(dests).toContainEqual({ amount: 1, location: 'home', homePosition: 0 });
+    // The peg is therefore movable with the 7.
+    expect(getMovablePegs(0, card('7'), pegs, P0)).toContain(4);
+  });
+
+  it('does not offer it when no partner peg can take the remaining 6', () => {
+    // Partner pegs all in start (can't move by count), so the split can't complete.
+    const pegs = pegState([...allHomeExceptLast]);
+    const dests = getValidDestinations(0, 4, card('7'), pegs, P0);
+    expect(dests).not.toContainEqual({ amount: 1, location: 'home', homePosition: 0 });
+  });
+
+  it('applies the two halves across both owners', () => {
+    const pegs = pegState([...allHomeExceptLast, [2, 0, onTrack(20)]]);
+    // First half: your last peg goes home.
+    const { newPegs: afterFirst } = applyMove(0, 4, card('7'), 1, pegs, P0);
+    expect(afterFirst[0].every((p) => p.location === 'home')).toBe(true);
+    // Handoff: the remaining 6 is played on the partner's peg.
+    expect(splitCompleter(0, afterFirst, P0)).toBe(2);
+    const { newPegs: afterSecond } = applyMove(2, 0, card('7'), 6, afterFirst, P0);
+    expect(afterSecond[2][0]).toMatchObject({ location: 'track', position: 26 });
+  });
+});
+
+describe('AI handoff split: finish your last peg home, advance your partner', () => {
+  const allHomeExceptLast = [
+    [0, 0, inHome(1)],
+    [0, 1, inHome(2)],
+    [0, 2, inHome(3)],
+    [0, 3, inHome(4)],
+    [0, 4, onTrack(getHomeEntrance(0))], // last peg on its own entrance (space 3)
+  ];
+
+  it('enumerates a 7 split whose remainder is played on the partner', () => {
+    const pegs = pegState([...allHomeExceptLast, [2, 0, onTrack(20)]]);
+    const moves = getPossibleMoves(0, [card('7')], pegs, { mode: GAME_MODES.PARTNERS });
+    const handoff = moves.find(
+      (m) => m.type === 'split7' && m.amount === 1 && m.secondOwner === 2
+    );
+    expect(handoff).toBeTruthy();
+    expect(handoff.secondPeg).toBe(0);
+    expect(handoff.remaining).toBe(6);
+    // Result: your last peg is home and the partner advanced 6.
+    expect(handoff.newPegs[0].every((p) => p.location === 'home')).toBe(true);
+    expect(handoff.newPegs[2][0]).toMatchObject({ location: 'track', position: 26 });
+  });
+
+  it('prefers the handoff split when it advances the team most', () => {
+    const pegs = pegState([...allHomeExceptLast, [2, 0, onTrack(20)]]);
+    const best = findBestAIMove(0, [card('7')], pegs, { mode: GAME_MODES.PARTNERS });
+    expect(best.type).toBe('split7');
+    expect(best.secondOwner).toBe(2);
+    expect(best.newPegs[0].every((p) => p.location === 'home')).toBe(true);
   });
 });
