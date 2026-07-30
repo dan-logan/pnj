@@ -462,3 +462,60 @@ describe('AI handoff split: finish your last peg home, advance your partner', ()
     expect(best.newPegs[0].every((p) => p.location === 'home')).toBe(true);
   });
 });
+
+describe('joker OUT OF START onto a partner on its own entrance (Topher follow-up)', () => {
+  // Confirmed intended behavior: the mutual-bump swap fires even when the mover
+  // comes from start, so the start peg lands on its OWN home entrance while the
+  // partner keeps its entrance. (A big jump, but consistent with the swap rule.)
+  const entrance0 = getHomeEntrance(0); // 3
+  const entrance2 = getHomeEntrance(2); // 39
+
+  it('sends the start peg to its own home entrance; partner keeps its spot', () => {
+    const pegs = pegState([[0, 0, { location: 'start' }], [2, 0, onTrack(entrance2)]]);
+    expect(isValidMove(0, 0, card('JOKER'), pegs, null, P0)).toBe(true);
+    const { newPegs, bumped } = applyJoker(0, 0, 2, 0, pegs, P0);
+    expect(bumped).toBe(true);
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: entrance0 });
+    expect(newPegs[2][0]).toMatchObject({ location: 'track', position: entrance2 });
+  });
+
+  it('cascades an opponent off your entrance so the start peg can still land', () => {
+    const pegs = pegState([
+      [0, 0, { location: 'start' }],
+      [2, 0, onTrack(entrance2)],
+      [1, 0, onTrack(entrance0)], // opponent on your entrance
+    ]);
+    const { newPegs, bumped } = applyJoker(0, 0, 2, 0, pegs, P0);
+    expect(bumped).toBe(true);
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: entrance0 });
+    expect(newPegs[1][0]).toMatchObject({ location: 'start' });
+  });
+
+  it('still works when your other pegs are in the home ROW (not on the entrance square)', () => {
+    // The late-game case: four pegs already home, one straggler in start.
+    // The home row (homePosition) is distinct from track square 3, so the swap
+    // still has somewhere to land.
+    const pegs = pegState([
+      [0, 0, { location: 'start' }],
+      [0, 1, inHome(0)],
+      [0, 2, inHome(1)],
+      [0, 3, inHome(2)],
+      [0, 4, inHome(3)],
+      [2, 0, onTrack(entrance2)],
+    ]);
+    const { newPegs, bumped } = applyJoker(0, 0, 2, 0, pegs, P0);
+    expect(bumped).toBe(true);
+    expect(newPegs[0][0]).toMatchObject({ location: 'track', position: entrance0 });
+  });
+
+  it('is rejected when the chosen start peg cannot land (your own peg holds the entrance square)', () => {
+    const pegs = pegState([
+      [0, 0, { location: 'start' }],
+      [0, 1, onTrack(entrance0)], // your own peg sits on the entrance track square
+      [2, 0, onTrack(entrance2)],
+    ]);
+    // Choosing the start peg as the joker source can't resolve — the swap would
+    // land it on a square your own peg holds.
+    expect(applyJoker(0, 0, 2, 0, pegs, P0).bumped).toBe(false);
+  });
+});
