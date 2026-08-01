@@ -20,6 +20,11 @@ The host creates a game, gets a share link, sends it to a friend. The friend ope
 claims seat 2, and they play out a full partner-mode game against Blue + Green, taking
 turns hours apart if they like.
 
+**Several games at once.** Because turns can be hours apart, a single game is not enough to hold
+anyone's attention — you need something to do while your partner thinks. So a player can have any
+number of remote games running against different partners, plus their solo game, and switch
+between them freely from a **My Games** lobby reachable from inside any game. See Package 3.
+
 ### Explicitly NOT in Phase 1
 
 Do not build these. They are later phases and adding them now will sink the change.
@@ -32,6 +37,7 @@ Do not build these. They are later phases and adding them now will sink the chan
 | Server-side move validation | Clients are trusted. |
 | Hidden hands | Partners share a win condition, so there is no incentive to peek. Deliberately out of scope. |
 | Server-side AI execution | Not needed — see §4.2. |
+| User accounts | The game list lives on the device. Consequence in §4 risks — accepted. |
 | Supabase Realtime subscriptions | Polling instead — see §4.4 for the reason. |
 | Changing `NUM_PLAYERS`, board geometry, or any game rule | The engine is correct. Do not touch the rules in `src/game/engine.js`. |
 
@@ -349,6 +355,12 @@ All `SECURITY DEFINER`, granted to `anon`:
   re-read and adopt.
 - `start_game(p_id uuid, p_token uuid, p_state jsonb) → int`
   Host-only. Sets the initial dealt state, `status = 'active'`, `version = 1`.
+- `list_games(p_pairs jsonb) → setof (id, status, mode, current_player, winner, version, updated_at, seat, partner_joined)`
+  Takes `[{ "id": uuid, "token": uuid }, …]` and returns a **summary row per pair whose token
+  matches** — silently skipping the rest, so a bad token leaks nothing. This powers the My Games
+  lobby in one round trip. It must **not** return the `state` or `replay` blobs; the lobby only
+  needs whose turn it is and when it last moved. Shipping four full game states to render a list
+  is the obvious way to make this feature feel slow.
 
 #### 2.5 Client module
 
@@ -361,10 +373,22 @@ export async function joinGame(code)
 export async function fetchGame(id, token)
 export async function publishState(id, token, payload)  // throws VersionConflict
 export async function startGame(id, token, state)
+export async function listGames(sessions)   // → summary rows for the lobby
 ```
 
-Plus `src/net/localSession.js` — the active remote game's `{ id, token, seat, code }` in
-localStorage under `pnj:remoteGame:v1`, so a reload rejoins without re-entering anything.
+Plus `src/net/localSession.js` — the device's **list** of remote games in localStorage under
+`pnj:games:v1`:
+
+```js
+{ version: 1, activeId: '<uuid>|null', games: [
+  { id, token, seat, code, label, createdAt, lastSeenVersion, lastSeenAt }
+] }
+```
+
+Design it as a list from the start. A singular `pnj:remoteGame` key would need migrating the
+moment the switcher lands, and the switcher is in the same phase. `label` is a local nickname for
+the game ("Sara", "Topher") since there are no accounts and therefore no real partner names —
+prompt for it at create/join time, default to the game code.
 
 **Acceptance:** unit tests for the code generator and the client module against a mocked
 `supabase-js` (follow the injectable-backend pattern in `stats.js` / `persistence.js`). Manually
@@ -372,26 +396,69 @@ confirm that a client holding the anon key but no token can read nothing.
 
 ---
 
-### Package 3 — Lobby UI
+### Package 3 — My Games lobby and switcher
 
-Small and deliberately boring. Only rendered when `isMultiplayerConfigured()` is true.
+Only rendered when `isMultiplayerConfigured()` is true. When it isn't, the app keeps today's exact
+flow — first-player modal, single local save, resume prompt — and none of this exists.
+
+#### 3.1 Creating and joining
 
 - **"Play with a friend"** on the existing first-player modal.
 - **Host:** creates the game → shows the 6-char code and a copyable share link (`?g=<uuid>`) →
   "Waiting for your partner to join…". Polls `get_game` every 3 s until `guest_token` is set, then
   deals (`startGameWithPlayer`) and calls `start_game`.
-- **Guest:** opening `?g=<uuid>` (or entering the code) calls `join_game`, stores the session
-  locally, and waits until `status = 'active'`.
+- **Guest:** opening `?g=<uuid>` (or entering the code) calls `join_game`, stores the session in
+  `pnj:games:v1`, and waits until `status = 'active'`.
 - **First player:** host-only. Reuse the existing modal and spinner (`:220`); the guest never sees it.
-- **Rejoin:** on mount, if `pnj:remoteGame:v1` exists and its game isn't `finished`, resume the
-  remote game instead of offering the local save.
+- A player can be host in one game and guest in another simultaneously. Seat assignment is
+  per-game and already lives in `seatOwners`, so nothing special is needed.
+
+#### 3.2 The lobby
+
+A modal overlay, in the same style as the existing stats and resume modals — **not** a route, not a
+component split. It lists:
+
+- **Your solo game**, if a local save exists — "Solo vs AI, your turn".
+- **Every remote game** in `pnj:games:v1`, each showing the label, whose turn it is, and how long
+  since the last move (`updated_at`, rendered relative: "3 hours ago").
+- **Sorted with "your turn" first**, then by most recently updated. This ordering is the whole
+  point of the screen.
+- Finished games, collapsed, with the result. Plus **New game** and **Join by code**.
+
+Populate it with one `list_games` call. Show a **badge with the number of games waiting on you** on
+the lobby button, so a player can see there is something to do without opening it. That badge is
+also exactly what Phase 2's push notifications will drive.
+
+#### 3.3 Switching
+
+- A **My Games** button in the game header (next to Stats / New Game, `:1862`) opens the lobby from
+  inside any game — solo or remote.
+- Switching to a game means: fetch its state, then hand it to the existing `applySavedGame` path
+  (`:280`) along with its `seatOwners` and session. `applySavedGame` already resets every per-game
+  ref — tallies, replay buffer, turn trackers — so "switch game" is very nearly "resume a different
+  save" and should reuse that machinery rather than growing a parallel one. Set `activeId`.
+- **Block switching mid-split.** If `splitRemaining !== 0`, refuse with "Finish or undo your split
+  first" — the Undo Split button (`:1890`) is right there. In-progress selections
+  (`selectedCard` / `selectedPeg`) are transient and aren't persisted even today, so they can be
+  dropped silently; a half-played 7 or 9 cannot.
+- Switching away from a remote game needs no write: state is only ever published at handoff (§4.1),
+  so an un-committed turn simply starts over, exactly like a disconnect.
+
+#### 3.4 Entry point
+
+On mount, when multiplayer is configured, open the lobby instead of the resume modal — it
+subsumes it, and the resume prompt doesn't make sense once more than one game can be resumed.
+Auto-open the last `activeId` game only when it is the sole game and it is your turn.
 
 **Local save interaction.** The localStorage save (`persistence.js`) remains the source of truth
-for **solo only**. In a remote game the server row is the save: skip the save effect at `:1132`
-when a remote session is active, and don't offer the local resume modal over a remote game.
+for **solo only**, and there is still exactly one solo game. In a remote game the server row is
+the save: skip the save effect at `:1132` when a remote session is active.
 
 **Acceptance:** two browser profiles; host creates, guest joins by link and by code; both land on a
-dealt board with the correct seat; the guest sees their own pegs at the bottom.
+dealt board with the correct seat; the guest sees their own pegs at the bottom. Then: run three
+games at once against two different partners plus a solo game, switch between all four, and confirm
+each resumes exactly where it was with the right seat, board orientation, replay buffer, and
+tallies. Confirm the badge count matches the number of games actually waiting on you.
 
 ---
 
@@ -454,9 +521,17 @@ in Package 5, so the player sees the winning move.
 
 #### 4.4 Poll while waiting
 
-While it is not your turn and a remote session is active, poll `get_game` every 4 s, plus on
-`visibilitychange` and `focus` (mobile players will background the tab). Stop once the state
-arrives with your seat to move, or the game is finished.
+Two cadences, deliberately different:
+
+- **The open game**, while it isn't your turn: `get_game` every 4 s, plus on `visibilitychange`
+  and `focus` (mobile players will background the tab). Stop once the state arrives with your seat
+  to move, or the game is finished.
+- **The lobby summary**, for every other game: `list_games` every 30 s and on focus. It only feeds
+  a badge and a list, so it does not need to be fast, and one summary call covers all games
+  regardless of how many are running.
+
+Never poll `get_game` per game in a loop — that is the version of this feature that gets the
+project rate-limited on the free tier.
 
 On a state with a **higher version**: adopt it wholesale via the existing `applySavedGame` path
 (`:280`) — note that `applySavedGame` currently forces `setWinner(null)` at `:288`, which must
@@ -545,6 +620,9 @@ and then shows the overlay.
 | Env vars missing in the Pages build | Multiplayer UI hidden, not broken. Test a build with the vars unset. |
 | Guest seat taken by someone else with the code | Accepted and documented; links use the UUID, not the code. |
 | Supabase free tier pausing on inactivity | Fail soft — keep the board readable and show a reconnect notice. |
+| **The game list is per-device** | With no accounts, clearing site data or switching phones loses access to in-flight games — the tokens are gone and there is no recovery path. Accepted for Phase 1. Mitigate by making the share link re-joinable: opening `?g=<uuid>` on a device that already holds a seat token for that game restores it. Tell the user this in the lobby ("games live on this device"). Accounts are the real fix and are a later phase. |
+| Switching games mid-turn corrupts state | Blocked mid-split (§3.3); everything else is transient. |
+| Abandoned games pile up in the list | Local "archive" hides a game from the lobby without touching the row. Show the last-move age so stale games are obvious. |
 
 ---
 
@@ -559,6 +637,9 @@ and then shows the overlay.
 - [ ] Exactly one write per human turn (verify in the Supabase logs).
 - [ ] A client holding the anon key but no seat token can read nothing.
 - [ ] Either player can close the tab mid-game and rejoin where they left off.
+- [ ] Three concurrent remote games plus a solo game can be switched between freely, each resuming
+      with the right seat, orientation, replay buffer, and tallies.
+- [ ] The lobby badge shows how many games are waiting on you, from a single `list_games` call.
 - [ ] The AI never stalls the game regardless of who has the app open.
 - [ ] Each remote turn opens with an automatic replay of the two moves you missed, skippable.
 - [ ] `npm test` and `npm run build` pass, including with the Supabase env vars unset.
@@ -570,4 +651,7 @@ Web push for turn notifications: switch `vite-plugin-pwa` from `generateSW` to `
 a custom `push` handler, store subscriptions per seat, send from a Supabase Edge Function with
 VAPID on turn change. iOS requires the PWA be installed to the home screen (16.4+) and permission
 requested from a user gesture — which is why notifications come *after* we know the async cadence
-is fun.
+is fun. The "games waiting on you" count from §3.2 is the payload.
+
+Accounts are the other candidate for Phase 2, and the more important one if people actually use
+this: they turn the per-device game list into a real one that survives a new phone.
