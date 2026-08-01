@@ -74,6 +74,9 @@ Those changes are visible in solo play and that is intended.
 
 Ship in this order. Packages 0 and 1 need no backend and are independently verifiable.
 
+**Every package ships its own tests and its own `CLAUDE.md` update.** Package 6 is a final pass,
+not the place where testing happens — see the table there for what each package owns.
+
 ---
 
 ### Package 0 — Seat-ownership refactor (no backend)
@@ -593,18 +596,36 @@ and then shows the overlay.
 
 ---
 
-### Package 6 — Tests, docs, CI
+### Package 6 — Final pass
 
-- Unit-test the pure additions next to their modules, per repo convention: `nextHumanSeat`, the
-  seat-owner derivations, `didIWin`, the idempotent stats recorder, the partner-mode nemesis fix,
-  the game-code generator, the session client against a mocked backend. Put the seat helpers in a
-  plain module (`src/net/seats.js`) so they are testable without React — the repo has no
-  component-test setup and this plan does not add one.
-- CI (`.github/workflows/ci.yml`) needs no change; it runs `npm test` and the build. Ensure the
-  build passes **without** the Supabase env vars, since CI won't have them.
-- Update `CLAUDE.md`: a "Remote play" section covering `src/net/*`, the seat-ownership model, the
-  three turn-exchange rules, the derived-phase/status model, and the fact that solo is the
-  `['me','ai','ai','ai']` special case.
+**Tests are not deferred to this package.** Each package ships its own, per the repo convention in
+`CLAUDE.md` — logic changes and their tests land in the same change. For reference, the pure
+additions each package owns:
+
+| Package | Tests it must ship |
+|---|---|
+| 0 | seat-owner derivations, the generalised board rotation (pure math, assert `mySeat = 0` is identical to today) |
+| 1 | `didIWin` across both modes, the idempotent stats recorder, the partner-mode nemesis fix |
+| 2 | the game-code generator, the session client against a mocked `supabase-js` |
+| 4 | `nextHumanSeat` for every seat layout, including the solo `['me','ai','ai','ai']` case |
+| 5 | frame-buffer seeding and ordering (wire frames before locally-simulated ones) |
+
+Put pure helpers in plain modules (`src/net/seats.js`, and extend `src/game/stats.js`) so they are
+testable without React. The repo has no component-test setup and this plan does not add one — if a
+behaviour can only be tested through the component, that is a signal to move the logic out of it.
+
+What genuinely remains for the end:
+
+- **A full manual playtest** of the matrix that unit tests can't cover: two devices, three
+  concurrent games, a game won by each of the four seats, a reload mid-turn on each side, and a
+  force-quit immediately after a win to confirm stats record exactly once.
+- **Build with the Supabase env vars unset** and confirm the app deploys and plays solo with no
+  multiplayer UI. CI won't have the vars, so this is also what keeps CI green —
+  `.github/workflows/ci.yml` itself needs no change.
+- **Update `CLAUDE.md`**: a "Remote play" section covering `src/net/*`, the seat-ownership model,
+  the derived phase/status model, the three turn-exchange rules, the two polling cadences, and the
+  fact that solo is the `['me','ai','ai','ai']` special case. Prefer updating it incrementally as
+  each package lands; this is the backstop, not the plan.
 
 ---
 
