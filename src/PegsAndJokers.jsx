@@ -39,6 +39,15 @@ import {
   getNemesis
 } from './game/stats.js';
 import { loadGame, saveGame, clearGame } from './game/persistence.js';
+import {
+  SOLO_SEAT_OWNERS,
+  mySeatsOf,
+  primarySeat,
+  isMyTurnFor,
+  isAISeat,
+  visualSideFor,
+  seatAtVisualSide,
+} from './net/seats.js';
 import InstallPrompt from './InstallPrompt.jsx';
 import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
 
@@ -50,6 +59,16 @@ const REPLAY_FRAME_PAUSE_MS = 600; // pause after each move before the next one
 
 export default function PegsAndJokers() {
   const [gameMode, setGameMode] = useState(GAME_MODES.CLASSIC);
+
+  // Who owns each seat from THIS client's point of view. Solo is the layout
+  // where seat 0 is the only non-AI seat; remote play swaps one AI seat for
+  // 'them' and (for the guest) moves 'me' to seat 2. Nothing below may assume
+  // "the local human is player 0" — derive from here instead.
+  const [seatOwners, setSeatOwners] = useState(SOLO_SEAT_OWNERS);
+  const mySeats = useMemo(() => mySeatsOf(seatOwners), [seatOwners]);
+  const mySeat = useMemo(() => primarySeat(seatOwners), [seatOwners]);
+  const ownsSeat = useCallback((player) => mySeats.includes(player), [mySeats]);
+
   const [deck, setDeck] = useState([]);
   const [discardPiles, setDiscardPiles] = useState([[], [], [], []]); // Per-player discard piles
   const [stuckCounts, setStuckCounts] = useState([0, 0, 0, 0]); // Track stuck discards per player
@@ -73,7 +92,12 @@ export default function PegsAndJokers() {
   const [winner, setWinner] = useState(null);
   const [moveHistory, setMoveHistory] = useState([]);
   const [lastMoves, setLastMoves] = useState([null, null, null, null]); // Last move description per player
+
+  // Replaces every `currentPlayer === 0` turn gate in the component.
+  const isMyTurn = isMyTurnFor(seatOwners, currentPlayer);
+
   const aiProcessingRef = useRef(false); // Prevent AI from running twice on same turn
+  const aiTimerRef = useRef(null); // the AI's "thinking" timeout, so endGame can cancel it
   const prevPlayerRef = useRef(null); // Detect the turn passing back to the human
 
   // Animation state
@@ -146,17 +170,17 @@ export default function PegsAndJokers() {
   const [showResumeModal, setShowResumeModal] = useState(false);
 
   // In partner mode, once your own pegs are all home you play your hand on your
-  // partner's pegs; otherwise you always control your own (player 0). This is the
-  // "owner" of the pegs the human moves this turn.
+  // partner's pegs; otherwise you always control your own seat's pegs. This is
+  // the "owner" of the pegs you move this turn.
   const controlledOwnerFor = useCallback((pegState) => (
-    gameMode === GAME_MODES.PARTNERS && pegState[0].every(p => p.location === 'home')
-      ? getPartner(0)
-      : 0
-  ), [gameMode]);
+    gameMode === GAME_MODES.PARTNERS && pegState[mySeat].every(p => p.location === 'home')
+      ? getPartner(mySeat)
+      : mySeat
+  ), [gameMode, mySeat]);
 
   // Options threaded into the engine so it applies the partner friendly-bump rule
-  // (the human always acts as player 0).
-  const moveOptions = useMemo(() => ({ actor: 0, mode: gameMode }), [gameMode]);
+  // (you always act as your own seat).
+  const moveOptions = useMemo(() => ({ actor: mySeat, mode: gameMode }), [mySeat, gameMode]);
 
   const startGameWithPlayer = useCallback((firstPlayer) => {
     const newDeck = createDeck();
@@ -180,7 +204,7 @@ export default function PegsAndJokers() {
     setJokerMode(false);
     setJokerSourcePeg(null);
     setDiscardMode(false);
-    setGameMessage(firstPlayer === 0 ? 'Your turn! Select a card and peg to move.' : `${PLAYER_NAMES[firstPlayer]} is thinking...`);
+    setGameMessage(ownsSeat(firstPlayer) ? 'Your turn! Select a card and peg to move.' : `${PLAYER_NAMES[firstPlayer]} is thinking...`);
     setWinner(null);
     setMoveHistory([]);
     setLastMoves([null, null, null, null]);
@@ -208,13 +232,13 @@ export default function PegsAndJokers() {
     timesBumpedThisGameRef.current = 0;
     gameRecordedRef.current = false;
     setShowFirstPlayerModal(false);
-  }, [resetReplay]);
+  }, [resetReplay, ownsSeat]);
 
   const handleGoFirst = useCallback(() => {
     unlockAudio();
     startModeRef.current = 'chosen';
-    startGameWithPlayer(0);
-  }, [startGameWithPlayer]);
+    startGameWithPlayer(mySeat);
+  }, [startGameWithPlayer, mySeat]);
 
   const handleRandomFirst = useCallback(() => {
     unlockAudio();
@@ -324,7 +348,7 @@ export default function PegsAndJokers() {
     replayPrevPlayerRef.current = saved.currentPlayer;
 
     setGameMessage(
-      saved.currentPlayer === 0
+      ownsSeat(saved.currentPlayer)
         ? 'Welcome back! Your turn — select a card and peg to move.'
         : `${PLAYER_NAMES[saved.currentPlayer]} is thinking...`
     );
@@ -332,7 +356,7 @@ export default function PegsAndJokers() {
     setPendingResume(null);
     setShowResumeModal(false);
     setShowFirstPlayerModal(false);
-  }, [resetReplay]);
+  }, [resetReplay, ownsSeat]);
 
   // On mount, offer to resume a saved game if one exists; otherwise start fresh.
   useEffect(() => {
@@ -402,12 +426,12 @@ export default function PegsAndJokers() {
   // last turn.
   useEffect(() => {
     const prev = replayPrevPlayerRef.current;
-    if (prev === 0 && currentPlayer !== 0) {
+    if (ownsSeat(prev) && !ownsSeat(currentPlayer)) {
       replayLogRef.current = [];
       setReplayReady(0);
     }
     replayPrevPlayerRef.current = currentPlayer;
-  }, [currentPlayer]);
+  }, [currentPlayer, ownsSeat]);
 
   // Play back the buffered AI moves, slowed down, as an "instant replay". The
   // board is driven from the recorded snapshots and restored to the live state
@@ -532,8 +556,8 @@ export default function PegsAndJokers() {
     // Tally bumps for stats: pegs you sent home vs. your pegs sent home. Friendly
     // partner bumps are cooperative and don't count.
     for (const b of bumps) {
-      if (mover === 0 && b.player !== 0) bumpsDeliveredThisGameRef.current += 1;
-      if (mover !== 0 && b.player === 0) timesBumpedThisGameRef.current += 1;
+      if (ownsSeat(mover) && !ownsSeat(b.player)) bumpsDeliveredThisGameRef.current += 1;
+      if (!ownsSeat(mover) && ownsSeat(b.player)) timesBumpedThisGameRef.current += 1;
     }
 
     sfx.bump();
@@ -549,12 +573,12 @@ export default function PegsAndJokers() {
       runBumpFx(fb.player, fb.pegIndex, getTrackPosition(fb.fromPosition),
         getTrackPosition(fb.toPosition), 'friendly');
     }
-  }, [animationsEnabled, gameMode, runBumpFx]);
+  }, [animationsEnabled, gameMode, runBumpFx, ownsSeat]);
 
-  // `owner` is whose peg moves (the human's partner once the human is all home);
-  // the human always acts as player 0, so the hand, discards and turn are theirs.
+  // `owner` is whose peg moves (your partner once you are all home); you always
+  // act as your own seat, so the hand, discards and turn are yours.
   const executeMove = useCallback((owner, pegIndex, card, splitAmount = null) => {
-    const actor = 0;
+    const actor = mySeat;
     if (!isValidMove(owner, pegIndex, card, pegs, splitAmount, moveOptions)) {
       setGameMessage('Invalid move. Try again.');
       return false;
@@ -701,10 +725,10 @@ export default function PegsAndJokers() {
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
 
     return true;
-  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode]);
+  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
-    const actor = 0;
+    const actor = mySeat;
     const owner = controlledOwnerFor(pegs);
     // For both 7 and 9 cards, ensure different pegs are used — but only when the
     // completing peg is the same owner. A handoff split that finished your last
@@ -782,7 +806,7 @@ export default function PegsAndJokers() {
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
 
     return true;
-  }, [splitCard, splitPegIndex, splitOwner, pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode]);
+  }, [splitCard, splitPegIndex, splitOwner, pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat]);
 
   // Undo a half-finished split: restore the board (and anything the first half
   // bumped) to the snapshot taken before it, and return the turn to the point
@@ -842,7 +866,7 @@ export default function PegsAndJokers() {
         if (ok) {
           newPegs = afterStart;
           autoStarted = true;
-          if (player === 0) {
+          if (ownsSeat(player)) {
             setGameMessage('After 3 stuck turns, you start a peg!');
           }
         }
@@ -857,9 +881,9 @@ export default function PegsAndJokers() {
       return updated;
     });
 
-    // Log AI discards into the replay buffer too, so a stuck opponent's turn is
-    // still accounted for when you watch the replay.
-    if (player !== 0) {
+    // Log other seats' discards into the replay buffer too, so a stuck
+    // opponent's turn is still accounted for when you watch the replay.
+    if (!ownsSeat(player)) {
       recordReplayFrame({
         player,
         description: autoStarted ? 'Stuck 3x — started a peg' : 'No move — discarded',
@@ -880,17 +904,17 @@ export default function PegsAndJokers() {
     setSelectedPeg(null);
     setDiscardMode(false);
 
-    if (player === 0) {
-      const nextPlayer = 1;
+    if (ownsSeat(player)) {
+      const nextPlayer = (player + 1) % 4;
       setCurrentPlayer(nextPlayer);
-      if (newStuckCounts[0] === 0 && newPegs !== pegs) {
+      if (newStuckCounts[player] === 0 && newPegs !== pegs) {
         // Delay message change so player sees the "start a peg" message
         setTimeout(() => setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`), 1500);
       } else {
         setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
       }
     } else {
-      // AI player discarded - show message with stuck count, then advance player
+      // Another seat discarded - show message with stuck count, then advance player
       const nextPlayer = (player + 1) % 4;
 
       if (newStuckCounts[player] === 0 && newPegs !== pegs) {
@@ -905,17 +929,17 @@ export default function PegsAndJokers() {
 
       // Delay the "thinking" message so discard message is visible
       setTimeout(() => {
-        if (nextPlayer === 0) {
+        if (ownsSeat(nextPlayer)) {
           setGameMessage('Your turn! Select a card and peg to move.');
         }
         // If next is AI, the useEffect will set the message
       }, 1200);
     }
-  }, [hands, deck, discardPiles, stuckCounts, pegs, triggerMoveEffects, recordReplayFrame, gameMode]);
+  }, [hands, deck, discardPiles, stuckCounts, pegs, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat]);
 
-  // AI logic - handles players 1, 2, 3
+  // AI logic - drives every seat this client does not own
   useEffect(() => {
-    if (currentPlayer === 0 || winner !== null) return;
+    if (isMyTurn || winner !== null) return;
     if (aiProcessingRef.current) return; // Already processing this turn
 
     aiProcessingRef.current = true;
@@ -923,6 +947,7 @@ export default function PegsAndJokers() {
     const nextPlayer = (currentPlayer + 1) % 4;
 
     const timer = setTimeout(() => {
+      aiTimerRef.current = null;
       const aiHand = hands[aiPlayer];
 
       // Helper function to complete AI move
@@ -969,7 +994,7 @@ export default function PegsAndJokers() {
 
         setCurrentPlayer(nextPlayer);
         aiProcessingRef.current = false;
-        if (nextPlayer === 0) {
+        if (ownsSeat(nextPlayer)) {
           setGameMessage('Your turn! Select a card and peg to move.');
         } else {
           setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
@@ -1069,20 +1094,23 @@ export default function PegsAndJokers() {
       // No valid move, discard (discardAndDraw handles player transition for AI)
       discardAndDraw(aiPlayer);
     }, 800);
+    aiTimerRef.current = timer;
 
     return () => {
       clearTimeout(timer);
+      if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat]);
 
-  // Chime + gentle buzz when control passes back to the human player
+  // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
-    if (currentPlayer === 0 && prevPlayerRef.current !== null && prevPlayerRef.current !== 0 && winner === null) {
+    const prev = prevPlayerRef.current;
+    if (isMyTurn && prev !== null && !ownsSeat(prev) && winner === null) {
       sfx.yourTurn();
     }
     prevPlayerRef.current = currentPlayer;
-  }, [currentPlayer, winner]);
+  }, [currentPlayer, isMyTurn, winner, ownsSeat]);
 
   // Count a completed turn each time control passes to a different player.
   // The winning move doesn't switch players, so it's added on at record time.
@@ -1132,7 +1160,7 @@ export default function PegsAndJokers() {
   useEffect(() => {
     if (showFirstPlayerModal || showResumeModal) return;
     if (isReplaying) return; // don't persist the rewound board during a replay
-    if (!(hands[0]?.length > 0)) return; // no game in progress yet
+    if (!(hands[mySeat]?.length > 0)) return; // no game in progress yet
     if (winner !== null) {
       clearGame();
       return;
@@ -1160,10 +1188,14 @@ export default function PegsAndJokers() {
   }, [
     pegs, hands, deck, discardPiles, stuckCounts, currentPlayer,
     splitRemaining, splitCard, splitPegIndex, splitOwner, lastMoves, moveHistory,
-    winner, showFirstPlayerModal, showResumeModal, gameMode, isReplaying,
+    winner, showFirstPlayerModal, showResumeModal, gameMode, isReplaying, mySeat,
   ]);
 
-  const selectedCardObj = selectedCard !== null ? hands[0]?.[selectedCard] ?? null : null;
+  // The hand you play from — your own seat's, always (even in partner mode,
+  // where your cards may move your partner's pegs).
+  const myHand = hands[mySeat] ?? [];
+
+  const selectedCardObj = selectedCard !== null ? myHand[selectedCard] ?? null : null;
 
   // Whose pegs the human is moving this turn (their own, or their partner's once
   // they've finished in partner mode).
@@ -1172,7 +1204,7 @@ export default function PegsAndJokers() {
   // Pegs the human can legally move right now (null = highlighting inactive).
   // During the second half of a split this is the set of pegs that can finish it.
   const movablePegSet = useMemo(() => {
-    if (currentPlayer !== 0 || winner !== null || discardMode || jokerMode || isReplaying) return null;
+    if (!isMyTurn || winner !== null || discardMode || jokerMode || isReplaying) return null;
     if (splitRemaining !== 0 && splitCard) {
       const set = new Set();
       for (let i = 0; i < 5; i++) {
@@ -1186,33 +1218,33 @@ export default function PegsAndJokers() {
     }
     if (!selectedCardObj) return null;
     return new Set(getMovablePegs(controlledOwner, selectedCardObj, pegs, moveOptions));
-  }, [currentPlayer, winner, discardMode, jokerMode, isReplaying, splitRemaining, splitCard, splitPegIndex, splitOwner, selectedCardObj, pegs, controlledOwner, moveOptions]);
+  }, [isMyTurn, winner, discardMode, jokerMode, isReplaying, splitRemaining, splitCard, splitPegIndex, splitOwner, selectedCardObj, pegs, controlledOwner, moveOptions]);
 
   // Tappable destination spaces for the selected peg with a 7 or 9 (ghost
   // circles on the board — tapping one picks that split amount)
   const ghostDestinations = useMemo(() => {
-    if (currentPlayer !== 0 || winner !== null || jokerMode || discardMode || isReplaying) return [];
+    if (!isMyTurn || winner !== null || jokerMode || discardMode || isReplaying) return [];
     if (splitRemaining !== 0 || !selectedCardObj || selectedPeg === null) return [];
     const info = CARD_VALUES[selectedCardObj.rank];
     if (!info.canSplit && !info.mustSplit) return [];
     return getValidDestinations(controlledOwner, selectedPeg, selectedCardObj, pegs, moveOptions);
-  }, [currentPlayer, winner, jokerMode, discardMode, isReplaying, splitRemaining, selectedCardObj, selectedPeg, pegs, controlledOwner, moveOptions]);
+  }, [isMyTurn, winner, jokerMode, discardMode, isReplaying, splitRemaining, selectedCardObj, selectedPeg, pegs, controlledOwner, moveOptions]);
 
   // Which cards in hand have at least one fully playable move (used to dim
   // dead cards; unlike hasAnyValidMove this requires splits to be completable)
   const playableCards = useMemo(() => {
-    if (currentPlayer !== 0 || winner !== null) return hands[0].map(() => true);
-    return hands[0].map(c => getMovablePegs(controlledOwner, c, pegs, moveOptions).length > 0);
-  }, [currentPlayer, winner, hands, pegs, controlledOwner, moveOptions]);
+    if (!isMyTurn || winner !== null) return myHand.map(() => true);
+    return myHand.map(c => getMovablePegs(controlledOwner, c, pegs, moveOptions).length > 0);
+  }, [isMyTurn, winner, myHand, pegs, controlledOwner, moveOptions]);
 
   const handleCardClick = (cardIndex) => {
-    if (currentPlayer !== 0 || winner !== null || isReplaying) return;
+    if (!isMyTurn || winner !== null || isReplaying) return;
     if (splitRemaining !== 0) return;
     unlockAudio();
 
     // In discard mode, clicking a card discards it
     if (discardMode) {
-      discardAndDraw(0, cardIndex);
+      discardAndDraw(mySeat, cardIndex);
       return;
     }
 
@@ -1226,7 +1258,7 @@ export default function PegsAndJokers() {
   };
 
   const handlePegClick = (player, pegIndex) => {
-    if (currentPlayer !== 0 || winner !== null || isReplaying) return;
+    if (!isMyTurn || winner !== null || isReplaying) return;
 
     // In joker mode, clicking your own peg cancels the selection
     if (jokerMode && player === controlledOwner) {
@@ -1265,7 +1297,7 @@ export default function PegsAndJokers() {
     }
 
     setSelectedPeg(pegIndex);
-    const card = hands[0][selectedCard];
+    const card = myHand[selectedCard];
     const cardInfo = CARD_VALUES[card.rank];
 
     // Handle Joker - enter selection mode for target
@@ -1292,7 +1324,7 @@ export default function PegsAndJokers() {
   const handleJokerTarget = (targetPlayer, targetPegIndex) => {
     if (isReplaying) return;
     if (!jokerMode || jokerSourcePeg === null || selectedCard === null) return;
-    const actor = 0;
+    const actor = mySeat;
     const owner = controlledOwnerFor(pegs);
     if (targetPlayer === owner) return; // Can't target the mover's own pegs
 
@@ -1358,7 +1390,7 @@ export default function PegsAndJokers() {
     }
 
     // Next player
-    const nextPlayer = 1; // After player 0, always goes to player 1
+    const nextPlayer = (actor + 1) % 4;
     setCurrentPlayer(nextPlayer);
     setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
   };
@@ -1368,7 +1400,7 @@ export default function PegsAndJokers() {
   const handleGhostClick = (dest) => {
     if (isReplaying) return;
     if (selectedCard === null || selectedPeg === null) return;
-    const card = hands[0][selectedCard];
+    const card = myHand[selectedCard];
     executeMove(controlledOwnerFor(pegs), selectedPeg, card, dest.amount);
   };
 
@@ -1379,8 +1411,9 @@ export default function PegsAndJokers() {
     const side = Math.floor(trackIndex / SPACES_PER_SIDE);
     const pos = trackIndex % SPACES_PER_SIDE;
 
-    // Rotate visual layout so player 0 (Yellow) is at the bottom
-    const visualSide = (side + 2) % 4;
+    // Rotate the visual layout so YOUR seat is at the bottom. With mySeat = 0
+    // this is the original (side + 2) % 4, so solo rendering is unchanged.
+    const visualSide = visualSideFor(side, mySeat);
 
     const topY = MARGIN;
     const bottomY = BOARD_SIZE - MARGIN;
@@ -1413,8 +1446,8 @@ export default function PegsAndJokers() {
   const getStartAreaPosition = (player, pegIndex) => {
     const trackPos8 = getTrackPosition(player * SPACES_PER_SIDE + 8);
 
-    // Rotate visual layout so player 0 (Yellow) is at the bottom
-    const visualSide = (player + 2) % 4;
+    // Rotate the visual layout so YOUR seat is at the bottom.
+    const visualSide = visualSideFor(player, mySeat);
 
     // Offset inward from track, close to the come-out space
     const inwardOffset = 22;
@@ -1450,8 +1483,8 @@ export default function PegsAndJokers() {
   const getHomePosition = (player, homePos) => {
     const trackPos3 = getTrackPosition(player * SPACES_PER_SIDE + 3);
 
-    // Rotate visual layout so player 0 (Yellow) is at the bottom
-    const visualSide = (player + 2) % 4;
+    // Rotate the visual layout so YOUR seat is at the bottom.
+    const visualSide = visualSideFor(player, mySeat);
 
     const spacing = 14;
 
@@ -1475,11 +1508,11 @@ export default function PegsAndJokers() {
 
   // Board label for a seat: "You", partner or opponent in partner mode, else AI.
   const roleLabel = (player) => {
-    if (player === 0) return 'You (Yellow)';
+    if (ownsSeat(player)) return `You (${PLAYER_NAMES[player]})`;
     if (gameMode === GAME_MODES.PARTNERS) {
-      return `${PLAYER_NAMES[player]} (${sameTeam(player, 0) ? 'Partner' : 'Opponent'})`;
+      return `${PLAYER_NAMES[player]} (${sameTeam(player, mySeat) ? 'Partner' : 'Opponent'})`;
     }
-    return `${PLAYER_NAMES[player]} (AI)`;
+    return `${PLAYER_NAMES[player]} (${isAISeat(seatOwners, player) ? 'AI' : 'Player'})`;
   };
 
   const renderCard = (card, index, isSelected, isPlayable = true) => {
@@ -1523,7 +1556,7 @@ export default function PegsAndJokers() {
             <h2 className="text-2xl font-bold mb-3 text-center">Resume game?</h2>
             <p className="text-center text-gray-300 mb-6">
               You have a game in progress
-              {pendingResume.currentPlayer === 0 ? (
+              {ownsSeat(pendingResume.currentPlayer) ? (
                 <> — it's <span className="font-semibold text-amber-400">your turn</span>.</>
               ) : (
                 <>
@@ -1887,7 +1920,7 @@ export default function PegsAndJokers() {
 
         {/* Undo a mis-tapped split: only available between the two halves of a
             split, before the second peg commits the move */}
-        {splitUndo && splitRemaining !== 0 && currentPlayer === 0 && winner === null && !isReplaying && (
+        {splitUndo && splitRemaining !== 0 && isMyTurn && winner === null && !isReplaying && (
           <div className="text-center mb-4">
             <button
               onClick={undoSplit}
@@ -1899,7 +1932,7 @@ export default function PegsAndJokers() {
         )}
 
         {/* Instant replay: offer a rewind when it's your turn and the AI just moved */}
-        {!isReplaying && replayReady > 0 && currentPlayer === 0 && winner === null && (
+        {!isReplaying && replayReady > 0 && isMyTurn && winner === null && (
           <div className="text-center mb-4">
             <button
               onClick={startReplay}
@@ -1962,7 +1995,7 @@ export default function PegsAndJokers() {
                     // While a bumped peg is flying back, its start slot renders empty
                     const isFlyingBack = bumpFx && bumpFx.player === player && bumpFx.pegIndex === i;
                     const hasPeg = pegs[player][i]?.location === 'start' && !isFlyingBack;
-                    const isClickable = currentPlayer === 0 && player === controlledOwner && hasPeg && !jokerMode;
+                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && !jokerMode;
                     const isSelected = player === controlledOwner && (i === selectedPeg || i === jokerSourcePeg) && pegs[player][i]?.location === 'start';
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(i);
                     const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(i);
@@ -1996,7 +2029,7 @@ export default function PegsAndJokers() {
                     const { x, y } = getHomePosition(player, i);
                     const hasPeg = pegs[player].some(p => p.location === 'home' && p.homePosition === i);
                     const pegIndex = pegs[player].findIndex(p => p.location === 'home' && p.homePosition === i);
-                    const isClickable = currentPlayer === 0 && player === controlledOwner && hasPeg && i < 4 && !jokerMode;
+                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && i < 4 && !jokerMode;
                     const isSelected = player === controlledOwner && pegIndex === selectedPeg && hasPeg;
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(pegIndex);
                     const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(pegIndex);
@@ -2042,7 +2075,7 @@ export default function PegsAndJokers() {
                   const isJokerSource = jokerMode && player === controlledOwner && pegIndex === jokerSourcePeg;
                   // The human can click the pegs they control when not in joker mode,
                   // target pegs in joker mode, or their controlled pegs to cancel.
-                  const isClickable = currentPlayer === 0 && (player === controlledOwner || isJokerTarget);
+                  const isClickable = isMyTurn && (player === controlledOwner || isJokerTarget);
                   const isSelected = player === controlledOwner && (pegIndex === selectedPeg || isJokerSource);
                   const isMovable = player === controlledOwner && !jokerMode && movablePegSet != null && movablePegSet.has(pegIndex);
                   const isDimmed = player === controlledOwner && !jokerMode && movablePegSet != null && !movablePegSet.has(pegIndex);
@@ -2168,14 +2201,15 @@ export default function PegsAndJokers() {
 
               {/* Per-player discard piles with stuck counters */}
               {[0, 1, 2, 3].map(player => {
-                // Position discard piles in corners around center draw pile (rotated so Yellow is at bottom)
+                // Discard piles sit in the corners around the centre draw pile,
+                // indexed by *visual side* so they follow the board rotation.
                 const positions = [
-                  { x: 220, y: 240 },  // Yellow - bottom-right of center
-                  { x: 130, y: 240 },  // Blue - bottom-left of center
-                  { x: 130, y: 140 },  // Pink - top-left of center
-                  { x: 220, y: 140 }   // Green - top-right of center
+                  { x: 130, y: 140 },  // top side - top-left of center
+                  { x: 220, y: 140 },  // right side - top-right of center
+                  { x: 220, y: 240 },  // bottom side (yours) - bottom-right of center
+                  { x: 130, y: 240 }   // left side - bottom-left of center
                 ];
-                const pos = positions[player];
+                const pos = positions[visualSideFor(player, mySeat)];
                 const lastCard = discardPiles[player]?.[discardPiles[player].length - 1];
                 const stuckCount = stuckCounts[player];
 
@@ -2229,23 +2263,34 @@ export default function PegsAndJokers() {
                 );
               })}
 
-              {/* Labels with last move - rotated so Yellow (player 0) is at bottom */}
-              <g>
-                <text x="200" y="20" textAnchor="middle" fill={PLAYER_COLORS[2]} fontSize="11" fontWeight="bold">{roleLabel(2)}</text>
-                {lastMoves[2] && <text x="200" y="31" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[2]}</text>}
-              </g>
-              <g transform="rotate(90 378 205)">
-                <text x="378" y="200" textAnchor="middle" fill={PLAYER_COLORS[3]} fontSize="11" fontWeight="bold">{roleLabel(3)}</text>
-                {lastMoves[3] && <text x="378" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[3]}</text>}
-              </g>
-              <g>
-                <text x="200" y="383" textAnchor="middle" fill={PLAYER_COLORS[0]} fontSize="11" fontWeight="bold">{roleLabel(0)}</text>
-                {lastMoves[0] && <text x="200" y="394" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[0]}</text>}
-              </g>
-              <g transform="rotate(-90 22 205)">
-                <text x="22" y="200" textAnchor="middle" fill={PLAYER_COLORS[1]} fontSize="11" fontWeight="bold">{roleLabel(1)}</text>
-                {lastMoves[1] && <text x="22" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[1]}</text>}
-              </g>
+              {/* Labels with last move, placed by visual side so YOUR seat is
+                  always the one at the bottom */}
+              {(() => {
+                const top = seatAtVisualSide(0, mySeat);
+                const right = seatAtVisualSide(1, mySeat);
+                const bottom = seatAtVisualSide(2, mySeat);
+                const left = seatAtVisualSide(3, mySeat);
+                return (
+                  <>
+                    <g>
+                      <text x="200" y="20" textAnchor="middle" fill={PLAYER_COLORS[top]} fontSize="11" fontWeight="bold">{roleLabel(top)}</text>
+                      {lastMoves[top] && <text x="200" y="31" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[top]}</text>}
+                    </g>
+                    <g transform="rotate(90 378 205)">
+                      <text x="378" y="200" textAnchor="middle" fill={PLAYER_COLORS[right]} fontSize="11" fontWeight="bold">{roleLabel(right)}</text>
+                      {lastMoves[right] && <text x="378" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[right]}</text>}
+                    </g>
+                    <g>
+                      <text x="200" y="383" textAnchor="middle" fill={PLAYER_COLORS[bottom]} fontSize="11" fontWeight="bold">{roleLabel(bottom)}</text>
+                      {lastMoves[bottom] && <text x="200" y="394" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[bottom]}</text>}
+                    </g>
+                    <g transform="rotate(-90 22 205)">
+                      <text x="22" y="200" textAnchor="middle" fill={PLAYER_COLORS[left]} fontSize="11" fontWeight="bold">{roleLabel(left)}</text>
+                      {lastMoves[left] && <text x="22" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[left]}</text>}
+                    </g>
+                  </>
+                );
+              })()}
             </svg>
           </div>
 
@@ -2254,7 +2299,7 @@ export default function PegsAndJokers() {
             <div className="mb-4">
               <h3 className="text-lg font-semibold mb-2">Your Hand:</h3>
               <div className="flex gap-2 flex-wrap">
-                {hands[0].map((card, i) => renderCard(card, i, i === selectedCard, playableCards[i]))}
+                {myHand.map((card, i) => renderCard(card, i, i === selectedCard, playableCards[i]))}
               </div>
             </div>
 
@@ -2310,7 +2355,7 @@ export default function PegsAndJokers() {
             {/* Discarding is only allowed when the player is genuinely stuck (no
                 legal move). If any card can be played, no discard option is shown
                 so the player can't skip a turn they're required to play. */}
-            {currentPlayer === 0 && !jokerMode && !splitRemaining && !discardMode && !isReplaying && hands[0]?.length > 0 && !playableCards.some(Boolean) && (
+            {isMyTurn && !jokerMode && !splitRemaining && !discardMode && !isReplaying && myHand.length > 0 && !playableCards.some(Boolean) && (
               <div className="mb-4">
                 <div>
                   <button
@@ -2322,9 +2367,9 @@ export default function PegsAndJokers() {
                     }}
                     className="px-4 py-2 bg-red-600 rounded hover:bg-red-700 font-bold"
                   >
-                    No Valid Move - Select Card to Discard {stuckCounts[0] > 0 && `(${stuckCounts[0]}/3)`}
+                    No Valid Move - Select Card to Discard {stuckCounts[mySeat] > 0 && `(${stuckCounts[mySeat]}/3)`}
                   </button>
-                  {stuckCounts[0] === 2 && (
+                  {stuckCounts[mySeat] === 2 && (
                     <p className="text-yellow-400 text-sm mt-1">Next stuck discard will let you start a peg!</p>
                   )}
                 </div>

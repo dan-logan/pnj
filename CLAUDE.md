@@ -24,12 +24,32 @@ The rules engine is pure JavaScript (no React), separated from the UI so it can 
 - **src/game/engine.js** - Move validation (`isValidMove`, `hasAnyValidMove`), move application (`applyMove`), win detection, animation paths, UI affordances (`getValidDestinations`, `getMovablePegs`, `findBumps`). All functions take the peg state as an argument and return new state without mutating. Movement functions accept an `options` arg (`{ actor, mode }`) so a player can move a partner's pegs and so the partner friendly-bump rule applies; `applyJoker` and `findFriendlyBumps` support partner mode, and `checkWinner(pegs, mode)` returns a team index in partner mode
 - **src/game/ai.js** - AI move enumeration and scoring (`getPossibleMoves`, `findBestAIMove`); prioritizes moves that advance toward home, avoids vulnerable positions. In partner mode it scores by team distance, plays for its partner once its own pegs are all home, and values friendly-bump jokers
 - **src/game/stats.js** - Persistent player statistics in localStorage; pure record/derive logic with an optional injectable storage backend
+- **src/net/seats.js** - Pure seat-ownership helpers, no React: `mySeatsOf`, `primarySeat`, `isMyTurnFor`, `isAISeat`, and the board-rotation math `visualSideFor`/`seatAtVisualSide`. See "Seat ownership" below
 - **src/game/persistence.js** - Save/resume of an in-progress game to localStorage (`serializeGame`, `saveGame`, `loadGame`, `clearGame`, `isResumable`). Snapshots pegs/hands/deck/discards/currentPlayer plus split state and per-game stat tallies as plain JSON. Same injectable-storage pattern as stats.js; no-ops without storage
 - **src/audio.js** - Web Audio synth sound effects + `navigator.vibrate` haptics with a persisted mute setting; all no-ops outside a browser
-- **src/PegsAndJokers.jsx** - React component: game state via hooks, turn flow, input handlers, SVG board rendering. Move input is tap-driven: selecting a card glows the movable pegs (`getMovablePegs`), selecting a peg with a 7/9 renders tappable ghost destination circles (`getValidDestinations`). A `useEffect` snapshots the game to localStorage after every committed change and clears it on win; on load it offers a "Resume game?" modal when a save exists. **Instant replay:** each AI move (and stuck-discard) is recorded into a `replayLogRef` buffer as a frame (`{ player, description, pegsBefore, pegsAfter, segments }`); the buffer resets when you hand off your turn and holds exactly the opponents' moves since your last turn. When it's your turn a "📺 Instant Replay" button plays them back slowed down, driving the board from the recorded peg snapshots (reusing `calculateMovePath`/`animatingPeg`) and restoring the live board when it finishes or you press Stop. Interaction handlers and the persistence effect are gated on `isReplaying` so playback never mutates the real game or save
+- **src/PegsAndJokers.jsx** - React component: game state via hooks, turn flow, input handlers, SVG board rendering. Turn gating, actor identity and board orientation all derive from `seatOwners` (see "Seat ownership"). Move input is tap-driven: selecting a card glows the movable pegs (`getMovablePegs`), selecting a peg with a 7/9 renders tappable ghost destination circles (`getValidDestinations`). A `useEffect` snapshots the game to localStorage after every committed change and clears it on win; on load it offers a "Resume game?" modal when a save exists. **Instant replay:** each AI move (and stuck-discard) is recorded into a `replayLogRef` buffer as a frame (`{ player, description, pegsBefore, pegsAfter, segments }`); the buffer resets when you hand off your turn and holds exactly the opponents' moves since your last turn. When it's your turn a "📺 Instant Replay" button plays them back slowed down, driving the board from the recorded peg snapshots (reusing `calculateMovePath`/`animatingPeg`) and restoring the live board when it finishes or you press Stop. Interaction handlers and the persistence effect are gated on `isReplaying` so playback never mutates the real game or save
 - **src/InstallPrompt.jsx** - Dismissible "Add to Home Screen" banner: replays the captured `beforeinstallprompt` on Chrome/Android, shows manual Share-sheet instructions on iOS Safari, hidden when already installed
 - **src/main.jsx** - React entry point
 - **src/index.css** - Tailwind imports plus small keyframe animations for peg glow/ghost destinations
+
+### Seat ownership
+
+The component never assumes "the local human is player 0". A single `seatOwners` state array says who owns each of the four seats **from this client's point of view**:
+
+| Layout | `seatOwners` |
+|---|---|
+| Solo (today's only mode) | `['me', 'ai', 'ai', 'ai']` |
+| Remote host | `['me', 'ai', 'them', 'ai']` |
+| Remote guest | `['them', 'ai', 'me', 'ai']` |
+
+Everything else is derived from it (helpers in `src/net/seats.js`):
+
+- `mySeats` — every seat this client controls, **an array** even though only one seat is ever owned today, so a client driving two seats needs no second refactor. `ownsSeat(p)` is the membership test.
+- `mySeat` — the primary seat: whose hand is shown, who acts as the engine `actor`, and whose board edge faces the player.
+- `isMyTurn` — replaces every `currentPlayer === 0` turn gate.
+- Board rotation — seat `x` is drawn on visual side `(x - mySeat + 2) mod 4` (0 top, 1 right, 2 bottom, 3 left), so your own seat is always at the bottom. `getTrackPosition` / `getStartAreaPosition` / `getHomePosition`, the discard-pile corners and the four board labels all go through `visualSideFor` / `seatAtVisualSide`. With `mySeat = 0` this collapses to the original `(x + 2) % 4`, which is why solo rendering is byte-for-byte unchanged.
+
+Solo is not a special case in the code — it is just the layout whose only non-AI seat is seat 0.
 
 ### PWA
 
@@ -39,7 +59,7 @@ Peg state shape: a 4-element array (one per player) of 5 peg objects, each `{ lo
 
 ## Testing
 
-Tests live next to the modules they cover (`src/game/*.test.js`) and run with Vitest. They cover deck composition, move validation for every card type (including 7/9 split rules and home-corridor edge cases), bumping, win detection, and AI move selection. CI (`.github/workflows/ci.yml`) runs tests and the build on every pull request, and the deploy workflow runs tests before deploying. When changing game rules, add or update engine tests in the same change.
+Tests live next to the modules they cover (`src/game/*.test.js`, `src/net/*.test.js`) and run with Vitest. They cover deck composition, move validation for every card type (including 7/9 split rules and home-corridor edge cases), bumping, win detection, AI move selection, seat-ownership derivations and board rotation. CI (`.github/workflows/ci.yml`) runs tests and the build on every pull request, and the deploy workflow runs tests before deploying. When changing game rules, add or update engine tests in the same change. There is no component-test setup and none is planned: logic that needs testing belongs in a plain module, not in `PegsAndJokers.jsx`.
 
 ## Game Logic Key Concepts
 
