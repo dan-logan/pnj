@@ -1,8 +1,10 @@
 # Multiplayer Phase 1 — Implementation Plan
 
-**Status:** approved design, not yet implemented
+**Status:** Packages 0 and 1 are built and pushed to the branch. Packages 2–6 are approved design, not yet implemented.
 **Branch:** `claude/multiplayer-remote-play-ecx61a`
 **Audience:** the agent implementing this. Assume no memory of the design discussion — everything needed is here.
+
+**Revision note (written after building Packages 0 and 1).** §2.3–§2.5, §3.1, §3.2, §3.4, §4.1, §4.3, §4.4, §5.1 and §5.2 have been corrected against the code as it now stands. The shape of the design is unchanged; what changed is a handful of RPC signatures, the tally model, the lobby's "whose turn" test, and three assumptions that Package 1 invalidated. Revised passages are marked **[revised]** and say what was wrong.
 
 ---
 
@@ -270,6 +272,29 @@ partner mode credits both opponents.
 
 ---
 
+### What Packages 0 and 1 actually built
+
+Both are on the branch and `CLAUDE.md` documents them under "Seat ownership", "Game phase and
+status" and "Ending a game". Read those before starting Package 2 — they are the ground truth, and
+the line numbers scattered through this plan predate them and are now wrong. The short version:
+
+- `src/net/seats.js` — `mySeatsOf`, `primarySeat`, `isMyTurnFor`, `isAISeat`, `visualSideFor`,
+  `seatAtVisualSide`. The component holds `seatOwners` state and derives `mySeats` / `mySeat` /
+  `isMyTurn` / `ownsSeat` from it. `setSeatOwners` exists and is unused — it is the hook Package 3
+  needs when a game is opened.
+- `src/game/status.js` — `derivePhase`, `describeStatus`, `describeOutcome`. `gameMessage` is gone;
+  `notice` holds transient feedback and clears on any phase change. **There are no status timers
+  left. Do not add one.**
+- `endGame(winner, { winningSeat, description })` is the only terminal transition, and cancels every
+  pending timer. `recordFinishedGame(gameId, result)` in `src/game/stats.js` is idempotent on
+  `pnj:recordedGames:v1`; `didIWin(winner, mode, mySeats)` interprets a winner per mode. The game id
+  round-trips through `serializeGame()`, so a remote game should use its Supabase row id.
+- Beyond the sites this plan listed, Package 0 also had to fix: two hardcoded `nextPlayer = 1`
+  handoffs, the discard-pile corner coordinates, and the four board labels. Expect the same — the
+  line-number lists here are a starting point, not an inventory.
+
+---
+
 ### Package 2 — Supabase backend
 
 Create a Supabase project (free tier is sufficient). Add `@supabase/supabase-js`.
@@ -327,9 +352,11 @@ create table games (
   status      text not null default 'lobby',   -- lobby | active | finished
   host_token  uuid not null default gen_random_uuid(),
   guest_token uuid,
-  state       jsonb,          -- serializeGame() output
+  state       jsonb,          -- shared game state (see §4.1)
   replay      jsonb not null default '[]',     -- frames for the last human move
   version     int  not null default 0,
+  current_player smallint,     -- the seat the state is parked on (always an AI seat)
+  waiting_on  smallint,        -- the HUMAN seat that must act next — see §3.2
   winner      int,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
@@ -349,16 +376,29 @@ All `SECURITY DEFINER`, granted to `anon`:
 - `join_game(p_code text) → (id, seat, guest_token, mode, status, state, version)`
   If `guest_token` is null, mint one and return seat 2. If already set, return the existing token
   so a reload rejoins.
-- `get_game(p_id uuid, p_token uuid) → (state, replay, version, status, winner, mode)`
-  Token must match `host_token` or `guest_token`.
-- `publish_state(p_id uuid, p_token uuid, p_state jsonb, p_replay jsonb, p_version int, p_winner int) → int`
+- `join_game_by_id(p_id uuid) → (id, seat, guest_token, mode, status, state, version)` **[revised]**
+  Same behaviour, keyed on the id. **This did not exist and the design could not work without it:**
+  share links carry `?g=<uuid>`, not the 6-char code, so `join_game(p_code)` alone means a share
+  link can never be used to join. This is safe under the same argument the plan already makes for
+  links — the UUID is unguessable, so knowing it *is* the credential to claim the open seat.
+- `get_game(p_id uuid, p_token uuid, p_since_version int default -1) → (state, replay, version, status, winner, mode, current_player, waiting_on, guest_joined)` **[revised]**
+  Token must match `host_token` or `guest_token`. Two additions:
+  - `p_since_version` — when the row's `version <= p_since_version`, return the metadata but leave
+    `state` and `replay` **null**. Without this, the §4.4 poll re-downloads the whole game every
+    4 seconds forever. Measured against the real serializer, a publish is ~13 KB (4.8 KB state,
+    ~4.1 KB per split replay frame), so an idle client burns ~11 MB/hour to learn nothing.
+  - `guest_joined boolean` — never the token itself. The host's lobby poll in §3.1 waits for the
+    guest to take the seat, and there was previously **no way to observe that**: `status` stays
+    `'lobby'` until the host itself calls `start_game`.
+- `publish_state(p_id uuid, p_token uuid, p_state jsonb, p_replay jsonb, p_version int, p_winner int, p_current_player smallint, p_waiting_on smallint) → int` **[revised]**
   Compare-and-swap: update only `where id = p_id and version = p_version`; set `version = version + 1`,
   `updated_at = now()`, and `status = 'finished'` when `p_winner` is not null. If no row is updated,
   raise a distinguishable error (`errcode 'P0001'`, message `version_conflict`) so the client can
-  re-read and adopt.
-- `start_game(p_id uuid, p_token uuid, p_state jsonb) → int`
+  re-read and adopt. `p_waiting_on` is `nextHumanSeat(currentPlayer, seatOwners)` (§4.2) — see §3.2
+  for why the lobby cannot work without it.
+- `start_game(p_id uuid, p_token uuid, p_state jsonb, p_current_player smallint, p_waiting_on smallint) → int`
   Host-only. Sets the initial dealt state, `status = 'active'`, `version = 1`.
-- `list_games(p_pairs jsonb) → setof (id, status, mode, current_player, winner, version, updated_at, seat, partner_joined)`
+- `list_games(p_pairs jsonb) → setof (id, status, mode, current_player, waiting_on, winner, version, updated_at, seat, guest_joined)` **[revised]**
   Takes `[{ "id": uuid, "token": uuid }, …]` and returns a **summary row per pair whose token
   matches** — silently skipping the rest, so a bad token leaks nothing. This powers the My Games
   lobby in one round trip. It must **not** return the `state` or `replay` blobs; the lobby only
@@ -373,7 +413,8 @@ All `SECURITY DEFINER`, granted to `anon`:
 export function isMultiplayerConfigured()   // both env vars present
 export async function createGame(mode)
 export async function joinGame(code)
-export async function fetchGame(id, token)
+export async function joinGameById(id)      // share links carry the id, not the code
+export async function fetchGame(id, token, sinceVersion)  // null state when unchanged
 export async function publishState(id, token, payload)  // throws VersionConflict
 export async function startGame(id, token, state)
 export async function listGames(sessions)   // → summary rows for the lobby
@@ -408,10 +449,12 @@ flow — first-player modal, single local save, resume prompt — and none of th
 
 - **"Play with a friend"** on the existing first-player modal.
 - **Host:** creates the game → shows the 6-char code and a copyable share link (`?g=<uuid>`) →
-  "Waiting for your partner to join…". Polls `get_game` every 3 s until `guest_token` is set, then
-  deals (`startGameWithPlayer`) and calls `start_game`.
-- **Guest:** opening `?g=<uuid>` (or entering the code) calls `join_game`, stores the session in
-  `pnj:games:v1`, and waits until `status = 'active'`.
+  "Waiting for your partner to join…". Polls `get_game` every 3 s until it reports
+  `guest_joined` **[revised — this flag had to be added to `get_game`; there was no way to see the
+  join]**, then deals (`startGameWithPlayer`) and calls `start_game`.
+- **Guest:** opening `?g=<uuid>` calls `join_game_by_id`; entering the code calls `join_game`
+  **[revised — the link carries the id, which the original `join_game(p_code)` could not accept]**.
+  Either way it stores the session in `pnj:games:v1` and waits until `status = 'active'`.
 - **First player:** host-only. Reuse the existing modal and spinner (`:220`); the guest never sees it.
 - A player can be host in one game and guest in another simultaneously. Seat assignment is
   per-game and already lives in `seatOwners`, so nothing special is needed.
@@ -432,6 +475,14 @@ Populate it with one `list_games` call. Show a **badge with the number of games 
 the lobby button, so a player can see there is something to do without opening it. That badge is
 also exactly what Phase 2's push notifications will drive.
 
+**"Your turn" is `waiting_on === seat`, never `current_player === seat`. [revised]** This is the
+single easiest way to ship a lobby that looks finished and does nothing. §4.1 publishes *after* the
+turn passes on, so every stored row is parked on an AI seat — `current_player` is always 1 or 3 and
+`current_player === seat` is false for every game, always. The sort would never reorder and the
+badge would never leave zero. `waiting_on` is `nextHumanSeat(current_player, seatOwners)`, written
+by the publisher (§2.4). Storing it rather than deriving it client-side keeps the rule in one place
+and is exactly the field Phase 2 needs to know whom to notify.
+
 #### 3.3 Switching
 
 - A **My Games** button in the game header (next to Stats / New Game, `:1862`) opens the lobby from
@@ -449,9 +500,18 @@ also exactly what Phase 2's push notifications will drive.
 
 #### 3.4 Entry point
 
-On mount, when multiplayer is configured, open the lobby instead of the resume modal — it
-subsumes it, and the resume prompt doesn't make sense once more than one game can be resumed.
-Auto-open the last `activeId` game only when it is the sole game and it is your turn.
+On mount, open the lobby instead of the resume modal **only when this device actually has remote
+games** (`pnj:games:v1` is non-empty) — it subsumes the resume prompt, which stops making sense once
+more than one game can be resumed. Auto-open the last `activeId` game only when it is the sole game
+and it is your turn.
+
+**[revised]** The original trigger was `isMultiplayerConfigured()`, which contradicts the
+non-negotiable constraint in §1. Once the env vars are set on Pages that predicate is true for
+*everyone*, so every solo player who has never touched multiplayer would get a lobby instead of the
+resume modal they know. The "solo is unchanged" guarantee would then be enforced only by the absence
+of configuration — precisely the state that stops holding the day Package 2 deploys. Gate on the
+device having remote games; `isMultiplayerConfigured()` still gates whether multiplayer can be
+*started* at all.
 
 **Local save interaction.** The localStorage save (`persistence.js`) remains the source of truth
 for **solo only**, and there is still exactly one solo game. In a remote game the server row is
@@ -478,11 +538,41 @@ Consequence worth knowing: a half-finished split never crosses the wire (`splitR
 0 in a published snapshot). If a player disconnects mid-split the server still holds the pre-turn
 state and their turn simply starts over when they return. That is intended.
 
-The three sites where a human turn ends are `executeMove` (`:699`), `completeSplit` (`:780`), and
-`discardAndDraw`'s human branch (`:894`). Route all three through one `commitTurn(nextPlayer,
-nextState)` helper rather than duplicating publish logic three times.
+The three sites where a human turn ends are `executeMove`, `completeSplit`, `handleJokerTarget` and
+`discardAndDraw`'s human branch. (Package 0 made `handleJokerTarget` a real fourth site — it used to
+hardcode `nextPlayer = 1`.) Route all of them through one `commitTurn(nextPlayer, nextState)` helper
+rather than duplicating publish logic.
 
-Payload: `serializeGame(...)` as-is, plus the replay frames for the move just made.
+#### Payload: NOT `serializeGame()` as-is **[revised]**
+
+The original said "`serializeGame(...)` as-is". That is wrong, and wrong in a way that silently
+corrupts both players' lifetime stats. `serializeGame()` carries
+`tallies: { turns, jokersPlayed, bumpsDelivered, timesBumped, startMode }`, and three of those are
+**personal to the client that computed them** — `triggerMoveEffects` counts a bump as delivered or
+received by testing `ownsSeat()`. Sync that blob and adopt it through `applySavedGame` and each
+client overwrites its own tallies with its partner's, then folds them into its own lifetime stats.
+
+It is worse than a mix-up, because §4.2 means neither client sees half the bumps at all: the host
+adopts Blue's move as a finished board and never runs `triggerMoveEffects` over it, so Blue bumping
+a host peg increments `timesBumped` nowhere. Bump stats quietly stop working the moment play goes
+remote.
+
+So the shared state is `serializeGame()` with the tally block restructured:
+
+- `turns` — shared and objective. Keep it, but see §4.4: it must become a counter incremented once
+  per seat that actually moves, not the transition-counting effect there is today.
+- `jokersPlayed`, `bumpsDelivered`, `timesBumped` — **per-seat arrays** (`[n0, n1, n2, n3]`),
+  tallied by whichever client simulates the move, summed over `mySeats` at record time. That fixes
+  both halves: the numbers ride the wire from whoever observed them, and each client reads off only
+  its own seats. It also survives §3.3's game switching, where per-game refs would otherwise be lost.
+- `startMode` — a host-only concept ("did *I* choose to go first"). Do not let a guest inherit it:
+  remote games should count toward neither the `chosenFirst` nor the `randomFirst` bucket.
+- `moveHistory` — write-only dead state (set, never read). Drop it from the payload.
+
+Plus the replay frames for the move just made. Note what a frame costs: each carries six full board
+snapshots (`pegsBefore`/`pegsAfter`, and every segment's `fromPegs`/`toPegs`), so a 7-split frame is
+~4.1 KB against a 4.8 KB state. A typical publish is ~13 KB, not "a few KB" — which is what makes
+the version gate on `get_game` (§2.4) load-bearing rather than an optimisation.
 
 #### 4.2 Simulate AI only when the chain leads to your seat
 
@@ -522,13 +612,21 @@ If the arriving state has a winner, do **not** simulate anything. Route it strai
 (§1.3), which records stats idempotently and shows the end-of-game overlay — after the auto-replay
 in Package 5, so the player sees the winning move.
 
+**[revised — how this composes with what Package 1 built.]** `applySavedGame` resets `endedRef` and
+`endInfo` and leaves `winner` null, so the correct sequence is **adopt first, then call `endGame`**
+with the snapshot's winner. Do not try to make `applySavedGame` set the winner itself. Done in that
+order you get idempotent stat recording and the overlay for free, and a terminal state can be
+adopted any number of times safely. Frame seeding must also come *after* the adopt, because
+`applySavedGame` calls `resetReplay()`, which empties `replayLogRef`.
+
 #### 4.4 Poll while waiting
 
 Two cadences, deliberately different:
 
-- **The open game**, while it isn't your turn: `get_game` every 4 s, plus on `visibilitychange`
-  and `focus` (mobile players will background the tab). Stop once the state arrives with your seat
-  to move, or the game is finished.
+- **The open game**, while it isn't your turn: `get_game` every 4 s **passing the version you
+  already hold** (§2.4), plus on `visibilitychange` and `focus` (mobile players will background the
+  tab). Stop once the state arrives with your seat to move, or the game is finished. **[revised]**
+  Without the version argument this is ~11 MB/hour per idle client to be told nothing changed.
 - **The lobby summary**, for every other game: `list_games` every 30 s and on focus. It only feeds
   a badge and a list, so it does not need to be fast, and one summary call covers all games
   regardless of how many are running.
@@ -543,6 +641,12 @@ and let §4.2 decide whether to simulate.
 
 On a **version conflict** when publishing: re-read, adopt, and surface a non-destructive notice.
 With one writer per turn this should be unreachable; treat it as a bug signal, not a routine path.
+
+**The turn counter needs fixing for remote play. [revised]** `turnsRef` increments in an effect that
+watches `currentPlayer` for a *change*, so adopting a state that jumped from seat 1 to seat 3 counts
+one turn instead of two — and counts differently on each client. Make `turns` a plain counter in the
+shared state, incremented once per seat that actually moves (locally when simulating, and carried
+over the wire otherwise).
 
 **Acceptance:** a complete two-device partner game start to finish, including a joker bump, a 7/9
 split, a stuck discard, and a browser reload mid-game on each side.
@@ -560,7 +664,13 @@ On receiving a state where the AI chain leads to your seat:
 
 1. Adopt the state (your partner's move already applied); seed `replayLogRef` from the wire frames.
 2. Run the AI seats **silently** — no animation, no 800 ms thinking delay — recording frames.
-   Reuse the existing `animationsEnabled === false` branch in the AI effect (`:1035`).
+   Reuse the existing `animationsEnabled === false` branch in the AI effect for the animation part.
+   **[revised]** That branch does *not* skip the thinking delay: the AI effect's `setTimeout(…, 800)`
+   is unconditional and `animationsEnabled` only branches inside it. Silent mode needs the delay
+   collapsed to 0 as a separate change. Note also that the effect processes **one** seat per run and
+   waits on a React commit between them, so "run the AI seats forward" is asynchronous — set a
+   `pendingAutoReplayRef` at adoption and fire the replay from the turn-start effect when `isMyTurn`
+   becomes true, rather than trying to sequence it inline.
 3. Auto-start the replay over the whole buffer: partner's move, then the AI moves, at replay pace.
 4. Replay ends → your turn, interaction unlocks.
 
@@ -579,6 +689,13 @@ readable pace.
   turn start — keep it that small.
 - If the game ended during step 1 or 2, still play the replay, *then* show the end-of-game overlay.
   You want to see the winning move. Interaction stays locked throughout.
+  **[revised — this needs a change to what Package 1 built.]** `endGame` currently does the opposite:
+  it cancels `replaySegTimerRef` and `replayFrameTimerRef` and restores the live board, and
+  `derivePhase` ranks `finished` above `replaying`. Split it into *settle* (cancel timers, set
+  `winner`, record stats — always immediate, so nothing can move afterwards) and *present* (the
+  overlay). Gate the overlay on `winner !== null && !isReplaying && !endOverlayDismissed`, and have
+  the settle step leave the replay timers alone when a replay is the deliberate presentation. Do not
+  delay setting `winner` — that is what makes the game inert.
 - The manual "📺 Instant Replay" button (`:1902`) stays, for re-watching.
 - Update the buffer-reset trigger at `:405` from `prev === 0` to `prev === mySeat`.
 
@@ -640,7 +757,10 @@ What genuinely remains for the end:
 | A seat-0 assumption survives the sweep | Grep for `=== 0`, `!== 0`, `hands[0]`, `pegs[0]`, `stuckCounts[0]` after Package 0 and account for every hit. |
 | Env vars missing in the Pages build | Multiplayer UI hidden, not broken. Test a build with the vars unset. |
 | Guest seat taken by someone else with the code | Accepted and documented; links use the UUID, not the code. |
-| Supabase free tier pausing on inactivity | Fail soft — keep the board readable and show a reconnect notice. |
+| Supabase free tier pausing on inactivity | **Likelier than it looks:** free projects pause after ~7 days idle, and this feature is *designed* around multi-day turns, so a quiet week makes every game unreachable until someone opens the dashboard. Decide explicitly between "fail soft with a reconnect notice" and a keep-alive; don't leave it to chance. |
+| Personal stat tallies synced as if shared | Per-seat arrays in the payload (§4.1). Test by having each side bump the other and checking both lifetime stat lines. |
+| The lobby badge never fires | "Your turn" is `waiting_on`, not `current_player` (§3.2). Verify the badge is non-zero on the side that has to move. |
+| The 4 s poll re-downloading the whole game | Version-gated `get_game` (§2.4). Verify in the Supabase logs that an idle client transfers metadata only. |
 | **The game list is per-device** | With no accounts, clearing site data or switching phones loses access to in-flight games — the tokens are gone and there is no recovery path. Accepted for Phase 1. Mitigate by making the share link re-joinable: opening `?g=<uuid>` on a device that already holds a seat token for that game restores it. Tell the user this in the lobby ("games live on this device"). Accounts are the real fix and are a later phase. |
 | Switching games mid-turn corrupts state | Blocked mid-split (§3.3); everything else is transient. |
 | Abandoned games pile up in the list | Local "archive" hides a game from the lobby without touching the row. Show the last-move age so stale games are obvious. |
@@ -656,6 +776,13 @@ What genuinely remains for the end:
       app is closed, and including when an AI wins during the other client's simulation.
 - [ ] A partner-mode loss credits both opposing players.
 - [ ] Exactly one write per human turn (verify in the Supabase logs).
+- [ ] An idle client polling every 4 s transfers metadata only, not the state and replay blobs.
+- [ ] Bumps delivered and received are counted correctly on *both* devices, including bumps dealt by
+      an AI seat the other client simulated.
+- [ ] A share link opened on a fresh device joins the game (not only the 6-char code).
+- [ ] The host's "waiting for your partner" screen advances by itself when the guest joins.
+- [ ] With the Supabase env vars set, a player with no remote games still gets today's exact solo
+      flow — first-player modal, single local save, resume prompt, no lobby.
 - [ ] A client holding the anon key but no seat token can read nothing.
 - [ ] Either player can close the tab mid-game and rejoin where they left off.
 - [ ] Three concurrent remote games plus a solo game can be switched between freely, each resuming
