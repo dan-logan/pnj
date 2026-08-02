@@ -39,17 +39,46 @@ import {
   formatStreak,
   getNemesis
 } from './game/stats.js';
-import { loadGame, saveGame, clearGame } from './game/persistence.js';
+import { loadGame, saveGame, clearGame, serializeGame } from './game/persistence.js';
 import { PHASES, derivePhase, describeStatus, describeOutcome } from './game/status.js';
 import {
   SOLO_SEAT_OWNERS,
+  HOST_SEAT_OWNERS,
+  remoteSeatOwners,
   mySeatsOf,
   primarySeat,
   isMyTurnFor,
   isAISeat,
+  nextHumanSeat,
   visualSideFor,
   seatAtVisualSide,
 } from './net/seats.js';
+import {
+  isMultiplayerConfigured,
+  signIn,
+  createGame,
+  joinGame,
+  joinGameById,
+  fetchGame,
+  startGame,
+  subscribeGameMeta,
+  subscribeGameState,
+  subscribeMyGames,
+} from './net/session.js';
+import { STATUS, HOST_SEAT, GUEST_SEAT } from './net/protocol.js';
+import {
+  loadLocalGames,
+  hasLocalGames,
+  upsertLocalGame,
+  archiveLocalGame,
+  setActiveId,
+} from './net/localSession.js';
+import {
+  buildRemoteRows,
+  countWaitingOnMe,
+  relativeTime,
+  seatForUid,
+} from './net/lobby.js';
 import InstallPrompt from './InstallPrompt.jsx';
 import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
 
@@ -70,6 +99,31 @@ export default function PegsAndJokers() {
   const mySeats = useMemo(() => mySeatsOf(seatOwners), [seatOwners]);
   const mySeat = useMemo(() => primarySeat(seatOwners), [seatOwners]);
   const ownsSeat = useCallback((player) => mySeats.includes(player), [mySeats]);
+
+  // --- Remote play (Packages 2/3) ---------------------------------------------
+  // All of this is inert for a solo player: with no Firebase config or no remote
+  // games on the device, nothing here signs in or loads the Firestore SDK, and
+  // none of the UI renders. `session` is null for the solo game and holds
+  // { id, seat, version } for an open remote game — the server row is that game's
+  // save, so the local-save effect skips while it is set.
+  const multiplayerConfigured = isMultiplayerConfigured();
+  const [myUid, setMyUid] = useState(null);
+  const [session, setSession] = useState(null);
+  const sessionRef = useRef(null); // mirror for use inside async listeners
+  const [showLobby, setShowLobby] = useState(false);
+  const [remoteMeta, setRemoteMeta] = useState([]); // metadata rows from subscribeMyGames
+  const [openMeta, setOpenMeta] = useState(null); // metadata of the open remote game
+  const [mpScreen, setMpScreen] = useState(null); // null | 'menu' | 'hosting' | 'join'
+  const [hostInfo, setHostInfo] = useState(null); // { id, code, link } while waiting for a guest
+  const [joinInput, setJoinInput] = useState('');
+  const [labelInput, setLabelInput] = useState('');
+  const [mpNotice, setMpNotice] = useState(null);
+  const [mpBusy, setMpBusy] = useState(false);
+  const myGamesUnsubRef = useRef(null);
+  const gameMetaUnsubRef = useRef(null);
+  const gameStateUnsubRef = useRef(null);
+  const hostDealtRef = useRef(false); // guard the deal-on-guest-join from firing twice
+  const bootstrappedRef = useRef(false); // one-time mount routing
 
   const [deck, setDeck] = useState([]);
   const [discardPiles, setDiscardPiles] = useState([[], [], [], []]); // Per-player discard piles
@@ -435,16 +489,287 @@ export default function PegsAndJokers() {
     setShowFirstPlayerModal(false);
   }, [resetReplay, ownsSeat]);
 
-  // On mount, offer to resume a saved game if one exists; otherwise start fresh.
+  // --- Remote play: sessions, listeners, create/join, switching ---------------
+  //
+  // The discipline that used to be "clear the interval" is now "detach the
+  // listener" (a leaked listener costs money). Every path that changes the open
+  // game — switching, joining, unmount — goes through detachGameListeners first.
+
+  // Keep the ref in step with the state so async listeners always see the game
+  // that is actually open, not the one that was open when they were created.
+  const setActiveSession = useCallback((next) => {
+    sessionRef.current = next;
+    setSession(next);
+  }, []);
+
+  const detachGameListeners = useCallback(() => {
+    if (gameMetaUnsubRef.current) { gameMetaUnsubRef.current(); gameMetaUnsubRef.current = null; }
+    if (gameStateUnsubRef.current) { gameStateUnsubRef.current(); gameStateUnsubRef.current = null; }
+  }, []);
+
+  // Adopt a state snapshot arriving over the wire for the open game. In Package 3
+  // this is how the guest receives the initial deal; Package 4 layers turn
+  // exchange and auto-replay on top of the same seam. Ignore our own echo.
+  const handleRemoteState = useCallback((id, payload, info) => {
+    const s = sessionRef.current;
+    if (!s || s.id !== id) return; // a stale delivery from a game we left
+    if (!payload || !payload.state) return; // not dealt yet
+    if (info && info.isEcho(s.version)) return; // our own write coming back
+    applySavedGame(payload.state);
+    setActiveSession({ ...s, version: payload.version });
+  }, [applySavedGame, setActiveSession]);
+
+  // Deal the opening board as host and publish it, once a guest has claimed the
+  // seat. Host goes first — a simple, deterministic rule for Phase 1; wiring the
+  // existing first-player spinner into hosting is a later nicety. This does
+  // everything a solo deal does, but also serialises the state onto the wire so
+  // the guest can adopt it.
+  const dealAndStartAsHost = useCallback(async (id) => {
+    const firstPlayer = HOST_SEAT;
+    const newDeck = createDeck();
+    const hands = [newDeck.splice(0, 6), newDeck.splice(0, 6), newDeck.splice(0, 6), newDeck.splice(0, 6)];
+    const saved = serializeGame({
+      gameId: id,
+      mode: GAME_MODES.PARTNERS,
+      pegs: createInitialPegs(),
+      hands,
+      deck: newDeck,
+      discardPiles: [[], [], [], []],
+      stuckCounts: [0, 0, 0, 0],
+      currentPlayer: firstPlayer,
+      splitRemaining: 0, splitCard: null, splitPegIndex: null, splitOwner: null,
+      lastMoves: [null, null, null, null],
+      moveHistory: [],
+      turns: 0, jokersPlayed: 0, bumpsDelivered: 0, timesBumped: 0, startMode: 'chosen',
+    });
+    setSeatOwners(HOST_SEAT_OWNERS);
+    setGameMode(GAME_MODES.PARTNERS);
+    applySavedGame(saved);
+    setActiveSession({ id, seat: HOST_SEAT, version: 1 });
+    setHostInfo(null);
+    setMpScreen(null);
+    try {
+      await startGame(id, {
+        state: saved,
+        replay: [],
+        currentPlayer: firstPlayer,
+        waitingOn: nextHumanSeat(firstPlayer, HOST_SEAT_OWNERS),
+      });
+    } catch {
+      setMpNotice('Dealt locally, but could not publish. Check your connection.');
+    }
+  }, [applySavedGame, setActiveSession]);
+
+  // Metadata listener for the open game: whose turn / status for display, and —
+  // for the host waiting on a partner — the trigger to deal once a guest appears.
+  const handleOpenMeta = useCallback((id, meta) => {
+    const s = sessionRef.current;
+    if (!s || s.id !== id) return;
+    setOpenMeta(meta);
+    if (!meta) return;
+    if (s.seat === HOST_SEAT && meta.status === STATUS.LOBBY && meta.guestUid && !hostDealtRef.current) {
+      hostDealtRef.current = true;
+      dealAndStartAsHost(id);
+    }
+  }, [dealAndStartAsHost]);
+
+  const attachGameListeners = useCallback((id) => {
+    detachGameListeners();
+    gameMetaUnsubRef.current = subscribeGameMeta(id, (meta) => handleOpenMeta(id, meta));
+    gameStateUnsubRef.current = subscribeGameState(id, (payload, info) => handleRemoteState(id, payload, info));
+  }, [detachGameListeners, handleOpenMeta, handleRemoteState]);
+
+  // Open a remote game this device already belongs to: orient the board from the
+  // seat, fetch the current state (adopting it if the game is dealt), and attach
+  // the live listeners. Used by joining and by switching in from the lobby.
+  const openRemoteGame = useCallback(async (id, seat) => {
+    hostDealtRef.current = false;
+    detachGameListeners();
+    setSeatOwners(remoteSeatOwners(seat));
+    setGameMode(GAME_MODES.PARTNERS);
+    setActiveSession({ id, seat, version: null });
+    setActiveId(id);
+    setShowLobby(false);
+    setMpScreen(null);
+    setShowFirstPlayerModal(false);
+    setShowResumeModal(false);
+    setOpenMeta(null);
+    try {
+      const snap = await fetchGame(id);
+      setOpenMeta(snap.meta);
+      if (snap.state) {
+        applySavedGame(snap.state);
+        setActiveSession({ id, seat, version: snap.version });
+      } else if (seat === HOST_SEAT && snap.meta.guestUid && snap.meta.status === STATUS.LOBBY) {
+        // Re-entering our own game that a guest joined while we were away.
+        hostDealtRef.current = true;
+        await dealAndStartAsHost(id);
+      }
+      attachGameListeners(id);
+    } catch {
+      setMpNotice('Could not open that game. It may have been removed.');
+    }
+  }, [applySavedGame, attachGameListeners, detachGameListeners, dealAndStartAsHost, setActiveSession]);
+
+  // Host a new remote game: create it, cache it locally, show the code + share
+  // link, and wait. The metadata listener deals automatically when a guest joins.
+  const hostNewGame = useCallback(async (label) => {
+    setMpBusy(true);
+    setMpNotice(null);
+    try {
+      const uid = await signIn();
+      setMyUid(uid);
+      const { id, code } = await createGame(GAME_MODES.PARTNERS);
+      upsertLocalGame({ id, seat: HOST_SEAT, code, label: (label && label.trim()) || code, createdAt: Date.now() });
+      const link = `${window.location.origin}${window.location.pathname}?g=${id}`;
+      hostDealtRef.current = false;
+      detachGameListeners();
+      setSeatOwners(HOST_SEAT_OWNERS);
+      setGameMode(GAME_MODES.PARTNERS);
+      setActiveSession({ id, seat: HOST_SEAT, version: 0 });
+      setActiveId(id);
+      setHostInfo({ id, code, link });
+      setShowLobby(false);
+      setShowFirstPlayerModal(false);
+      setShowResumeModal(false);
+      setMpScreen('hosting');
+      setLabelInput('');
+      attachGameListeners(id);
+    } catch {
+      setMpNotice('Could not create a game. Check your connection.');
+    } finally {
+      setMpBusy(false);
+    }
+  }, [attachGameListeners, detachGameListeners, setActiveSession]);
+
+  // Join a game by code or by the id in a ?g= share link.
+  const beginJoin = useCallback(async (rawInput, { byId = false, label = '' } = {}) => {
+    setMpBusy(true);
+    setMpNotice(null);
+    try {
+      const uid = await signIn();
+      setMyUid(uid);
+      const { id, seat } = byId ? await joinGameById(rawInput) : await joinGame(rawInput);
+      upsertLocalGame({
+        id,
+        seat,
+        code: byId ? null : rawInput,
+        label: (label && label.trim()) || (byId ? null : rawInput),
+        createdAt: Date.now(),
+      });
+      setJoinInput('');
+      setLabelInput('');
+      await openRemoteGame(id, seat);
+    } catch {
+      setMpNotice(byId ? 'Could not open that invite link — the game may be gone.' : 'No game found for that code.');
+      setShowLobby(true);
+    } finally {
+      setMpBusy(false);
+    }
+  }, [openRemoteGame]);
+
+  // Switch which game is on screen. Blocked mid-split (a half-played 7 or 9 can't
+  // be persisted); everything else — a selected card/peg — is transient and
+  // dropped silently. Switching away from a remote game needs no write: state is
+  // only ever published at handoff, so an un-committed turn just starts over.
+  const switchToGame = useCallback(async (target) => {
+    if (splitRemaining !== 0) {
+      setMpNotice('Finish or undo your split first, then switch games.');
+      setShowLobby(true);
+      return;
+    }
+    detachGameListeners();
+    hostDealtRef.current = false;
+    setOpenMeta(null);
+    setMpNotice(null);
+    if (target === 'solo' || target == null) {
+      setActiveSession(null);
+      setActiveId(null);
+      setSeatOwners(SOLO_SEAT_OWNERS);
+      setShowLobby(false);
+      const saved = loadGame();
+      if (saved) applySavedGame(saved);
+      else initGame();
+      return;
+    }
+    const seat = target.seat ?? seatForUid(target, myUid) ?? GUEST_SEAT;
+    await openRemoteGame(target.id, seat);
+  }, [splitRemaining, detachGameListeners, setActiveSession, applySavedGame, initGame, myUid, openRemoteGame]);
+
+  // Hide a finished/abandoned game from the lobby without touching the document.
+  const archiveGame = useCallback((id) => {
+    archiveLocalGame(id);
+    setRemoteMeta((rows) => [...rows]); // nudge the derived lobby to recompute
+    if (sessionRef.current?.id === id) switchToGame('solo');
+  }, [switchToGame]);
+
+  // The header / end-overlay "New Game" button: leave any remote game cleanly
+  // (detach listeners, drop the session) and open the solo first-player modal.
+  const startNewSoloGame = useCallback(() => {
+    detachGameListeners();
+    hostDealtRef.current = false;
+    setActiveSession(null);
+    setActiveId(null);
+    setOpenMeta(null);
+    setSeatOwners(SOLO_SEAT_OWNERS);
+    initGame();
+  }, [detachGameListeners, setActiveSession, initGame]);
+
+  // On mount, route to the right starting screen (§3.4). The lobby subsumes the
+  // resume prompt, but ONLY for a device that actually has remote games — a
+  // solo-only player, even with the env vars set, gets today's exact flow and is
+  // never signed in.
   useEffect(() => {
+    if (bootstrappedRef.current) return;
+    bootstrappedRef.current = true;
+    const joinId = typeof window !== 'undefined'
+      ? new URLSearchParams(window.location.search).get('g')
+      : null;
     const saved = loadGame();
+
+    if (multiplayerConfigured && joinId) {
+      if (saved) setPendingResume(saved);
+      beginJoin(joinId, { byId: true });
+      return;
+    }
+    if (multiplayerConfigured && hasLocalGames()) {
+      const active = loadLocalGames().games.filter((g) => !g.archived);
+      if (active.length === 1) {
+        // Restore the single-game case to where you were.
+        openRemoteGame(active[0].id, active[0].seat);
+      } else {
+        if (saved) setPendingResume(saved);
+        setShowLobby(true);
+      }
+      return;
+    }
     if (saved) {
       setPendingResume(saved);
       setShowResumeModal(true);
     } else {
       initGame();
     }
-  }, [initGame]);
+  }, [initGame, multiplayerConfigured, beginJoin, openRemoteGame]);
+
+  // The lobby/badge listener. One subscription covers every game you are in and
+  // feeds both the list and the badge. Attach it only once the player has engaged
+  // with multiplayer — the lobby is open, a remote game is active, or the device
+  // already has games — so a solo-only player never signs in or loads the SDK.
+  useEffect(() => {
+    if (!multiplayerConfigured) return;
+    if (!(showLobby || session != null || hasLocalGames())) return;
+    if (myGamesUnsubRef.current) return;
+    myGamesUnsubRef.current = subscribeMyGames((rows) => setRemoteMeta(rows));
+    signIn().then(setMyUid).catch(() => {});
+  }, [multiplayerConfigured, showLobby, session]);
+
+  // Detach every listener on unmount. This is the discipline that replaces
+  // "clear the interval" — a leaked Firestore listener bills forever.
+  useEffect(() => () => {
+    if (myGamesUnsubRef.current) myGamesUnsubRef.current();
+    if (gameMetaUnsubRef.current) gameMetaUnsubRef.current();
+    if (gameStateUnsubRef.current) gameStateUnsubRef.current();
+  }, []);
 
   // Run animation for a move, then call onComplete when done
   const animateMove = useCallback((player, pegIndex, card, amount, currentPegs, onComplete) => {
@@ -993,9 +1318,14 @@ export default function PegsAndJokers() {
     }
   }, [hands, deck, discardPiles, stuckCounts, pegs, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat]);
 
-  // AI logic - drives every seat this client does not own
+  // AI logic - drives the AI seats this client is responsible for
   useEffect(() => {
     if (isMyTurn || winner !== null) return;
+    // Never drive a human seat. In solo every non-me seat is 'ai', so this is a
+    // no-op there; in a remote game it stops this client from running the *other*
+    // human's ('them') turn as if it were AI. (Package 4 narrows this further, to
+    // simulate an AI chain only when it terminates at one of your own seats.)
+    if (!isAISeat(seatOwners, currentPlayer)) return;
     if (aiProcessingRef.current) return; // Already processing this turn
 
     aiProcessingRef.current = true;
@@ -1151,7 +1481,7 @@ export default function PegsAndJokers() {
       if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners]);
 
   // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
@@ -1190,6 +1520,10 @@ export default function PegsAndJokers() {
   // or before cards are dealt, and clear the save once the game is over so we
   // never offer to resume a finished game.
   useEffect(() => {
+    // The localStorage save is the source of truth for SOLO only, and there is
+    // exactly one solo game. In a remote game the server row is the save, so
+    // this effect must not overwrite the solo save with a remote board.
+    if (session) return;
     if (showFirstPlayerModal || showResumeModal) return;
     if (isReplaying) return; // don't persist the rewound board during a replay
     if (!(hands[mySeat]?.length > 0)) return; // no game in progress yet
@@ -1221,7 +1555,7 @@ export default function PegsAndJokers() {
   }, [
     pegs, hands, deck, discardPiles, stuckCounts, currentPlayer,
     splitRemaining, splitCard, splitPegIndex, splitOwner, lastMoves, moveHistory,
-    winner, showFirstPlayerModal, showResumeModal, gameMode, isReplaying, mySeat,
+    winner, showFirstPlayerModal, showResumeModal, gameMode, isReplaying, mySeat, session,
   ]);
 
   // The hand you play from — your own seat's, always (even in partner mode,
@@ -1253,6 +1587,35 @@ export default function PegsAndJokers() {
   const outcome = useMemo(
     () => describeOutcome(winner, gameMode, mySeats),
     [winner, gameMode, mySeats]
+  );
+
+  // --- Lobby derivations ------------------------------------------------------
+  // The lobby rows and the waiting-on-you badge come from a single listener's
+  // metadata rows plus the device's local labels, so the list and the badge can
+  // never disagree. "Your turn" is waitingOn === seat (see lobby.js), never
+  // currentPlayer, which is always parked on an AI seat.
+  const localGamesList = useMemo(
+    () => loadLocalGames().games,
+    [remoteMeta, showLobby, session, mpScreen]
+  );
+  const localById = useMemo(
+    () => Object.fromEntries(localGamesList.map((g) => [g.id, g])),
+    [localGamesList]
+  );
+  const lobbyRows = useMemo(
+    () => buildRemoteRows(remoteMeta, { myUid, localById }),
+    [remoteMeta, myUid, localById]
+  );
+  const waitingCount = useMemo(() => countWaitingOnMe(lobbyRows), [lobbyRows]);
+  const liveRows = useMemo(() => lobbyRows.filter((r) => !r.finished), [lobbyRows]);
+  const finishedRows = useMemo(() => lobbyRows.filter((r) => r.finished), [lobbyRows]);
+  const soloSaveExists = useMemo(
+    () => !session && !!loadGame(),
+    [session, showLobby, winner]
+  );
+  // A guest who has opened a game the host hasn't dealt yet is simply waiting.
+  const waitingForHostDeal = Boolean(
+    session && session.seat === GUEST_SEAT && openMeta && openMeta.status === STATUS.LOBBY
   );
 
   // A notice answers the action that produced it, so it dies with the phase.
@@ -1611,6 +1974,206 @@ export default function PegsAndJokers() {
     <div className="min-h-screen bg-gray-900 text-white p-2 sm:p-4">
       <InstallPrompt />
 
+      {/* My Games lobby. A modal overlay in the same style as the stats/resume
+          modals — not a route. Populated by one subscribeMyGames listener, so it
+          updates itself when a partner moves whether or not it is open. */}
+      {showLobby && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center p-5 pb-3 border-b border-gray-700 sticky top-0 bg-gray-800">
+              <h2 className="text-2xl font-bold">🎮 My Games</h2>
+              <button
+                onClick={() => setShowLobby(false)}
+                className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-lg leading-none"
+                aria-label="Close My Games"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-5 space-y-3">
+              {mpNotice && <div className="text-sm text-amber-300">{mpNotice}</div>}
+
+              {/* Your solo game. */}
+              <button
+                onClick={() => switchToGame('solo')}
+                className={`w-full text-left px-4 py-3 rounded-lg transition-colors ${
+                  !session ? 'bg-amber-700/60 ring-1 ring-amber-500' : 'bg-gray-700 hover:bg-gray-600'
+                }`}
+              >
+                <div className="flex justify-between items-center">
+                  <span className="font-semibold">🧩 Solo vs AI</span>
+                  <span className="text-xs text-gray-300">
+                    {!session ? 'On screen' : soloSaveExists ? 'Resume' : 'New game'}
+                  </span>
+                </div>
+              </button>
+
+              {/* Remote games waiting on you sort first. */}
+              {liveRows.map((row) => (
+                <div
+                  key={row.id}
+                  className={`px-4 py-3 rounded-lg ${
+                    session?.id === row.id
+                      ? 'bg-teal-800/70 ring-1 ring-teal-400'
+                      : row.yourTurn
+                        ? 'bg-amber-700/50'
+                        : 'bg-gray-700'
+                  }`}
+                >
+                  <div className="flex justify-between items-center gap-2">
+                    <button className="flex-1 text-left" onClick={() => switchToGame(row)}>
+                      <div className="font-semibold truncate">{row.label}</div>
+                      <div className="text-xs text-gray-300">
+                        {row.lobby
+                          ? 'Waiting for your partner to join…'
+                          : row.yourTurn
+                            ? '⏳ Your turn'
+                            : `Waiting on partner · ${relativeTime(row.updatedAtMs)}`}
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => archiveGame(row.id)}
+                      className="text-xs px-2 py-1 rounded bg-gray-600 hover:bg-gray-500 flex-shrink-0"
+                      aria-label={`Archive ${row.label}`}
+                    >
+                      Archive
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              {/* Finished games, collapsed. */}
+              {finishedRows.length > 0 && (
+                <details className="bg-gray-700/40 rounded-lg px-4 py-2">
+                  <summary className="cursor-pointer text-sm text-gray-300">
+                    Finished games ({finishedRows.length})
+                  </summary>
+                  <div className="mt-2 space-y-2">
+                    {finishedRows.map((row) => (
+                      <div key={row.id} className="flex justify-between items-center text-sm">
+                        <button className="text-left flex-1 truncate" onClick={() => switchToGame(row)}>
+                          {row.label} — over
+                        </button>
+                        <button
+                          onClick={() => archiveGame(row.id)}
+                          className="text-xs px-2 py-1 rounded bg-gray-600 hover:bg-gray-500"
+                        >
+                          Archive
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+
+              {/* Start a new game. */}
+              <div className="border-t border-gray-700 pt-4 space-y-2">
+                <div className="text-sm text-gray-400">Start a new game</div>
+                <input
+                  type="text"
+                  value={labelInput}
+                  onChange={(e) => setLabelInput(e.target.value)}
+                  placeholder="Partner's name (optional)"
+                  className="w-full px-3 py-2 rounded bg-gray-700 text-white placeholder-gray-500"
+                />
+                <button
+                  disabled={mpBusy}
+                  onClick={() => { unlockAudio(); hostNewGame(labelInput); }}
+                  className="w-full px-4 py-3 bg-teal-600 hover:bg-teal-700 rounded-lg font-semibold disabled:opacity-50"
+                >
+                  ➕ Create game & get a code
+                </button>
+              </div>
+
+              {/* Join by code. */}
+              <div className="border-t border-gray-700 pt-4 space-y-2">
+                <div className="text-sm text-gray-400">Join with a code</div>
+                <input
+                  type="text"
+                  value={joinInput}
+                  onChange={(e) => setJoinInput(e.target.value.toUpperCase())}
+                  placeholder="6-character code"
+                  maxLength={8}
+                  className="w-full px-3 py-2 rounded bg-gray-700 text-white placeholder-gray-500 tracking-widest"
+                />
+                <button
+                  disabled={mpBusy || !joinInput.trim()}
+                  onClick={() => { unlockAudio(); beginJoin(joinInput, { label: labelInput }); }}
+                  className="w-full px-4 py-3 bg-purple-600 hover:bg-purple-700 rounded-lg font-semibold disabled:opacity-50"
+                >
+                  🔑 Join game
+                </button>
+              </div>
+
+              <p className="text-xs text-gray-500 pt-2">
+                Games live on this device. Clearing site data loses access to
+                games in progress.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hosting: the code + share link, waiting for a partner to join. The
+          metadata listener deals automatically the moment they do. */}
+      {hostInfo && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full p-6 text-center">
+            <h2 className="text-2xl font-bold mb-2">Waiting for your partner…</h2>
+            <p className="text-gray-300 mb-5 text-sm">
+              Share the code or the link. The game deals itself the moment they join.
+            </p>
+            <div className="bg-gray-900 rounded-lg py-4 mb-4">
+              <div className="text-xs text-gray-400 mb-1">Game code</div>
+              <div className="text-4xl font-bold tracking-[0.3em]">{hostInfo.code}</div>
+            </div>
+            <button
+              onClick={() => {
+                if (navigator.clipboard) navigator.clipboard.writeText(hostInfo.link).catch(() => {});
+                setMpNotice('Link copied.');
+              }}
+              className="w-full px-4 py-3 bg-teal-600 hover:bg-teal-700 rounded-lg font-semibold mb-3"
+            >
+              📋 Copy invite link
+            </button>
+            <div className="text-xs text-gray-500 break-all mb-5">{hostInfo.link}</div>
+            <div className="flex items-center justify-center gap-2 text-gray-300 mb-5">
+              <span className="inline-block w-3 h-3 rounded-full bg-amber-400 animate-pulse" />
+              Waiting…
+            </div>
+            <button
+              onClick={() => { setHostInfo(null); switchToGame('solo'); }}
+              className="text-sm text-gray-400 hover:text-gray-200"
+            >
+              Cancel and return to solo
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* A guest who opened a game the host hasn't dealt yet. */}
+      {waitingForHostDeal && !hostInfo && !showLobby && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-40 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full p-6 text-center">
+            <h2 className="text-xl font-bold mb-2">You're in!</h2>
+            <p className="text-gray-300 mb-5 text-sm">
+              Waiting for the host to deal. The board appears as soon as they do.
+            </p>
+            <div className="flex items-center justify-center gap-2 text-gray-300 mb-5">
+              <span className="inline-block w-3 h-3 rounded-full bg-amber-400 animate-pulse" />
+              Waiting…
+            </div>
+            <button
+              onClick={() => setShowLobby(true)}
+              className="text-sm text-gray-400 hover:text-gray-200"
+            >
+              My Games
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Resume Saved Game Modal */}
       {showResumeModal && pendingResume && (
         <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
@@ -1724,6 +2287,14 @@ export default function PegsAndJokers() {
                 >
                   Random First Player
                 </button>
+                {multiplayerConfigured && (
+                  <button
+                    onClick={() => { unlockAudio(); setMpNotice(null); setShowFirstPlayerModal(false); setShowLobby(true); }}
+                    className="w-full px-6 py-4 bg-teal-600 hover:bg-teal-700 rounded-lg text-lg font-semibold transition-colors"
+                  >
+                    🎮 Play with a Friend
+                  </button>
+                )}
               </div>
             ) : (
               <div className="text-center">
@@ -1832,7 +2403,7 @@ export default function PegsAndJokers() {
               </button>
               <div className="grid grid-cols-3 gap-2">
                 <button
-                  onClick={initGame}
+                  onClick={startNewSoloGame}
                   className="px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-semibold transition-colors"
                 >
                   New Game
@@ -2057,6 +2628,22 @@ export default function PegsAndJokers() {
             >
               {animationsEnabled ? 'Animations On' : 'Animations Off'}
             </button>
+            {multiplayerConfigured && (
+              <button
+                onClick={() => setShowLobby(true)}
+                className="relative px-4 py-2 bg-teal-600 rounded hover:bg-teal-700"
+              >
+                🎮 My Games
+                {waitingCount > 0 && (
+                  <span
+                    className="absolute -top-1 -right-1 min-w-[20px] h-5 px-1 flex items-center justify-center rounded-full bg-amber-500 text-xs font-bold text-gray-900"
+                    aria-label={`${waitingCount} games waiting on you`}
+                  >
+                    {waitingCount}
+                  </span>
+                )}
+              </button>
+            )}
             <button
               onClick={() => setShowStats(true)}
               className="px-4 py-2 bg-indigo-600 rounded hover:bg-indigo-700"
@@ -2064,7 +2651,7 @@ export default function PegsAndJokers() {
               📊 Stats
             </button>
             <button
-              onClick={initGame}
+              onClick={startNewSoloGame}
               className="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700"
             >
               New Game

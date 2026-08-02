@@ -8,6 +8,7 @@ import {
   isMyTurnFor,
   visualSideFor,
   seatAtVisualSide,
+  nextHumanSeat,
 } from './seats.js';
 
 const SOLO = SOLO_SEAT_OWNERS;
@@ -110,5 +111,38 @@ describe('board orientation', () => {
     expect(visualSideFor(0, 2)).toBe(0);
     expect(visualSideFor(3, 2)).toBe(3);
     expect(visualSideFor(1, 2)).toBe(1);
+  });
+});
+
+describe('nextHumanSeat', () => {
+  const HOST = ['me', 'ai', 'them', 'ai'];
+  const GUEST = ['them', 'ai', 'me', 'ai'];
+
+  it('returns the same seat when it is already human', () => {
+    expect(nextHumanSeat(0, HOST)).toBe(0);
+    expect(nextHumanSeat(2, HOST)).toBe(2);
+  });
+
+  it('walks the fixed turn order to the next human seat', () => {
+    // After the host (0) moves, currentPlayer parks on AI seat 1; the next human
+    // is the guest at 2.
+    expect(nextHumanSeat(1, HOST)).toBe(2);
+    // After the guest (2) moves, currentPlayer parks on AI seat 3; the next human
+    // is the host at 0.
+    expect(nextHumanSeat(3, HOST)).toBe(0);
+  });
+
+  it('gives the same absolute seat whichever client’s layout you pass', () => {
+    // This is why it is safe to store in the shared metadata: seats 1 and 3 are
+    // 'ai' in both layouts, so the answer does not depend on point of view.
+    for (const from of [0, 1, 2, 3]) {
+      expect(nextHumanSeat(from, HOST)).toBe(nextHumanSeat(from, GUEST));
+    }
+  });
+
+  it('in solo, every seat leads back to seat 0', () => {
+    for (const from of [0, 1, 2, 3]) {
+      expect(nextHumanSeat(from, SOLO_SEAT_OWNERS)).toBe(0);
+    }
   });
 });

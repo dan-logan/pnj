@@ -21,6 +21,18 @@ export const SEAT_THEM = 'them';
 // The layout for a local single-player game.
 export const SOLO_SEAT_OWNERS = [SEAT_ME, SEAT_AI, SEAT_AI, SEAT_AI];
 
+// The two remote partner layouts. The humans sit opposite (host 0, guest 2) with
+// AI between them (1, 3). Seats 1 and 3 are 'ai' in both, which is what makes the
+// board-orientation and nextHumanSeat maths agree between the two clients.
+export const HOST_SEAT_OWNERS = [SEAT_ME, SEAT_AI, SEAT_THEM, SEAT_AI];
+export const GUEST_SEAT_OWNERS = [SEAT_THEM, SEAT_AI, SEAT_ME, SEAT_AI];
+
+// The seat-owner layout for a device that plays a given seat in a remote game:
+// host (seat 0) sees the host layout, guest (seat 2) the guest layout.
+export function remoteSeatOwners(seat) {
+  return seat === 2 ? GUEST_SEAT_OWNERS : HOST_SEAT_OWNERS;
+}
+
 // Every seat this client controls, in turn order. An array (not a scalar) even
 // though Phase 1 only ever puts one seat in it, so that a client driving two
 // seats needs no second refactor.
@@ -67,4 +79,26 @@ export function visualSideFor(x, mySeat) {
 // Inverse of visualSideFor: which seat is drawn on a given visual side.
 export function seatAtVisualSide(visualSide, mySeat) {
   return (visualSide + mySeat + 2) % NUM_PLAYERS;
+}
+
+// The next non-AI (human) seat at or including `from`, walking the fixed turn
+// order 0 → 1 → 2 → 3 → 0. Two uses:
+//
+//   - The publisher stores `waitingOn = nextHumanSeat(currentPlayer, ...)` in the
+//     metadata, so the lobby knows whose turn it *really* is. currentPlayer is
+//     parked on an AI seat after every publish, so it can never answer that.
+//   - Package 4 gates AI simulation on whether this run of AI seats terminates at
+//     one of your own seats, so exactly one client runs any given AI turn.
+//
+// It only tests for `!== 'ai'`, and seats 1 and 3 are 'ai' in every Phase 1
+// layout (solo, host, guest), so it returns the same absolute seat whichever
+// client's seatOwners you pass — which is exactly why it is safe to store in the
+// shared metadata. With no human seat anywhere it returns `from` unchanged.
+export function nextHumanSeat(from, seatOwners) {
+  let p = from;
+  for (let i = 0; i < NUM_PLAYERS; i++) {
+    if (seatOwners[p] !== SEAT_AI) return p;
+    p = (p + 1) % NUM_PLAYERS;
+  }
+  return from;
 }
