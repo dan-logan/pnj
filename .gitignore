@@ -2,3 +2,8 @@ node_modules
 dist
 dev-dist
 .DS_Store
+
+# Local Supabase config. The anon key is public by design, but the file is
+# per-developer and has no business in the repo — .env.example carries the shape.
+.env
+.env.local
