@@ -1,0 +1,88 @@
+rules_version = '2';
+
+// This file is the entire backend. There is no server between the app's public
+// config and the data — these rules are the only thing enforcing that one
+// player cannot read another's game. Review them as such; a mistake here is a
+// full data leak with a config that ships in every client bundle.
+//
+// The model (plan §2.1): every game document carries participants: [hostUid,
+// guestUid]. You may read or write a game only if your anonymous uid is one of
+// its participants. The single deliberate exception is a game still in its
+// 'lobby' state (guestUid == null): a joining client must read it to claim the
+// seat, and at that point it holds no game state — only mode, code and hostUid.
+//
+// The acceptance gate (plan §2.6): a client holding the app's own public config,
+// signed in as a DIFFERENT anonymous uid, must be able to read neither an active
+// game's metadata nor its live/current state. firestore/rules.test.js asserts
+// exactly that against the emulator.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isParticipant(data) {
+      return signedIn() && request.auth.uid in data.participants;
+    }
+
+    match /games/{gameId} {
+      // Participants always. Plus an unclaimed game, because the joining client
+      // must read it to claim the seat — at which point it holds no game state.
+      allow read: if isParticipant(resource.data) || resource.data.guestUid == null;
+
+      // A freshly created game: the creator is the sole participant and the host,
+      // there is no guest yet, the version is 0 and it starts in the lobby.
+      allow create: if signedIn()
+        && request.resource.data.hostUid == request.auth.uid
+        && request.resource.data.guestUid == null
+        && request.resource.data.participants == [request.auth.uid]
+        && request.resource.data.version == 0
+        && request.resource.data.status == 'lobby';
+
+      allow update: if
+        // (a) Claim the empty guest seat. The only write a non-participant may
+        // make: it may only add ITSELF to participants, may not change the host,
+        // and does not advance the version (claiming a seat is not a turn).
+        (signedIn()
+         && resource.data.guestUid == null
+         && request.resource.data.guestUid == request.auth.uid
+         && request.resource.data.hostUid == resource.data.hostUid
+         && request.resource.data.participants == resource.data.participants.concat([request.auth.uid])
+         && request.resource.data.version == resource.data.version)
+        ||
+        // (b) Publish a turn (or the initial deal). Participants only; membership
+        // is frozen; the version advances by exactly one. This makes the
+        // compare-and-swap a database guarantee — two clients cannot both advance
+        // the same version, so the loser of a race gets a permission error rather
+        // than silently clobbering.
+        (isParticipant(resource.data)
+         && request.resource.data.participants == resource.data.participants
+         && request.resource.data.hostUid == resource.data.hostUid
+         && request.resource.data.guestUid == resource.data.guestUid
+         && request.resource.data.version == resource.data.version + 1);
+
+      // Games are never deleted; a device archives locally instead.
+      allow delete: if false;
+
+      match /live/{docId} {
+        // Mirrors the parent's membership. The get() costs one read, paid only on
+        // a write and on the first attach of a listener — not on every delivered
+        // update — so an idle subscription stays free.
+        allow read, write: if isParticipant(
+          get(/databases/$(database)/documents/games/$(gameId)).data
+        );
+      }
+    }
+
+    match /codes/{code} {
+      // A code resolves to a game id and nothing more. The id alone grants
+      // nothing: reading the game still requires being a participant. So any
+      // signed-in client may create a reservation and read one; nobody may
+      // change or delete a reservation once made.
+      allow read, create: if signedIn();
+      allow update, delete: if false;
+    }
+  }
+}

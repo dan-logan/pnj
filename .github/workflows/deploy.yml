@@ -35,6 +35,16 @@ jobs:
 
       - name: Build
         run: npm run build
+        # Public Firebase web config, baked into the static build. These are
+        # repository *variables* (Settings > Secrets and variables > Actions >
+        # Variables), not secrets — the web API key is an identifier and the
+        # security model rests on firestore/firestore.rules. If they are unset
+        # the app still builds and deploys, playing solo with no multiplayer UI.
+        env:
+          VITE_FIREBASE_API_KEY: ${{ vars.VITE_FIREBASE_API_KEY }}
+          VITE_FIREBASE_AUTH_DOMAIN: ${{ vars.VITE_FIREBASE_AUTH_DOMAIN }}
+          VITE_FIREBASE_PROJECT_ID: ${{ vars.VITE_FIREBASE_PROJECT_ID }}
+          VITE_FIREBASE_APP_ID: ${{ vars.VITE_FIREBASE_APP_ID }}
         
       - name: List dist contents
         run: ls -la dist
