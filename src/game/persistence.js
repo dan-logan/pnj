@@ -23,6 +23,10 @@ export function serializeGame(state) {
   return {
     version: SAVE_VERSION,
     savedAt: Date.now(),
+    // Identity of the game, so resuming it cannot record its result twice in
+    // the player stats (see recordFinishedGame). Optional: an older save
+    // without one is given a fresh id on load.
+    gameId: state.gameId ?? null,
     mode: state.mode ?? 'classic',
     pegs: state.pegs,
     hands: state.hands,

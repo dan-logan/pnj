@@ -29,9 +29,10 @@ import {
 import { findBestAIMove } from './game/ai.js';
 import {
   loadStats,
-  saveStats,
   resetStats,
-  recordGame,
+  recordFinishedGame,
+  newGameId,
+  didIWin,
   winRate,
   averageTurns,
   bucketWinRate,
@@ -39,6 +40,7 @@ import {
   getNemesis
 } from './game/stats.js';
 import { loadGame, saveGame, clearGame } from './game/persistence.js';
+import { PHASES, derivePhase, describeStatus, describeOutcome } from './game/status.js';
 import {
   SOLO_SEAT_OWNERS,
   mySeatsOf,
@@ -88,8 +90,16 @@ export default function PegsAndJokers() {
   const [jokerMode, setJokerMode] = useState(false); // true when waiting for target selection
   const [jokerSourcePeg, setJokerSourcePeg] = useState(null); // which of player's pegs to move
   const [discardMode, setDiscardMode] = useState(false); // true when player is selecting a card to discard
-  const [gameMessage, setGameMessage] = useState('Your turn! Select a card and peg to move.');
+  // Transient feedback only — "Invalid move. Try again." The *status* is
+  // derived (see `phase` / `statusLine` below) and is never set imperatively.
+  const [notice, setNotice] = useState(null);
   const [winner, setWinner] = useState(null);
+  // What the game ended on, for the end-of-game overlay: who made the winning
+  // move and what it was. Remotely this can be a move you never saw.
+  const [endInfo, setEndInfo] = useState(null);
+  // The overlay covers the board, so it can be dismissed to inspect the final
+  // position and reopened from the status line.
+  const [endOverlayDismissed, setEndOverlayDismissed] = useState(false);
   const [moveHistory, setMoveHistory] = useState([]);
   const [lastMoves, setLastMoves] = useState([null, null, null, null]); // Last move description per player
 
@@ -120,7 +130,11 @@ export default function PegsAndJokers() {
   const bumpsDeliveredThisGameRef = useRef(0);
   const timesBumpedThisGameRef = useRef(0);
   const startModeRef = useRef('chosen'); // 'chosen' | 'random'
-  const gameRecordedRef = useRef(false); // guard against double-recording a win
+  // Every game has an id (a fresh uuid locally, the server row id remotely).
+  // Stats are recorded against it, so a game can only ever be counted once
+  // however many times its end is observed.
+  const gameIdRef = useRef(null);
+  const endedRef = useRef(false); // guard against a second terminal transition
 
   // Bump fly-back animation: { player, pegIndex, from: {x,y}, to: {x,y}, progress: 0-1 }
   const [bumpFx, setBumpFx] = useState(null);
@@ -169,6 +183,66 @@ export default function PegsAndJokers() {
   const [pendingResume, setPendingResume] = useState(null);
   const [showResumeModal, setShowResumeModal] = useState(false);
 
+  // The one terminal transition. Every win-detection site routes through here —
+  // your move, a split that completes the win, an AI move, and later a finished
+  // state arriving over the wire — so a finished game looks the same however it
+  // was observed, and nothing is left running behind it.
+  const endGame = useCallback((winnerIdx, { winningSeat = null, description = null } = {}) => {
+    if (winnerIdx === null || winnerIdx === undefined) return;
+    if (endedRef.current) return; // already terminal
+    endedRef.current = true;
+
+    // 1. Cancel everything pending. A timer that fires after the game ends and
+    //    overwrites the result is the bug this whole package exists to remove.
+    if (animationRef.current) { clearInterval(animationRef.current); animationRef.current = null; }
+    if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
+    if (replaySegTimerRef.current) { clearInterval(replaySegTimerRef.current); replaySegTimerRef.current = null; }
+    if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
+    if (spinIntervalRef.current) { clearInterval(spinIntervalRef.current); spinIntervalRef.current = null; }
+    if (aiTimerRef.current) { clearTimeout(aiTimerRef.current); aiTimerRef.current = null; }
+    replayCancelRef.current = true;
+    aiProcessingRef.current = false;
+    setAnimatingPeg(null);
+    setBumpFx(null);
+    setIsReplaying(false);
+    setReplayInfo(null);
+    setNotice(null);
+    setSelectedCard(null);
+    setSelectedPeg(null);
+    setJokerMode(false);
+    setJokerSourcePeg(null);
+    setDiscardMode(false);
+    // A replay cut short by the end of the game leaves the board rewound.
+    if (replayRestoreRef.current) {
+      setPegs(replayRestoreRef.current);
+      replayRestoreRef.current = null;
+    }
+
+    // 2. The winner. Classic: a player index. Partners: a *team* index.
+    setWinner(winnerIdx);
+
+    // 3. Stats, from the terminal state and keyed by the game id, so it does
+    //    not matter whether this client was watching when the game ended, nor
+    //    whether the winning move was yours, your partner's or an AI's.
+    const tallies = {
+      turns: turnsRef.current + 1, // include the winning turn
+      jokersPlayed: jokersThisGameRef.current,
+      bumpsDelivered: bumpsDeliveredThisGameRef.current,
+      timesBumped: timesBumpedThisGameRef.current,
+    };
+    const { stats: updated } = recordFinishedGame(gameIdRef.current, {
+      won: didIWin(winnerIdx, gameMode, mySeats),
+      winner: winnerIdx,
+      mySeats,
+      startMode: startModeRef.current,
+      mode: gameMode,
+      ...tallies,
+    });
+    setStats(updated);
+    setEndInfo({ winner: winnerIdx, winningSeat, description, ...tallies });
+    setEndOverlayDismissed(false);
+  }, [gameMode, mySeats]);
+
   // In partner mode, once your own pegs are all home you play your hand on your
   // partner's pegs; otherwise you always control your own seat's pegs. This is
   // the "owner" of the pegs you move this turn.
@@ -204,7 +278,7 @@ export default function PegsAndJokers() {
     setJokerMode(false);
     setJokerSourcePeg(null);
     setDiscardMode(false);
-    setGameMessage(ownsSeat(firstPlayer) ? 'Your turn! Select a card and peg to move.' : `${PLAYER_NAMES[firstPlayer]} is thinking...`);
+    setNotice(null);
     setWinner(null);
     setMoveHistory([]);
     setLastMoves([null, null, null, null]);
@@ -230,7 +304,10 @@ export default function PegsAndJokers() {
     jokersThisGameRef.current = 0;
     bumpsDeliveredThisGameRef.current = 0;
     timesBumpedThisGameRef.current = 0;
-    gameRecordedRef.current = false;
+    gameIdRef.current = newGameId();
+    endedRef.current = false;
+    setEndInfo(null);
+    setEndOverlayDismissed(false);
     setShowFirstPlayerModal(false);
   }, [resetReplay, ownsSeat]);
 
@@ -335,7 +412,11 @@ export default function PegsAndJokers() {
     bumpsDeliveredThisGameRef.current = t.bumpsDelivered ?? 0;
     timesBumpedThisGameRef.current = t.timesBumped ?? 0;
     startModeRef.current = t.startMode ?? 'chosen';
-    gameRecordedRef.current = false;
+    // Keep the saved game's identity so resuming it cannot record it twice.
+    gameIdRef.current = saved.gameId ?? newGameId();
+    endedRef.current = false;
+    setEndInfo(null);
+    setEndOverlayDismissed(false);
 
     // Seed the turn/return trackers to the restored player so resuming doesn't
     // count a spurious turn or fire a "your turn" chime.
@@ -347,11 +428,7 @@ export default function PegsAndJokers() {
     resetReplay();
     replayPrevPlayerRef.current = saved.currentPlayer;
 
-    setGameMessage(
-      ownsSeat(saved.currentPlayer)
-        ? 'Welcome back! Your turn — select a card and peg to move.'
-        : `${PLAYER_NAMES[saved.currentPlayer]} is thinking...`
-    );
+    setNotice(null);
 
     setPendingResume(null);
     setShowResumeModal(false);
@@ -580,7 +657,7 @@ export default function PegsAndJokers() {
   const executeMove = useCallback((owner, pegIndex, card, splitAmount = null) => {
     const actor = mySeat;
     if (!isValidMove(owner, pegIndex, card, pegs, splitAmount, moveOptions)) {
-      setGameMessage('Invalid move. Try again.');
+      setNotice('Invalid move. Try again.');
       return false;
     }
 
@@ -606,7 +683,7 @@ export default function PegsAndJokers() {
       }
 
       if (!hasValidSecondPeg) {
-        setGameMessage(`Cannot split: no other peg can move ${Math.abs(remaining)} ${remaining > 0 ? 'forward' : 'backward'}.`);
+        setNotice(`Cannot split: no other peg can move ${Math.abs(remaining)} ${remaining > 0 ? 'forward' : 'backward'}.`);
         return false;
       }
     }
@@ -631,7 +708,7 @@ export default function PegsAndJokers() {
       }
 
       if (!hasValidSecondPeg) {
-        setGameMessage(`Cannot split: no other peg can move the remaining ${remaining} spaces.`);
+        setNotice(`Cannot split: no other peg can move the remaining ${remaining} spaces.`);
         return false;
       }
     }
@@ -666,7 +743,7 @@ export default function PegsAndJokers() {
       setSplitOwner(owner); // and whose peg it was, so the completer collision check is owner-aware
       setSplitUndo({ pegs, lastMoves }); // pre-move board, so a mis-tap can be undone
       setSelectedPeg(null);
-      setGameMessage(`Tap a glowing peg to move the remaining ${remaining} spaces (or Undo).`);
+      setNotice(null); // the split prompt is part of the derived status line
       return true;
     }
 
@@ -680,13 +757,13 @@ export default function PegsAndJokers() {
       setSplitOwner(owner); // and whose peg it was, so the completer collision check is owner-aware
       setSplitUndo({ pegs, lastMoves }); // pre-move board, so a mis-tap can be undone
       setSelectedPeg(null);
-      setGameMessage(`Tap a glowing peg to move ${remaining} spaces ${direction} (or Undo).`);
+      setNotice(null); // the split prompt is part of the derived status line
       return true;
     }
 
     const w = checkWinner(newPegs, gameMode);
     if (w !== null) {
-      setWinner(w);
+      endGame(w, { winningSeat: actor, description: moveDescription });
       return true;
     }
 
@@ -722,10 +799,10 @@ export default function PegsAndJokers() {
     // Switch to next player
     const nextPlayer = (actor + 1) % 4;
     setCurrentPlayer(nextPlayer);
-    setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
+    setNotice(null);
 
     return true;
-  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat]);
+  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat, endGame]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
     const actor = mySeat;
@@ -737,12 +814,12 @@ export default function PegsAndJokers() {
     const cardInfo = CARD_VALUES[splitCard?.rank];
     if ((cardInfo?.mustSplit || cardInfo?.canSplit) && owner === splitOwner && pegIndex === splitPegIndex) {
       const cardName = cardInfo?.mustSplit ? 'Nine' : 'Seven';
-      setGameMessage(`${cardName} card must use two different pegs. Try again.`);
+      setNotice(`${cardName} card must use two different pegs. Try again.`);
       return false;
     }
 
     if (!isValidMove(owner, pegIndex, splitCard, pegs, amount, moveOptions)) {
-      setGameMessage('Invalid move for split. Try again.');
+      setNotice('Invalid move for split. Try again.');
       return false;
     }
 
@@ -769,7 +846,7 @@ export default function PegsAndJokers() {
 
     const w = checkWinner(newPegs, gameMode);
     if (w !== null) {
-      setWinner(w);
+      endGame(w, { winningSeat: actor, description: `Split: ${lastMoves[actor]}, ${secondMoveDesc}` });
       return true;
     }
 
@@ -803,10 +880,10 @@ export default function PegsAndJokers() {
     setSplitUndo(null);
     const nextPlayer = (actor + 1) % 4;
     setCurrentPlayer(nextPlayer);
-    setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
+    setNotice(null);
 
     return true;
-  }, [splitCard, splitPegIndex, splitOwner, pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat]);
+  }, [splitCard, splitPegIndex, splitOwner, pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat, endGame]);
 
   // Undo a half-finished split: restore the board (and anything the first half
   // bumped) to the snapshot taken before it, and return the turn to the point
@@ -829,7 +906,7 @@ export default function PegsAndJokers() {
     setSplitOwner(null);
     setSplitUndo(null);
     setSelectedPeg(null); // keep the card selected so pegs re-glow for another try
-    setGameMessage('Split undone. Select a peg to move.');
+    setNotice('Split undone. Select a peg to move.');
   }, [splitUndo]);
 
   const discardAndDraw = useCallback((player, cardIndex = 0) => {
@@ -866,9 +943,6 @@ export default function PegsAndJokers() {
         if (ok) {
           newPegs = afterStart;
           autoStarted = true;
-          if (ownsSeat(player)) {
-            setGameMessage('After 3 stuck turns, you start a peg!');
-          }
         }
       }
       newStuckCounts[player] = 0; // Reset even if no peg to start
@@ -904,36 +978,18 @@ export default function PegsAndJokers() {
     setSelectedPeg(null);
     setDiscardMode(false);
 
-    if (ownsSeat(player)) {
-      const nextPlayer = (player + 1) % 4;
-      setCurrentPlayer(nextPlayer);
-      if (newStuckCounts[player] === 0 && newPegs !== pegs) {
-        // Delay message change so player sees the "start a peg" message
-        setTimeout(() => setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`), 1500);
-      } else {
-        setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
-      }
-    } else {
-      // Another seat discarded - show message with stuck count, then advance player
-      const nextPlayer = (player + 1) % 4;
+    setNotice(null);
 
-      if (newStuckCounts[player] === 0 && newPegs !== pegs) {
-        setGameMessage(`${PLAYER_NAMES[player]} was stuck 3 turns and started a peg!`);
-      } else {
-        setGameMessage(`${PLAYER_NAMES[player]} discarded (stuck: ${newStuckCounts[player]}/3)`);
-      }
-
-      // Set next player immediately to prevent useEffect from re-triggering
-      setCurrentPlayer(nextPlayer);
-      aiProcessingRef.current = false; // Allow next AI to process
-
-      // Delay the "thinking" message so discard message is visible
-      setTimeout(() => {
-        if (ownsSeat(nextPlayer)) {
-          setGameMessage('Your turn! Select a card and peg to move.');
-        }
-        // If next is AI, the useEffect will set the message
-      }, 1200);
+    // Hand off. What just happened is already visible on the board — the
+    // last-move label under the seat and its stuck counter — so nothing is
+    // announced here. The old code posted three messages on 1200/1500 ms
+    // timers, which then fired after a win had landed and overwrote the win
+    // text; the status line derives itself now and there are no timers left to
+    // outlive their turn.
+    const nextPlayer = (player + 1) % 4;
+    setCurrentPlayer(nextPlayer);
+    if (!ownsSeat(player)) {
+      aiProcessingRef.current = false; // Allow the next AI seat to process
     }
   }, [hands, deck, discardPiles, stuckCounts, pegs, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat]);
 
@@ -987,18 +1043,12 @@ export default function PegsAndJokers() {
 
         const w = checkWinner(newPegs, gameMode);
         if (w !== null) {
-          setWinner(w);
-          aiProcessingRef.current = false;
+          endGame(w, { winningSeat: aiPlayer, description: moveDescription });
           return true;
         }
 
         setCurrentPlayer(nextPlayer);
         aiProcessingRef.current = false;
-        if (ownsSeat(nextPlayer)) {
-          setGameMessage('Your turn! Select a card and peg to move.');
-        } else {
-          setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
-        }
         return false;
       };
 
@@ -1101,7 +1151,7 @@ export default function PegsAndJokers() {
       if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame]);
 
   // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
@@ -1122,36 +1172,18 @@ export default function PegsAndJokers() {
     prevTurnPlayerRef.current = currentPlayer;
   }, [currentPlayer, winner]);
 
-  // Fanfare on win, descending tone on loss
+  // Fanfare on win, descending tone on loss. Stats are NOT recorded here — a
+  // transition-watching effect only fires for whoever happened to be looking,
+  // which is wrong the moment a game can end on another device. endGame records
+  // them from the terminal state instead.
   useEffect(() => {
     if (winner === null) return;
-    if (winner === 0) {
+    if (didIWin(winner, gameMode, mySeats)) {
       sfx.win();
     } else {
       sfx.lose();
     }
-  }, [winner]);
-
-  // Fold the finished game into the persisted player stats exactly once.
-  useEffect(() => {
-    if (winner === null || gameRecordedRef.current) return;
-    gameRecordedRef.current = true;
-    const result = {
-      won: winner === 0,
-      winner,
-      turns: turnsRef.current + 1, // include the winning turn
-      startMode: startModeRef.current,
-      mode: gameMode,
-      jokersPlayed: jokersThisGameRef.current,
-      bumpsDelivered: bumpsDeliveredThisGameRef.current,
-      timesBumped: timesBumpedThisGameRef.current
-    };
-    setStats(prev => {
-      const updated = recordGame(prev, result);
-      saveStats(updated);
-      return updated;
-    });
-  }, [winner]);
+  }, [winner, gameMode, mySeats]);
 
   // Persist the in-progress game after every committed change so a mobile tab
   // eviction (a phone call mid-game) doesn't lose it. Skip while a modal is up
@@ -1166,6 +1198,7 @@ export default function PegsAndJokers() {
       return;
     }
     saveGame({
+      gameId: gameIdRef.current,
       mode: gameMode,
       pegs,
       hands,
@@ -1196,6 +1229,38 @@ export default function PegsAndJokers() {
   const myHand = hands[mySeat] ?? [];
 
   const selectedCardObj = selectedCard !== null ? myHand[selectedCard] ?? null : null;
+
+  // --- Derived game phase and status ---
+  //
+  // `phase` is the single answer to "what is happening", and `statusLine` is how
+  // it reads. Both are computed from state every render, so neither can go
+  // stale and neither can be overwritten by a timer that outlived its turn.
+  // Nothing sets them; `notice` carries the only genuinely transient text.
+  const dealt = !showFirstPlayerModal && !showResumeModal && myHand.length > 0;
+
+  const phase = useMemo(
+    () => derivePhase({ winner, isReplaying, dealt, isMyTurn, currentPlayer, seatOwners }),
+    [winner, isReplaying, dealt, isMyTurn, currentPlayer, seatOwners]
+  );
+
+  const statusLine = useMemo(
+    () => describeStatus({
+      phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, mode: gameMode,
+    }),
+    [phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, gameMode]
+  );
+
+  const outcome = useMemo(
+    () => describeOutcome(winner, gameMode, mySeats),
+    [winner, gameMode, mySeats]
+  );
+
+  // A notice answers the action that produced it, so it dies with the phase.
+  const prevPhaseRef = useRef(null);
+  useEffect(() => {
+    if (prevPhaseRef.current !== null && prevPhaseRef.current !== phase) setNotice(null);
+    prevPhaseRef.current = phase;
+  }, [phase]);
 
   // Whose pegs the human is moving this turn (their own, or their partner's once
   // they've finished in partner mode).
@@ -1265,7 +1330,7 @@ export default function PegsAndJokers() {
       setJokerMode(false);
       setJokerSourcePeg(null);
       setSelectedPeg(null);
-      setGameMessage('Joker cancelled. Select a card and peg to move.');
+      setNotice(null);
       return;
     }
 
@@ -1275,11 +1340,11 @@ export default function PegsAndJokers() {
       const cardInfo = CARD_VALUES[splitCard?.rank];
       if (controlledOwner === splitOwner && pegIndex === splitPegIndex) {
         const cardName = cardInfo?.mustSplit ? 'Nine' : 'Seven';
-        setGameMessage(`${cardName} card must use two different pegs. Try again.`);
+        setNotice(`${cardName} card must use two different pegs. Try again.`);
         return;
       }
       if (movablePegSet && !movablePegSet.has(pegIndex)) {
-        setGameMessage('That peg cannot finish the split. Tap a glowing peg.');
+        setNotice('That peg cannot finish the split. Tap a glowing peg.');
         return;
       }
       completeSplit(pegIndex, splitRemaining);
@@ -1287,12 +1352,12 @@ export default function PegsAndJokers() {
     }
 
     if (selectedCard === null) {
-      setGameMessage('Select a card first.');
+      setNotice('Select a card first.');
       return;
     }
 
     if (movablePegSet && !movablePegSet.has(pegIndex)) {
-      setGameMessage('That peg has no legal move with this card. Glowing pegs can move.');
+      setNotice('That peg has no legal move with this card. Glowing pegs can move.');
       return;
     }
 
@@ -1304,18 +1369,14 @@ export default function PegsAndJokers() {
     if (cardInfo.isJoker) {
       setJokerMode(true);
       setJokerSourcePeg(pegIndex);
-      setGameMessage(
-        gameMode === GAME_MODES.PARTNERS
-          ? "Click a peg on the track to bump — hit your partner to send them to their home stretch."
-          : "Now click an opponent's peg on the track to bump it."
-      );
+      setNotice(null); // the joker prompt is part of the derived status line
       return;
     }
 
     if ((cardInfo.canSplit || cardInfo.mustSplit) &&
         (pegs[controlledOwner][pegIndex].location === 'track' || pegs[controlledOwner][pegIndex].location === 'home')) {
       // 7s and 9s: tap one of the ghost destination spaces to pick the amount
-      setGameMessage('Tap a pulsing space on the board to move this peg there.');
+      setNotice('Tap a pulsing space on the board to move this peg there.');
     } else {
       executeMove(controlledOwner, pegIndex, card);
     }
@@ -1336,17 +1397,18 @@ export default function PegsAndJokers() {
     // Execute the joker via the engine so the partner friendly-bump rule applies.
     const { newPegs, bumped } = applyJoker(owner, jokerSourcePeg, targetPlayer, targetPegIndex, pegs, moveOptions);
     if (!bumped) {
-      setGameMessage('That joker bump is not legal. Pick another target.');
+      setNotice('That joker bump is not legal. Pick another target.');
       return;
     }
 
     // Record last move for Joker
     const friendly = gameMode === GAME_MODES.PARTNERS && sameTeam(targetPlayer, actor);
+    const jokerDescription = friendly
+      ? `Joker sent ${PLAYER_NAMES[targetPlayer]} to home stretch`
+      : `Joker bumped ${PLAYER_NAMES[targetPlayer]}`;
     setLastMoves(prev => {
       const updated = [...prev];
-      updated[actor] = friendly
-        ? `Joker sent ${PLAYER_NAMES[targetPlayer]} to home stretch`
-        : `Joker bumped ${PLAYER_NAMES[targetPlayer]}`;
+      updated[actor] = jokerDescription;
       return updated;
     });
 
@@ -1385,14 +1447,14 @@ export default function PegsAndJokers() {
 
     const w = checkWinner(newPegs, gameMode);
     if (w !== null) {
-      setWinner(w);
+      endGame(w, { winningSeat: actor, description: jokerDescription });
       return;
     }
 
     // Next player
     const nextPlayer = (actor + 1) % 4;
     setCurrentPlayer(nextPlayer);
-    setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
+    setNotice(null);
   };
 
   // Tap on a ghost destination circle: play the selected card with the amount
@@ -1689,6 +1751,110 @@ export default function PegsAndJokers() {
         </div>
       )}
 
+      {/* End-of-game overlay. Replaces the old inline green banner, which
+          rendered independently of the status line and so could sit above a
+          stale "Blue is thinking…". */}
+      {winner !== null && outcome && !endOverlayDismissed && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full max-h-[90vh] overflow-y-auto p-6">
+            <h2 className={`text-3xl font-bold mb-1 text-center ${outcome.won ? 'text-green-400' : 'text-gray-200'}`}>
+              {outcome.won ? '🎉 ' : ''}{outcome.text}
+            </h2>
+            <p className="text-center text-sm text-gray-400 mb-5">
+              {gameMode === GAME_MODES.PARTNERS ? 'Partner game' : 'Classic game'}
+            </p>
+
+            {/* The winning move. Worth spelling out because remotely the game
+                can end on a move you never saw happen. */}
+            {endInfo?.description && (
+              <div className="bg-gray-700/50 rounded-lg px-4 py-3 mb-5">
+                <div className="text-xs text-gray-400 mb-1">Winning move</div>
+                <div className="text-sm">
+                  <span
+                    className="font-semibold"
+                    style={{ color: PLAYER_COLORS[endInfo.winningSeat ?? 0] }}
+                  >
+                    {endInfo.winningSeat !== null && ownsSeat(endInfo.winningSeat)
+                      ? `You (${PLAYER_NAMES[endInfo.winningSeat]})`
+                      : PLAYER_NAMES[endInfo.winningSeat ?? 0]}
+                  </span>
+                  <span className="text-gray-200"> — {endInfo.description}</span>
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-4 gap-2 mb-5 text-center">
+              <div className="bg-gray-700 rounded-lg p-2">
+                <div className="text-lg font-bold">{endInfo?.turns ?? 0}</div>
+                <div className="text-[10px] text-gray-400">Turns</div>
+              </div>
+              <div className="bg-gray-700 rounded-lg p-2">
+                <div className="text-lg font-bold">{endInfo?.jokersPlayed ?? 0}</div>
+                <div className="text-[10px] text-gray-400">Jokers</div>
+              </div>
+              <div className="bg-gray-700 rounded-lg p-2">
+                <div className="text-lg font-bold text-green-400">{endInfo?.bumpsDelivered ?? 0}</div>
+                <div className="text-[10px] text-gray-400">Bumps</div>
+              </div>
+              <div className="bg-gray-700 rounded-lg p-2">
+                <div className="text-lg font-bold text-red-400">{endInfo?.timesBumped ?? 0}</div>
+                <div className="text-[10px] text-gray-400">Bumped</div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 mb-6 text-center">
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <div className="text-lg font-bold">{stats.gamesPlayed}</div>
+                <div className="text-[10px] text-gray-400">Games</div>
+              </div>
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <div className="text-lg font-bold text-amber-400">{Math.round(winRate(stats) * 100)}%</div>
+                <div className="text-[10px] text-gray-400">Win rate</div>
+              </div>
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <div className={`text-lg font-bold ${stats.currentStreak > 0 ? 'text-green-400' : stats.currentStreak < 0 ? 'text-red-400' : ''}`}>
+                  {formatStreak(stats.currentStreak)}
+                </div>
+                <div className="text-[10px] text-gray-400">Streak</div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <button
+                onClick={() => {
+                  unlockAudio();
+                  startModeRef.current = 'chosen';
+                  startGameWithPlayer(mySeat);
+                }}
+                className="w-full px-6 py-3 bg-amber-600 hover:bg-amber-700 rounded-lg font-semibold transition-colors"
+              >
+                Rematch
+              </button>
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  onClick={initGame}
+                  className="px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-semibold transition-colors"
+                >
+                  New Game
+                </button>
+                <button
+                  onClick={() => setShowStats(true)}
+                  className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg text-sm font-semibold transition-colors"
+                >
+                  📊 Stats
+                </button>
+                <button
+                  onClick={() => setEndOverlayDismissed(true)}
+                  className="px-3 py-2 bg-gray-600 hover:bg-gray-700 rounded-lg text-sm font-semibold transition-colors"
+                >
+                  View board
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Player Stats Modal */}
       {showStats && (
         <div
@@ -1906,16 +2072,21 @@ export default function PegsAndJokers() {
           </div>
         </div>
 
-        {winner !== null && (
-          <div className="text-center text-2xl font-bold mb-4 p-4 bg-green-600 rounded">
-            {gameMode === GAME_MODES.PARTNERS
-              ? (winner === 0 ? 'Your team wins! 🎉' : 'Opponents win!')
-              : (winner === 0 ? 'You Win!' : 'Opponent Wins!')}
-          </div>
-        )}
-
+        {/* The status line is derived from `phase` — it can never be stale, and
+            in particular never reads "Blue is thinking…" after the game ends.
+            `notice` sits under it for transient feedback and clears itself on
+            the next phase change. */}
         <div className="text-center mb-4 p-2 bg-gray-800 rounded">
-          {gameMessage}
+          <div>{statusLine}</div>
+          {notice && <div className="text-sm text-amber-300 mt-1">{notice}</div>}
+          {phase === PHASES.FINISHED && endOverlayDismissed && (
+            <button
+              onClick={() => setEndOverlayDismissed(false)}
+              className="mt-2 px-3 py-1 bg-amber-600 hover:bg-amber-700 rounded text-sm font-semibold"
+            >
+              🏁 Show result
+            </button>
+          )}
         </div>
 
         {/* Undo a mis-tapped split: only available between the two halves of a
@@ -2094,7 +2265,7 @@ export default function PegsAndJokers() {
                             setJokerMode(false);
                             setJokerSourcePeg(null);
                             setSelectedPeg(null);
-                            setGameMessage('Joker cancelled. Select a card and peg to move.');
+                            setNotice(null);
                           } else {
                             handlePegClick(player, pegIndex);
                           }
@@ -2327,7 +2498,7 @@ export default function PegsAndJokers() {
                     setJokerMode(false);
                     setJokerSourcePeg(null);
                     setSelectedPeg(null);
-                    setGameMessage('Joker cancelled. Select a card and peg to move.');
+                    setNotice(null);
                   }}
                   className="px-3 py-1 bg-gray-600 rounded hover:bg-gray-700"
                 >
@@ -2343,7 +2514,7 @@ export default function PegsAndJokers() {
                 <button
                   onClick={() => {
                     setDiscardMode(false);
-                    setGameMessage('Your turn! Select a card and peg to move.');
+                    setNotice(null);
                   }}
                   className="px-3 py-1 bg-gray-600 rounded hover:bg-gray-700"
                 >
@@ -2363,7 +2534,7 @@ export default function PegsAndJokers() {
                       setDiscardMode(true);
                       setSelectedCard(null);
                       setSelectedPeg(null);
-                      setGameMessage('Select a card to discard.');
+                      setNotice(null);
                     }}
                     className="px-4 py-2 bg-red-600 rounded hover:bg-red-700 font-bold"
                   >

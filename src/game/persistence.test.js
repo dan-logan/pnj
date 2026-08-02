@@ -155,3 +155,21 @@ describe('save/load/clear round-trip', () => {
     expect(() => clearGame(null)).not.toThrow();
   });
 });
+
+describe('game identity', () => {
+  it('round-trips the game id so a resumed game keeps its identity', () => {
+    // The id is what makes stats recording idempotent: resuming a game and
+    // finishing it must not record a second result for the same game.
+    const snap = serializeGame({ ...sampleState(), gameId: 'abc-123' });
+    expect(snap.gameId).toBe('abc-123');
+    const store = memoryStorage();
+    saveGame({ ...sampleState(), gameId: 'abc-123' }, store);
+    expect(loadGame(store).gameId).toBe('abc-123');
+  });
+
+  it('leaves the id null for a save made without one', () => {
+    // Saves written before game ids existed still load; the app mints a fresh
+    // id for them on resume.
+    expect(serializeGame(sampleState()).gameId).toBeNull();
+  });
+});

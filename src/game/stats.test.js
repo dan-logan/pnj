@@ -11,7 +11,17 @@ import {
   bucketWinRate,
   formatStreak,
   getNemesis,
+  didIWin,
+  winningSeats,
+  newGameId,
+  recordFinishedGame,
+  loadRecordedGames,
+  hasRecordedGame,
+  markGameRecorded,
+  RECORDED_GAMES_STORAGE_KEY,
+  MAX_RECORDED_GAMES,
 } from './stats.js';
+import { GAME_MODES } from './constants.js';
 
 // Minimal in-memory Storage stand-in so the pure logic can be tested without a
 // real browser localStorage.
@@ -221,5 +231,197 @@ describe('persistence', () => {
   it('does not throw when no storage is available', () => {
     expect(() => saveStats(createEmptyStats(), null)).not.toThrow();
     expect(loadStats(null)).toEqual(createEmptyStats());
+  });
+});
+
+describe('didIWin', () => {
+  it('is false with no winner', () => {
+    expect(didIWin(null, GAME_MODES.CLASSIC, [0])).toBe(false);
+    expect(didIWin(undefined, GAME_MODES.PARTNERS, [0])).toBe(false);
+  });
+
+  it('compares against the player index in classic mode', () => {
+    expect(didIWin(0, GAME_MODES.CLASSIC, [0])).toBe(true);
+    expect(didIWin(1, GAME_MODES.CLASSIC, [0])).toBe(false);
+    expect(didIWin(2, GAME_MODES.CLASSIC, [2])).toBe(true);
+  });
+
+  it('compares against the team in partner mode', () => {
+    // `winner` is a team index there: team 0 is seats 0 + 2.
+    expect(didIWin(0, GAME_MODES.PARTNERS, [0])).toBe(true);
+    expect(didIWin(0, GAME_MODES.PARTNERS, [1])).toBe(false);
+    expect(didIWin(1, GAME_MODES.PARTNERS, [1])).toBe(true);
+    expect(didIWin(1, GAME_MODES.PARTNERS, [3])).toBe(true);
+  });
+
+  it('gives the partner credit when their move wins the game', () => {
+    // The guest sits in seat 2; team 0 winning is their win even though the
+    // winning move was made by seat 0.
+    expect(didIWin(0, GAME_MODES.PARTNERS, [2])).toBe(true);
+  });
+
+  it('would be wrong as `winner === 0` for a human in seat 1 or 3', () => {
+    expect(didIWin(1, GAME_MODES.PARTNERS, [3])).toBe(true);
+    expect(didIWin(0, GAME_MODES.PARTNERS, [3])).toBe(false);
+  });
+
+  it('handles a client controlling more than one seat', () => {
+    expect(didIWin(1, GAME_MODES.CLASSIC, [0, 2])).toBe(false);
+    expect(didIWin(2, GAME_MODES.CLASSIC, [0, 2])).toBe(true);
+  });
+});
+
+describe('winningSeats', () => {
+  it('is the single player in classic mode', () => {
+    expect(winningSeats(1, GAME_MODES.CLASSIC)).toEqual([1]);
+  });
+
+  it('is both team members in partner mode', () => {
+    expect(winningSeats(0, GAME_MODES.PARTNERS)).toEqual([0, 2]);
+    expect(winningSeats(1, GAME_MODES.PARTNERS)).toEqual([1, 3]);
+  });
+
+  it('is empty with no winner', () => {
+    expect(winningSeats(null, GAME_MODES.PARTNERS)).toEqual([]);
+  });
+});
+
+describe('nemesis in partner mode', () => {
+  it('credits both members of the winning team, not just the team index', () => {
+    // The pre-existing bug: `lossesByOpponent[winner]++` with winner = team 1
+    // recorded one loss against Blue (player 1) and none against Green.
+    let s = createEmptyStats();
+    s = recordGame(s, loss({ winner: 1, mode: 'partners' }));
+    expect(s.lossesByOpponent).toEqual({ 1: 1, 2: 0, 3: 1 });
+  });
+
+  it('never credits your own partner', () => {
+    // You are the guest in seat 2, so team 1 (Blue + Green) beat you.
+    let s = createEmptyStats();
+    s = recordGame(s, loss({ winner: 1, mode: 'partners', mySeats: [2] }));
+    expect(s.lossesByOpponent).toEqual({ 1: 1, 2: 0, 3: 1 });
+
+    // And a human in seat 3 losing to team 0 credits only Yellow — seat 1 is
+    // their own partner, and seat 0's bucket does not exist.
+    let t = createEmptyStats();
+    t = recordGame(t, loss({ winner: 0, mode: 'partners', mySeats: [3] }));
+    expect(t.lossesByOpponent).toEqual({ 1: 0, 2: 1, 3: 0 });
+  });
+
+  it('leaves classic mode exactly as it was', () => {
+    let s = createEmptyStats();
+    s = recordGame(s, loss({ winner: 2 }));
+    s = recordGame(s, loss({ winner: 2 }));
+    s = recordGame(s, loss({ winner: 3 }));
+    expect(s.lossesByOpponent).toEqual({ 1: 0, 2: 2, 3: 1 });
+    expect(getNemesis(s)).toEqual({ player: 2, losses: 2 });
+  });
+
+  it('surfaces the right nemesis after partner-mode losses', () => {
+    let s = createEmptyStats();
+    s = recordGame(s, loss({ winner: 1, mode: 'partners' }));
+    s = recordGame(s, loss({ winner: 1, mode: 'partners' }));
+    s = recordGame(s, loss({ winner: 2 })); // classic loss to Pink
+    // Blue and Green are tied on 2; the first one found wins the tie-break.
+    expect(getNemesis(s)).toEqual({ player: 1, losses: 2 });
+  });
+});
+
+describe('recordFinishedGame', () => {
+  it('records a game once', () => {
+    const store = memoryStorage();
+    const r = recordFinishedGame('game-a', win(), store);
+    expect(r.recorded).toBe(true);
+    expect(r.stats.gamesPlayed).toBe(1);
+    expect(loadStats(store).gamesPlayed).toBe(1);
+  });
+
+  it('is a no-op the second time the same game ends', () => {
+    // Reopening a finished game, or a partner's winning move arriving twice,
+    // must not double-count it.
+    const store = memoryStorage();
+    recordFinishedGame('game-a', win(), store);
+    const again = recordFinishedGame('game-a', win(), store);
+    expect(again.recorded).toBe(false);
+    expect(again.stats.gamesPlayed).toBe(1);
+    expect(loadStats(store).gamesPlayed).toBe(1);
+  });
+
+  it('still returns the current stats when it skips', () => {
+    const store = memoryStorage();
+    recordFinishedGame('game-a', win(), store);
+    recordFinishedGame('game-b', loss(), store);
+    const again = recordFinishedGame('game-a', win(), store);
+    expect(again.stats.gamesPlayed).toBe(2);
+    expect(again.stats.wins).toBe(1);
+    expect(again.stats.losses).toBe(1);
+  });
+
+  it('records different games independently', () => {
+    const store = memoryStorage();
+    recordFinishedGame('game-a', win(), store);
+    recordFinishedGame('game-b', win(), store);
+    expect(loadStats(store).gamesPlayed).toBe(2);
+  });
+
+  it('refuses to record without an id rather than recording blind', () => {
+    const store = memoryStorage();
+    const r = recordFinishedGame(null, win(), store);
+    expect(r.recorded).toBe(false);
+    expect(loadStats(store).gamesPlayed).toBe(0);
+  });
+
+  it('survives a lost stats file (the id list is what dedupes)', () => {
+    const store = memoryStorage();
+    recordFinishedGame('game-a', win(), store);
+    store.removeItem(STATS_STORAGE_KEY);
+    const again = recordFinishedGame('game-a', win(), store);
+    expect(again.recorded).toBe(false);
+  });
+});
+
+describe('recorded game ids', () => {
+  it('starts empty and ignores junk', () => {
+    expect(loadRecordedGames(memoryStorage())).toEqual([]);
+    expect(loadRecordedGames(memoryStorage({ [RECORDED_GAMES_STORAGE_KEY]: 'not json' }))).toEqual([]);
+    expect(loadRecordedGames(memoryStorage({ [RECORDED_GAMES_STORAGE_KEY]: '{"a":1}' }))).toEqual([]);
+  });
+
+  it('remembers ids and reports membership', () => {
+    const store = memoryStorage();
+    markGameRecorded('x', store);
+    expect(hasRecordedGame('x', store)).toBe(true);
+    expect(hasRecordedGame('y', store)).toBe(false);
+    expect(hasRecordedGame(null, store)).toBe(false);
+  });
+
+  it('does not duplicate an id it already holds', () => {
+    const store = memoryStorage();
+    markGameRecorded('x', store);
+    markGameRecorded('x', store);
+    expect(loadRecordedGames(store)).toEqual(['x']);
+  });
+
+  it('drops the oldest ids past the cap', () => {
+    const store = memoryStorage();
+    for (let i = 0; i < MAX_RECORDED_GAMES + 5; i++) markGameRecorded(`g${i}`, store);
+    const ids = loadRecordedGames(store);
+    expect(ids).toHaveLength(MAX_RECORDED_GAMES);
+    expect(ids[0]).toBe('g5');
+    expect(ids.at(-1)).toBe(`g${MAX_RECORDED_GAMES + 4}`);
+  });
+
+  it('is cleared by resetting stats', () => {
+    const store = memoryStorage();
+    recordFinishedGame('game-a', win(), store);
+    resetStats(store);
+    expect(loadRecordedGames(store)).toEqual([]);
+  });
+});
+
+describe('newGameId', () => {
+  it('gives every game a distinct id', () => {
+    const ids = new Set(Array.from({ length: 50 }, () => newGameId()));
+    expect(ids.size).toBe(50);
   });
 });
