@@ -2299,20 +2299,20 @@ export default function PegsAndJokers() {
           modals — not a route. Populated by one subscribeMyGames listener, so it
           updates itself when a partner moves whether or not it is open. */}
       {showLobby && (
-        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
-          <div className="bg-gray-800 rounded-lg shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
-            <div className="flex justify-between items-center p-5 pb-3 border-b border-gray-700 sticky top-0 bg-gray-800">
-              <h2 className="text-2xl font-bold">🎮 My Games</h2>
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-2 sm:p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-lg w-full max-h-[90dvh] overflow-y-auto">
+            <div className="flex justify-between items-center gap-2 p-4 sm:p-5 pb-3 border-b border-gray-700 sticky top-0 bg-gray-800">
+              <h2 className="text-xl sm:text-2xl font-bold">🎮 My Games</h2>
               <button
                 onClick={() => setShowLobby(false)}
-                className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-lg leading-none"
+                className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-lg leading-none flex-shrink-0"
                 aria-label="Close My Games"
               >
                 ✕
               </button>
             </div>
 
-            <div className="p-5 space-y-3">
+            <div className="p-4 sm:p-5 space-y-3">
               {mpNotice && <div className="text-sm text-amber-300">{mpNotice}</div>}
 
               {/* Your solo game. */}
@@ -2928,8 +2928,20 @@ export default function PegsAndJokers() {
       )}
 
       <div className="max-w-5xl mx-auto">
-        <div className="flex justify-between items-center mb-4">
-          <h1 className="text-2xl font-bold">Pegs and Jokers</h1>
+        {/* The header wraps rather than overflowing. On a ~360px phone the five
+            controls cannot sit beside the title, and in a single non-wrapping row
+            they used to push "New Game" off the right edge *and* widen the
+            document — which in turn widened the layout viewport that every
+            `position: fixed` modal sizes against, so the modals rendered wider
+            than the screen too. Two groups, so the wrap lands somewhere chosen:
+            the two small toggles stay beside the title, and the three actions
+            drop to a full-width row of equal, thumb-sized buttons. From `sm` up
+            the width overrides collapse and it is one row again, as before. */}
+        <div className="flex flex-wrap justify-end items-center gap-2 mb-4">
+          {/* The auto margin belongs on the title, not on a button group: on a
+              group it would swallow the row's free space and force the wrap even
+              on a wide screen. */}
+          <h1 className="text-xl sm:text-2xl font-bold mr-auto">Pegs and Jokers</h1>
           <div className="flex gap-2 items-center">
             <button
               onClick={() => {
@@ -2938,27 +2950,34 @@ export default function PegsAndJokers() {
                 setSoundOn(next);
                 setMuted(!next);
               }}
-              className="px-3 py-2 rounded text-sm bg-gray-700 hover:bg-gray-600"
+              className="px-2.5 sm:px-3 py-2 rounded text-sm bg-gray-700 hover:bg-gray-600"
               aria-label={soundOn ? 'Mute sound and vibration' : 'Unmute sound and vibration'}
             >
               {soundOn ? '🔊' : '🔇'}
             </button>
             <button
               onClick={() => setAnimationsEnabled(!animationsEnabled)}
-              className={`px-3 py-2 rounded text-sm ${
+              className={`px-2.5 sm:px-3 py-2 rounded text-sm whitespace-nowrap ${
                 animationsEnabled
                   ? 'bg-green-600 hover:bg-green-700'
                   : 'bg-gray-600 hover:bg-gray-700'
               }`}
+              aria-label={animationsEnabled ? 'Turn animations off' : 'Turn animations on'}
             >
-              {animationsEnabled ? 'Animations On' : 'Animations Off'}
+              {/* "Animations" is the widest label in the row; on a phone the ✨
+                  carries the meaning and the word is dropped. */}
+              <span aria-hidden="true">✨</span>
+              <span className="hidden sm:inline"> Animations</span>
+              {animationsEnabled ? ' On' : ' Off'}
             </button>
+          </div>
+          <div className="flex gap-2 items-center w-full sm:w-auto">
             {multiplayerConfigured && (
               <button
                 onClick={() => setShowLobby(true)}
-                className="relative px-4 py-2 bg-teal-600 rounded hover:bg-teal-700"
+                className="relative flex-1 sm:flex-none px-2.5 sm:px-4 py-2 rounded text-sm sm:text-base bg-teal-600 hover:bg-teal-700 whitespace-nowrap"
               >
-                🎮 My Games
+                <span aria-hidden="true">🎮</span> My Games
                 {waitingCount > 0 && (
                   <span
                     className="absolute -top-1 -right-1 min-w-[20px] h-5 px-1 flex items-center justify-center rounded-full bg-amber-500 text-xs font-bold text-gray-900"
@@ -2971,13 +2990,13 @@ export default function PegsAndJokers() {
             )}
             <button
               onClick={() => setShowStats(true)}
-              className="px-4 py-2 bg-indigo-600 rounded hover:bg-indigo-700"
+              className="flex-1 sm:flex-none px-2.5 sm:px-4 py-2 rounded text-sm sm:text-base bg-indigo-600 hover:bg-indigo-700 whitespace-nowrap"
             >
-              📊 Stats
+              <span aria-hidden="true">📊</span> Stats
             </button>
             <button
               onClick={startNewSoloGame}
-              className="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700"
+              className="flex-1 sm:flex-none px-2.5 sm:px-4 py-2 rounded text-sm sm:text-base bg-blue-600 hover:bg-blue-700 whitespace-nowrap"
             >
               New Game
             </button>
