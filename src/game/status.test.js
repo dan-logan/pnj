@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { PHASES, derivePhase, describeStatus, describeOutcome } from './status.js';
+import { PHASES, derivePhase, describeStatus, describeOutcome, attributeFrameDescription } from './status.js';
 import { GAME_MODES } from './constants.js';
 
 const SOLO = ['me', 'ai', 'ai', 'ai'];
@@ -16,11 +16,10 @@ const base = {
 };
 
 describe('derivePhase', () => {
-  it('reports a finished game above everything else', () => {
+  it('reports a finished game above everything except an in-flight replay', () => {
     // This is the bug the derived model exists to kill: mid-animation, mid-AI
-    // turn, mid-replay — once there is a winner the phase is finished.
+    // turn — once there is a winner the phase is finished.
     expect(derivePhase({ ...base, winner: 0 })).toBe(PHASES.FINISHED);
-    expect(derivePhase({ ...base, winner: 1, isReplaying: true, isMyTurn: true })).toBe(PHASES.FINISHED);
     expect(derivePhase({ ...base, winner: 0, dealt: false })).toBe(PHASES.FINISHED);
   });
 
@@ -28,8 +27,13 @@ describe('derivePhase', () => {
     expect(derivePhase({ ...base, winner: 0, isMyTurn: true })).toBe(PHASES.FINISHED);
   });
 
-  it('locks into replaying while playback runs', () => {
+  it('locks into replaying while playback runs, even after the game has ended', () => {
+    // Package 5: a remote win auto-replays the winning move before the
+    // end-of-game overlay appears. `winner` is set immediately (so nothing can
+    // move afterwards) but the phase stays REPLAYING until playback finishes,
+    // so the status line doesn't say "Game over" out from under the replay.
     expect(derivePhase({ ...base, isReplaying: true, isMyTurn: true })).toBe(PHASES.REPLAYING);
+    expect(derivePhase({ ...base, winner: 1, isReplaying: true, isMyTurn: true })).toBe(PHASES.REPLAYING);
   });
 
   it('is dealing before any cards are out', () => {
@@ -135,5 +139,16 @@ describe('describeOutcome', () => {
 
   it('puts you first however the team is ordered', () => {
     expect(describeOutcome(1, GAME_MODES.PARTNERS, [3]).text).toBe('You and Blue win!');
+  });
+});
+
+describe('attributeFrameDescription', () => {
+  it('leaves the description alone when the actor moved their own peg', () => {
+    expect(attributeFrameDescription('Space 3 to Space 10', 0, 0)).toBe('Space 3 to Space 10');
+  });
+
+  it('names the peg owner when it differs from the actor (playing a partner\'s hand)', () => {
+    expect(attributeFrameDescription('Space 3 to Space 10', 0, 2))
+      .toBe("Space 3 to Space 10 (moved Pink's peg)");
   });
 });

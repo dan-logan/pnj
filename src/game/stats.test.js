@@ -125,6 +125,16 @@ describe('recordGame', () => {
     expect(s.randomFirst).toEqual({ games: 1, wins: 1 });
   });
 
+  it('counts a remote game (startMode: null) toward neither bucket', () => {
+    let s = createEmptyStats();
+    s = recordGame(s, win({ startMode: null }));
+    s = recordGame(s, loss({ startMode: null }));
+    expect(s.chosenFirst).toEqual({ games: 0, wins: 0 });
+    expect(s.randomFirst).toEqual({ games: 0, wins: 0 });
+    // The game itself still counts everywhere else.
+    expect(s.gamesPlayed).toBe(2);
+  });
+
   it('splits games by game mode, defaulting to solo', () => {
     let s = createEmptyStats();
     s = recordGame(s, win()); // no mode -> solo

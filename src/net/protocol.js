@@ -44,6 +44,8 @@ export function buildCreateMeta({ hostUid, code, mode = 'partners', now }) {
     currentPlayer: HOST_SEAT,
     waitingOn: HOST_SEAT,
     winner: null,
+    winningSeat: null,
+    description: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -70,12 +72,20 @@ export function buildJoinMeta(meta, guestUid, now) {
 // the version advances by exactly one, so two clients can never both advance the
 // same version — the database enforces the compare-and-swap, the client doesn't
 // merely promise to be the only writer.
-export function buildPublishMeta(meta, { currentPlayer, waitingOn, winner = null, status, now }) {
+//
+// winningSeat/description carry who made the winning move and what it was, so
+// the end-of-game overlay can show "who and what" on the client that never saw
+// the move happen (Package 4/5) — the shared `state` blob deliberately has no
+// `winner` field of its own (see session.js), so this is the only place that
+// information rides the wire.
+export function buildPublishMeta(meta, { currentPlayer, waitingOn, winner = null, winningSeat = null, description = null, status, now }) {
   return {
     ...meta,
     currentPlayer,
     waitingOn,
     winner,
+    winningSeat,
+    description,
     status: status ?? (winner !== null && winner !== undefined ? STATUS.FINISHED : STATUS.ACTIVE),
     version: meta.version + 1,
     updatedAt: now,

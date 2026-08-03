@@ -17,8 +17,36 @@ function resolveStorage(storage) {
   return null;
 }
 
+// A single number, or a per-seat [n0, n1, n2, n3] array. Accept either on the
+// way in (so an old save/payload with a plain number still loads) and always
+// normalize to the array shape on the way out.
+function toPerSeat(value) {
+  if (Array.isArray(value)) return [value[0] ?? 0, value[1] ?? 0, value[2] ?? 0, value[3] ?? 0];
+  return [value ?? 0, 0, 0, 0];
+}
+
 // Build the serializable snapshot. Kept separate from saveGame so it can be
-// unit-tested without a storage backend.
+// unit-tested without a storage backend. This is also the shape published to
+// the wire for a remote turn (Package 4) — see commitTurn in the component.
+//
+// tallies.jokersPlayed/bumpsDelivered/timesBumped are per-seat arrays, not a
+// single number. They used to be personal to whichever client computed them
+// (gated on `ownsSeat`), which silently corrupted them the moment play went
+// remote: each client would overwrite its partner's numbers with its own, and
+// neither side ever saw a bump an AI delivered while the OTHER client was
+// simulating it. A per-seat array is objective — whichever client actually
+// simulates a seat's move records it at that seat's index — so it rides the
+// wire correctly and each client sums only its own seats (`mySeats`) at
+// stats-record time. `turns` stays a single shared counter: it is
+// incremented once per seat that actually moves, which is already an
+// objective fact both clients agree on.
+//
+// `startMode` ("did *I* choose to go first") is a host-only, local concept —
+// a remote game should count toward neither the chosenFirst nor randomFirst
+// stat bucket, so the component passes `null` for a remote turn (see
+// commitTurn) rather than inheriting whatever the guest's default would be.
+//
+// `moveHistory` was write-only dead state (set, never read) and is dropped.
 export function serializeGame(state) {
   return {
     version: SAVE_VERSION,
@@ -39,14 +67,15 @@ export function serializeGame(state) {
     splitPegIndex: state.splitPegIndex ?? null,
     splitOwner: state.splitOwner ?? null,
     lastMoves: state.lastMoves ?? [null, null, null, null],
-    moveHistory: state.moveHistory ?? [],
     // Per-game stat tallies so a resumed game still records correct stats.
     tallies: {
       turns: state.turns ?? 0,
-      jokersPlayed: state.jokersPlayed ?? 0,
-      bumpsDelivered: state.bumpsDelivered ?? 0,
-      timesBumped: state.timesBumped ?? 0,
-      startMode: state.startMode ?? 'chosen',
+      jokersPlayed: toPerSeat(state.jokersPlayed),
+      bumpsDelivered: toPerSeat(state.bumpsDelivered),
+      timesBumped: toPerSeat(state.timesBumped),
+      // 'chosen' by default (today's solo behavior); a remote deal/turn passes
+      // `startMode: null` explicitly so it counts toward neither stat bucket.
+      startMode: state.startMode === undefined ? 'chosen' : state.startMode,
     },
   };
 }

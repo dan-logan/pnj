@@ -22,12 +22,16 @@ export const PHASES = {
   FINISHED: 'finished',
 };
 
-// The one source of truth for "what is happening". Order matters: a finished
-// game outranks everything, and a replay locks interaction regardless of whose
-// turn it nominally is.
+// The one source of truth for "what is happening". Order matters: a replay
+// outranks even a finished game, so a remote win can be watched (the auto-
+// replay of the winning move, Package 5) before the end-of-game overlay
+// appears — `winner` is set immediately when the game ends (so nothing can
+// move afterwards) but the *overlay* is presented only once the replay
+// finishes (`winner !== null && !isReplaying`, gated in the component). Once
+// a replay isn't running, a finished game outranks everything else.
 export function derivePhase({ winner, isReplaying, dealt, isMyTurn, currentPlayer, seatOwners }) {
-  if (winner !== null && winner !== undefined) return PHASES.FINISHED;
   if (isReplaying) return PHASES.REPLAYING;
+  if (winner !== null && winner !== undefined) return PHASES.FINISHED;
   if (!dealt) return PHASES.DEALING;
   if (isMyTurn) return PHASES.MY_TURN;
   return seatOwners[currentPlayer] === 'them' ? PHASES.WAITING_PARTNER : PHASES.AI_TURN;
@@ -96,4 +100,16 @@ export function describeOutcome(winner, mode = GAME_MODES.CLASSIC, mySeats = [0]
   // "You win", "You and Pink win", "Blue and Green win" — but "Blue wins".
   const verb = labels.length > 1 || won ? 'win' : 'wins';
   return { won, seats: ordered, text: `${subject} ${verb}${won ? '!' : '.'}` };
+}
+
+// §5.3: in partner mode, once a player's own pegs are all home their cards
+// move their *partner's* pegs (`controlledOwnerFor`). A replay frame's
+// `player` is the actor (whose turn it is / whose card was played), which can
+// differ from the peg's owner — watching your own peg move in a frame
+// attributed to your partner's turn is confusing without saying so. Named by
+// seat (not "your peg") so the text reads correctly for every viewer,
+// including a third party watching neither seat.
+export function attributeFrameDescription(description, actor, owner, names = PLAYER_NAMES) {
+  if (actor === owner) return description;
+  return `${description} (moved ${names[owner]}'s peg)`;
 }

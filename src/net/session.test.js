@@ -235,6 +235,18 @@ describe('startGame and publishState', () => {
     expect(meta.winner).toBe(0);
     expect(meta.status).toBe(STATUS.FINISHED);
   });
+
+  it('carries winningSeat and description through to the metadata', async () => {
+    const { id } = await createGame();
+    await startGame(id, { state: { s: 0 }, currentPlayer: 0, waitingOn: 2 });
+    await publishState(id, {
+      state: { s: 1 }, replay: [], currentPlayer: 2, waitingOn: 0, winner: 0,
+      winningSeat: 0, description: 'Ace out',
+    }, 1);
+    const meta = backend.docs.get(`games/${id}`);
+    expect(meta.winningSeat).toBe(0);
+    expect(meta.description).toBe('Ace out');
+  });
 });
 
 describe('fetchGame', () => {

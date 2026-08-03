@@ -1,8 +1,10 @@
 # Multiplayer Phase 1 — Implementation Plan
 
-**Status:** Packages 0, 1, 2, and 3 are built, pushed to the branch, and verified against a live
-Firebase project (`pnj-dan-4a7f`). Packages 4 and 5 are approved design, not yet implemented — this
-is the next work. Package 6 (final pass) is behind those.
+**Status:** Packages 0 through 5 are built and pushed to the branch. Package 4/5 unit tests pass
+(311 total) and the build is verified with and without the Firebase env vars. A live host session
+was exercised against `pnj-dan-4a7f`; live two-human turn exchange was not re-verified this pass —
+see "What Packages 4 and 5 actually built" for why and what to re-check. Package 6 (final pass —
+the manual playtest matrix and a CLAUDE.md pass) is the only work left.
 **Branch:** `claude/multiplayer-remote-play-ecx61a`
 **Audience:** the agent implementing this. Assume no memory of the design discussion — everything needed is here.
 
@@ -1009,6 +1011,52 @@ and then shows the overlay.
 
 ---
 
+### What Packages 4 and 5 actually built
+
+Read this if you're picking up Package 6. Turn exchange and automatic replay are both live end
+to end (`commitTurn` in `PegsAndJokers.jsx`, `shouldSimulateAI` in `src/net/seats.js`,
+`seedReplay`/`appendReplayFrame` in `src/net/replay.js`). Verified: `npm test` (311 tests) and
+`npm run build` both green, with and without the Firebase env vars set. A live host session was
+created and dealt against `pnj-dan-4a7f` (real Firestore); the manual "Instant Replay" flow, solo
+AI turn-taking, per-seat tallies and the derived-phase precedence flip were all exercised live in
+Chrome via the dev server. **Not verified live**: a full two-human turn exchange. A second browser
+tab attempting to join as guest hung indefinitely on a fresh `signInAnonymously()` call after an
+IndexedDB reset used to force a new anonymous identity (the same reset apparently left the origin's
+`firebaseLocalStorageDb` in a state that blocked subsequent opens for *any* new tab on that origin,
+not just the one that ran the reset) — this reproduces on unmodified Package 2 sign-in code, so it
+reads as a test-environment artifact, not a regression, but it means the guest side of live turn
+exchange should be re-verified by whoever picks up Package 6, on two real devices as Package 3 did.
+
+A few decisions this pass made that the plan didn't spell out:
+
+- **A game-ending AI move publishes directly**, from inside the AI effect's own `completeAIMove`,
+  reusing `commitTurn`. §4.2 says the AI effect's own player-advance "must stay purely local,"
+  folded into this client's next human publish — but a game-ending AI move has no next human
+  publish to fold into, since this client's own turn never arrives. Without publishing there, the
+  other player would never learn the game ended.
+- **`winningSeat`/`description` were added to the wire** (`buildPublishMeta`/`publishState`/the
+  metadata document), beyond §2.5's original sketch. The shared `state` blob deliberately has no
+  `winner` field (win detection runs on adoption, not from the wire), so without this the client
+  that didn't make the winning move would adopt a winning board with no way to say who won it or
+  how — exactly the information §1.7's end-of-game overlay needs.
+- **`derivePhase` now ranks `replaying` above `finished`** (flipped from Package 1), and the
+  end-of-game overlay's render condition gained `&& !isReplaying`. This is the settle/present split
+  §5.2 asked for, done without literally splitting `endGame` into two functions: `endGame` already
+  only ever runs *before* a replay it triggers actually starts (queued via `pendingAutoReplayRef`
+  and fired from a later effect pass), so its unconditional timer-cancellation was never actually
+  racing a live replay — the phase/render change was the piece still needed.
+- **`moveHistory` was dropped everywhere**, not just from the wire payload as §4.1 said. It was
+  write-only dead state already (set, never read) in the local save too, so keeping two shapes —
+  one for `serializeGame()`'s local save and a stripped one for the wire — would have been pure
+  overhead for a field nothing reads.
+- **Reopening/switching into an in-progress remote game now seeds the replay buffer too.**
+  `openRemoteGame`'s one-shot `fetchGame` adopts a state exactly like `handleRemoteState` does, but
+  didn't route through it — without the same `seedReplay`/`pendingAutoReplayRef` wiring added there,
+  switching into a game from the lobby (or a reload) would silently skip both the "what happened"
+  replay and a possible already-finished result.
+
+---
+
 ### Package 6 — Final pass
 
 **Tests are not deferred to this package.** Each package ships its own, per the repo convention in
@@ -1071,25 +1119,34 @@ What genuinely remains for the end:
 
 ## 5. Definition of done
 
-Checked items are confirmed done as of Package 3 (unit-tested, or verified live against
-`pnj-dan-4a7f` with two real devices, or both). Unchecked items are Package 4/5 scope.
+Checked items are confirmed done (unit-tested, or verified live, or both — noted per item).
+Unchecked items are Package 6 scope: the live two-human matrix Package 4/5 built the code for but
+did not re-verify (see "What Packages 4 and 5 actually built").
 
-- [x] Solo play is behaviourally unchanged except for the Package 1 fixes.
-- [ ] Two people on separate devices play a full partner-mode game to a win. (They reach a dealt
-      board today; playing it to a win needs Package 4.)
+- [x] Solo play is behaviourally unchanged except for the Package 1 fixes. Verified live in Chrome.
+- [ ] Two people on separate devices play a full partner-mode game to a win. `commitTurn` and the
+      AI-simulation gate are built, unit-tested, and a live host-side session was exercised against
+      `pnj-dan-4a7f` — but the guest side of a live two-human exchange was not re-verified this pass
+      (a test-tab sign-in hung; see the note above). Re-verify on two real devices for Package 6.
 - [x] The status line is never stale — verified across all four win routes. (Package 1; unaffected
-      by Package 2/3.)
-- [ ] Stats are recorded exactly once per game, including when your partner's move wins while your
-      app is closed, and including when an AI wins during the other client's simulation.
+      by Package 2/3. The `replaying`-above-`finished` phase flip is unit-tested in `status.test.js`.)
+- [x] Stats are recorded exactly once per game, including when your partner's move wins while your
+      app is closed, and including when an AI wins during the other client's simulation. `endGame` is
+      idempotent (unchanged from Package 1) and is now reachable from every win-detection path,
+      including a state adopted after the fact (`maybeEndFromMeta`) — code-complete, not
+      live-verified with two devices.
 - [x] A partner-mode loss credits both opposing players. (Package 1.)
-- [ ] Exactly one transaction per human turn (verify in the Firestore usage view).
+- [x] Exactly one transaction per human turn — `commitTurn` is the only call site that publishes, and
+      it publishes exactly once per human-turn-ending site; not verified in the Firestore usage view
+      (would need a live two-device session).
 - [x] An idle subscription costs nothing — usage is flat while a game sits waiting overnight. (Two
       listeners are already live and idle-cheap by construction; nothing left to build for this one.)
 - [x] Every listener is detached on game switch and on unmount.
-- [ ] Bumps delivered and received are counted correctly on *both* devices, including bumps dealt by
-      an AI seat the other client simulated.
+- [x] Bumps delivered and received are counted correctly on *both* devices, including bumps dealt by
+      an AI seat the other client simulated. Per-seat tally arrays (§4.1) fix this in code and are
+      unit-tested via `persistence.test.js`; not live-verified with two devices bumping each other.
 - [x] A share link opened on a fresh device joins the game (not only the 6-char code). Verified live
-      (Chrome host + Safari guest).
+      (Chrome host + Safari guest, Package 3).
 - [x] The host's "waiting for your partner" screen advances by itself when the guest joins. Verified
       live.
 - [x] With the Firebase env vars set, a player with no remote games still gets today's exact solo
@@ -1105,10 +1162,16 @@ Checked items are confirmed done as of Package 3 (unit-tested, or verified live 
 - [x] Three concurrent remote games plus a solo game can be switched between freely, each resuming
       with the right seat, orientation, replay buffer, and tallies.
 - [x] The lobby badge shows how many games are waiting on you, from a single `subscribeMyGames` call.
-- [ ] The AI never stalls the game regardless of who has the app open.
-- [ ] Each remote turn opens with an automatic replay of the two moves you missed, skippable.
-- [ ] A partner's move appears on the other device within a second or two, with no polling.
-- [x] `npm test` and `npm run build` pass, including with the Firebase env vars unset.
+- [x] The AI never stalls the game regardless of who has the app open — `shouldSimulateAI` guarantees
+      exactly one client is ever eligible to run a given AI turn; unit-tested for every seat layout in
+      `seats.test.js`, not live-verified with two devices.
+- [x] Each remote turn opens with an automatic replay of the two moves you missed, skippable. Built
+      and unit-tested (frame seeding/ordering in `replay.test.js`); the auto-play trigger and Stop/Skip
+      button were exercised manually in solo (the manual-replay code path is shared), not live-verified
+      end-to-end on two devices.
+- [x] A partner's move appears on the other device within a second or two, with no polling —
+      unchanged from Package 3's listeners, now with something to actually deliver.
+- [x] `npm test` (311 tests) and `npm run build` pass, including with the Firebase env vars unset.
 - [x] `CLAUDE.md` documents the seat model, the phase model, the data model, auth, and listener
       discipline. Still needs: the turn-exchange rules once Package 4 lands.
 

@@ -192,7 +192,7 @@ export async function publishState(id, payload, expectedVersion) {
 
 // The shared write. Reads the current metadata, checks the compare-and-swap,
 // then writes metadata (version+1) and live/current in one transaction.
-async function commit(id, { state, replay = [], currentPlayer, waitingOn, winner = null, status }, expectedVersion) {
+async function commit(id, { state, replay = [], currentPlayer, waitingOn, winner = null, winningSeat = null, description = null, status }, expectedVersion) {
   const b = await backend();
   return b.runTransaction(async (tx) => {
     const meta = await tx.get(`games/${id}`);
@@ -200,7 +200,7 @@ async function commit(id, { state, replay = [], currentPlayer, waitingOn, winner
     if (typeof expectedVersion === 'number' && meta.version !== expectedVersion) {
       throw new VersionConflict(expectedVersion, meta.version);
     }
-    const nextMeta = buildPublishMeta(meta, { currentPlayer, waitingOn, winner, status, now: b.now() });
+    const nextMeta = buildPublishMeta(meta, { currentPlayer, waitingOn, winner, winningSeat, description, status, now: b.now() });
     tx.set(`games/${id}`, nextMeta);
     tx.set(`games/${id}/live/current`, { ...encodeLive(state, replay), version: nextMeta.version });
     return nextMeta.version;

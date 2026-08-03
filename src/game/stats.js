@@ -200,9 +200,14 @@ export function recordGame(stats, result) {
     }
   }
 
-  const bucket = startMode === 'random' ? next.randomFirst : next.chosenFirst;
-  bucket.games += 1;
-  if (won) bucket.wins += 1;
+  // A remote game passes `startMode: null` (host-only concept — the guest
+  // never chose, and the host's remote deal doesn't offer the spinner either),
+  // so it counts toward neither bucket rather than defaulting into "chosen".
+  if (startMode === 'chosen' || startMode === 'random') {
+    const bucket = startMode === 'random' ? next.randomFirst : next.chosenFirst;
+    bucket.games += 1;
+    if (won) bucket.wins += 1;
+  }
 
   const modeBucket = mode === 'partners' ? next.partnerGames : next.soloGames;
   modeBucket.games += 1;

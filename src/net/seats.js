@@ -102,3 +102,15 @@ export function nextHumanSeat(from, seatOwners) {
   }
   return from;
 }
+
+// §4.2's AI-simulation gate, as one predicate: run the AI seat at
+// `currentPlayer` forward only when the run of AI seats starting there
+// terminates at one of THIS client's own seats. Exactly one client is ever
+// eligible for a given AI turn, which is what stops two devices from both
+// simulating the same move (and double-billing Firestore / double-counting
+// stats — see the risk table in the plan). In solo every chain leads back to
+// seat 0, so this is always true there; that invariant is exactly what keeps
+// solo behaviour unchanged.
+export function shouldSimulateAI(currentPlayer, seatOwners) {
+  return isMySeat(seatOwners, nextHumanSeat(currentPlayer, seatOwners));
+}

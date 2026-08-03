@@ -38,11 +38,10 @@ const sampleState = (over = {}) => ({
   splitCard: { rank: '7', suit: '♥', id: '7♥0' },
   splitPegIndex: 1,
   lastMoves: ['moved', null, null, null],
-  moveHistory: [],
   turns: 5,
-  jokersPlayed: 1,
-  bumpsDelivered: 2,
-  timesBumped: 0,
+  jokersPlayed: [1, 0, 0, 0],
+  bumpsDelivered: [2, 0, 0, 0],
+  timesBumped: [0, 0, 0, 0],
   startMode: 'random',
   ...over,
 });
@@ -57,11 +56,13 @@ describe('serializeGame', () => {
     expect(snap.splitCard.id).toBe('7♥0');
     expect(snap.tallies).toEqual({
       turns: 5,
-      jokersPlayed: 1,
-      bumpsDelivered: 2,
-      timesBumped: 0,
+      jokersPlayed: [1, 0, 0, 0],
+      bumpsDelivered: [2, 0, 0, 0],
+      timesBumped: [0, 0, 0, 0],
       startMode: 'random',
     });
+    // `moveHistory` is write-only dead state and is not part of the snapshot.
+    expect(snap.moveHistory).toBeUndefined();
   });
 
   it('fills sane defaults for optional fields', () => {
@@ -77,6 +78,21 @@ describe('serializeGame', () => {
     expect(snap.splitCard).toBeNull();
     expect(snap.lastMoves).toEqual([null, null, null, null]);
     expect(snap.tallies.startMode).toBe('chosen');
+    expect(snap.tallies.jokersPlayed).toEqual([0, 0, 0, 0]);
+    expect(snap.tallies.bumpsDelivered).toEqual([0, 0, 0, 0]);
+    expect(snap.tallies.timesBumped).toEqual([0, 0, 0, 0]);
+  });
+
+  it('normalizes a legacy single-number tally onto seat 0 (old solo saves)', () => {
+    const snap = serializeGame(sampleState({ jokersPlayed: 3, bumpsDelivered: 1, timesBumped: 2 }));
+    expect(snap.tallies.jokersPlayed).toEqual([3, 0, 0, 0]);
+    expect(snap.tallies.bumpsDelivered).toEqual([1, 0, 0, 0]);
+    expect(snap.tallies.timesBumped).toEqual([2, 0, 0, 0]);
+  });
+
+  it('a remote deal passes startMode: null so it counts toward neither stat bucket', () => {
+    const snap = serializeGame(sampleState({ startMode: null }));
+    expect(snap.tallies.startMode).toBeNull();
   });
 });
 

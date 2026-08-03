@@ -9,6 +9,7 @@ import {
   visualSideFor,
   seatAtVisualSide,
   nextHumanSeat,
+  shouldSimulateAI,
 } from './seats.js';
 
 const SOLO = SOLO_SEAT_OWNERS;
@@ -143,6 +144,43 @@ describe('nextHumanSeat', () => {
   it('in solo, every seat leads back to seat 0', () => {
     for (const from of [0, 1, 2, 3]) {
       expect(nextHumanSeat(from, SOLO_SEAT_OWNERS)).toBe(0);
+    }
+  });
+});
+
+describe('shouldSimulateAI — §4.2 gate', () => {
+  const HOST = ['me', 'ai', 'them', 'ai'];
+  const GUEST = ['them', 'ai', 'me', 'ai'];
+
+  it('solo: always true, for every currentPlayer — the invariant that keeps solo unchanged', () => {
+    for (const cp of [0, 1, 2, 3]) {
+      expect(shouldSimulateAI(cp, SOLO_SEAT_OWNERS)).toBe(true);
+    }
+  });
+
+  it('host runs Blue (seat 1) only when the chain leads back to the host (never — it leads to the guest)', () => {
+    expect(shouldSimulateAI(1, HOST)).toBe(false);
+  });
+
+  it('guest runs Blue (seat 1), since nextHumanSeat(1) = 2 = their own seat', () => {
+    expect(shouldSimulateAI(1, GUEST)).toBe(true);
+  });
+
+  it('symmetrically for Green (seat 3): the host runs it, the guest does not', () => {
+    expect(shouldSimulateAI(3, HOST)).toBe(true);
+    expect(shouldSimulateAI(3, GUEST)).toBe(false);
+  });
+
+  it('never true for a seat owned by the other human ("them")', () => {
+    expect(shouldSimulateAI(2, HOST)).toBe(false); // seat 2 is the guest's own turn
+    expect(shouldSimulateAI(0, GUEST)).toBe(false); // seat 0 is the host's own turn
+  });
+
+  it('exactly one of host/guest is eligible for any given AI seat — never both, never neither', () => {
+    for (const cp of [1, 3]) {
+      const hostRuns = shouldSimulateAI(cp, HOST);
+      const guestRuns = shouldSimulateAI(cp, GUEST);
+      expect(hostRuns).toBe(!guestRuns);
     }
   });
 });

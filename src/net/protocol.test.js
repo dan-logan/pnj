@@ -74,6 +74,23 @@ describe('buildPublishMeta — mirrors publish rule (b)', () => {
     expect(next.version).toBe(1);
     expect(next.status).toBe(STATUS.ACTIVE);
   });
+
+  it('carries who made the winning move and what it was', () => {
+    // The shared state blob has no `winner` field of its own (see session.js),
+    // so this is the only place that rides the wire — it's what lets the
+    // client that never saw the move happen show it in the end-of-game overlay.
+    const next = buildPublishMeta(active, {
+      currentPlayer: 2, waitingOn: 0, winner: 0, winningSeat: 0, description: 'Ace out', now: NOW,
+    });
+    expect(next.winningSeat).toBe(0);
+    expect(next.description).toBe('Ace out');
+  });
+
+  it('defaults winningSeat/description to null', () => {
+    const next = buildPublishMeta(active, { currentPlayer: 1, waitingOn: 2, now: NOW });
+    expect(next.winningSeat).toBeNull();
+    expect(next.description).toBeNull();
+  });
 });
 
 describe('isEcho — ignore your own write coming back', () => {
