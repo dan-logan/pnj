@@ -88,18 +88,27 @@ run_ok_if_exists "Firestore database may already exist" \
 # --- 4. Anonymous authentication --------------------------------------------
 #
 # Enabling a sign-in provider is a config PATCH on the Identity Toolkit admin
-# API — no console click required. Endpoint and body verified current.
+# API — no console click required, in principle. The `x-goog-user-project`
+# header is required: without it, a plain `gcloud auth print-access-token`
+# bearer token is rejected with a 403 SERVICE_DISABLED ("no quota project set"),
+# which looks nothing like the CONFIGURATION_NOT_FOUND case below and will
+# silently masquerade as success if you only grep for that string. Learned the
+# hard way — don't drop this header.
 #
-# Caveat (unverifiable without a live project): on a brand-new project whose Auth
-# config has never been initialised, this can return CONFIGURATION_NOT_FOUND. If
-# it does, open the Firebase console once — Build > Authentication > Get started —
-# then re-run this script. That initialises the config; the PATCH then succeeds
-# and stays idempotent.
+# Real caveat, confirmed against a live project: on a brand-new project whose
+# Auth config has never been initialised, this returns CONFIGURATION_NOT_FOUND.
+# There is no API-only fix — `identitytoolkit.googleapis.com/v2/.../identityPlatform:initializeAuth`
+# looks like the answer but is the PAID Identity Platform upgrade and demands
+# billing; it is not what a free anonymous-auth project needs. The actual fix is
+# a one-time console visit: Build > Authentication > Get started. That
+# provisions the free config with no billing involved. This script detects the
+# failure and tells you to do that, then re-run.
 echo "==> Enabling Anonymous auth"
 ACCESS_TOKEN="$(gcloud auth print-access-token)"
 HTTP_BODY="$(curl -sS -X PATCH \
   "https://identitytoolkit.googleapis.com/admin/v2/projects/$PROJECT_ID/config?updateMask=signIn.anonymous.enabled" \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "x-goog-user-project: $PROJECT_ID" \
   -H "Content-Type: application/json" \
   -d '{"signIn":{"anonymous":{"enabled":true}}}')" || true
 if echo "$HTTP_BODY" | grep -q 'CONFIGURATION_NOT_FOUND'; then
@@ -108,7 +117,12 @@ if echo "$HTTP_BODY" | grep -q 'CONFIGURATION_NOT_FOUND'; then
   echo "    click 'Get started', then re-run this script."
   fail "Anonymous auth not enabled (see message above)."
 fi
-echo "    Anonymous auth enabled."
+if ! echo "$HTTP_BODY" | grep -q '"enabled": *true'; then
+  echo "    Unexpected response from the anonymous-auth PATCH:"
+  echo "$HTTP_BODY" | sed 's/^/      /'
+  fail "Anonymous auth not confirmed enabled — see response above."
+fi
+echo "    Anonymous auth enabled (confirmed)."
 
 # --- 5. Web app + the four config values ------------------------------------
 
