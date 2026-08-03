@@ -38,11 +38,10 @@ const sampleState = (over = {}) => ({
   splitCard: { rank: '7', suit: '♥', id: '7♥0' },
   splitPegIndex: 1,
   lastMoves: ['moved', null, null, null],
-  moveHistory: [],
   turns: 5,
-  jokersPlayed: 1,
-  bumpsDelivered: 2,
-  timesBumped: 0,
+  jokersPlayed: [1, 0, 0, 0],
+  bumpsDelivered: [2, 0, 0, 0],
+  timesBumped: [0, 0, 0, 0],
   startMode: 'random',
   ...over,
 });
@@ -57,11 +56,13 @@ describe('serializeGame', () => {
     expect(snap.splitCard.id).toBe('7♥0');
     expect(snap.tallies).toEqual({
       turns: 5,
-      jokersPlayed: 1,
-      bumpsDelivered: 2,
-      timesBumped: 0,
+      jokersPlayed: [1, 0, 0, 0],
+      bumpsDelivered: [2, 0, 0, 0],
+      timesBumped: [0, 0, 0, 0],
       startMode: 'random',
     });
+    // `moveHistory` is write-only dead state and is not part of the snapshot.
+    expect(snap.moveHistory).toBeUndefined();
   });
 
   it('fills sane defaults for optional fields', () => {
@@ -77,6 +78,21 @@ describe('serializeGame', () => {
     expect(snap.splitCard).toBeNull();
     expect(snap.lastMoves).toEqual([null, null, null, null]);
     expect(snap.tallies.startMode).toBe('chosen');
+    expect(snap.tallies.jokersPlayed).toEqual([0, 0, 0, 0]);
+    expect(snap.tallies.bumpsDelivered).toEqual([0, 0, 0, 0]);
+    expect(snap.tallies.timesBumped).toEqual([0, 0, 0, 0]);
+  });
+
+  it('normalizes a legacy single-number tally onto seat 0 (old solo saves)', () => {
+    const snap = serializeGame(sampleState({ jokersPlayed: 3, bumpsDelivered: 1, timesBumped: 2 }));
+    expect(snap.tallies.jokersPlayed).toEqual([3, 0, 0, 0]);
+    expect(snap.tallies.bumpsDelivered).toEqual([1, 0, 0, 0]);
+    expect(snap.tallies.timesBumped).toEqual([2, 0, 0, 0]);
+  });
+
+  it('a remote deal passes startMode: null so it counts toward neither stat bucket', () => {
+    const snap = serializeGame(sampleState({ startMode: null }));
+    expect(snap.tallies.startMode).toBeNull();
   });
 });
 
@@ -153,5 +169,23 @@ describe('save/load/clear round-trip', () => {
     expect(() => saveGame(sampleState(), null)).not.toThrow();
     expect(loadGame(null)).toBeNull();
     expect(() => clearGame(null)).not.toThrow();
+  });
+});
+
+describe('game identity', () => {
+  it('round-trips the game id so a resumed game keeps its identity', () => {
+    // The id is what makes stats recording idempotent: resuming a game and
+    // finishing it must not record a second result for the same game.
+    const snap = serializeGame({ ...sampleState(), gameId: 'abc-123' });
+    expect(snap.gameId).toBe('abc-123');
+    const store = memoryStorage();
+    saveGame({ ...sampleState(), gameId: 'abc-123' }, store);
+    expect(loadGame(store).gameId).toBe('abc-123');
+  });
+
+  it('leaves the id null for a save made without one', () => {
+    // Saves written before game ids existed still load; the app mints a fresh
+    // id for them on resume.
+    expect(serializeGame(sampleState()).gameId).toBeNull();
   });
 });

@@ -29,16 +29,60 @@ import {
 import { findBestAIMove } from './game/ai.js';
 import {
   loadStats,
-  saveStats,
   resetStats,
-  recordGame,
+  recordFinishedGame,
+  newGameId,
+  didIWin,
   winRate,
   averageTurns,
   bucketWinRate,
   formatStreak,
   getNemesis
 } from './game/stats.js';
-import { loadGame, saveGame, clearGame } from './game/persistence.js';
+import { loadGame, saveGame, clearGame, serializeGame } from './game/persistence.js';
+import { PHASES, derivePhase, describeStatus, describeOutcome, attributeFrameDescription } from './game/status.js';
+import {
+  SOLO_SEAT_OWNERS,
+  HOST_SEAT_OWNERS,
+  remoteSeatOwners,
+  mySeatsOf,
+  primarySeat,
+  isMyTurnFor,
+  isAISeat,
+  nextHumanSeat,
+  shouldSimulateAI,
+  visualSideFor,
+  seatAtVisualSide,
+} from './net/seats.js';
+import { seedReplay, appendReplayFrame } from './net/replay.js';
+import {
+  isMultiplayerConfigured,
+  signIn,
+  createGame,
+  joinGame,
+  joinGameById,
+  fetchGame,
+  startGame,
+  publishState,
+  VersionConflict,
+  subscribeGameMeta,
+  subscribeGameState,
+  subscribeMyGames,
+} from './net/session.js';
+import { STATUS, HOST_SEAT, GUEST_SEAT } from './net/protocol.js';
+import {
+  loadLocalGames,
+  hasLocalGames,
+  upsertLocalGame,
+  archiveLocalGame,
+  setActiveId,
+} from './net/localSession.js';
+import {
+  buildRemoteRows,
+  countWaitingOnMe,
+  relativeTime,
+  seatForUid,
+} from './net/lobby.js';
 import InstallPrompt from './InstallPrompt.jsx';
 import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
 
@@ -50,6 +94,41 @@ const REPLAY_FRAME_PAUSE_MS = 600; // pause after each move before the next one
 
 export default function PegsAndJokers() {
   const [gameMode, setGameMode] = useState(GAME_MODES.CLASSIC);
+
+  // Who owns each seat from THIS client's point of view. Solo is the layout
+  // where seat 0 is the only non-AI seat; remote play swaps one AI seat for
+  // 'them' and (for the guest) moves 'me' to seat 2. Nothing below may assume
+  // "the local human is player 0" — derive from here instead.
+  const [seatOwners, setSeatOwners] = useState(SOLO_SEAT_OWNERS);
+  const mySeats = useMemo(() => mySeatsOf(seatOwners), [seatOwners]);
+  const mySeat = useMemo(() => primarySeat(seatOwners), [seatOwners]);
+  const ownsSeat = useCallback((player) => mySeats.includes(player), [mySeats]);
+
+  // --- Remote play (Packages 2/3) ---------------------------------------------
+  // All of this is inert for a solo player: with no Firebase config or no remote
+  // games on the device, nothing here signs in or loads the Firestore SDK, and
+  // none of the UI renders. `session` is null for the solo game and holds
+  // { id, seat, version } for an open remote game — the server row is that game's
+  // save, so the local-save effect skips while it is set.
+  const multiplayerConfigured = isMultiplayerConfigured();
+  const [myUid, setMyUid] = useState(null);
+  const [session, setSession] = useState(null);
+  const sessionRef = useRef(null); // mirror for use inside async listeners
+  const [showLobby, setShowLobby] = useState(false);
+  const [remoteMeta, setRemoteMeta] = useState([]); // metadata rows from subscribeMyGames
+  const [openMeta, setOpenMeta] = useState(null); // metadata of the open remote game
+  const [mpScreen, setMpScreen] = useState(null); // null | 'menu' | 'hosting' | 'join'
+  const [hostInfo, setHostInfo] = useState(null); // { id, code, link } while waiting for a guest
+  const [joinInput, setJoinInput] = useState('');
+  const [labelInput, setLabelInput] = useState('');
+  const [mpNotice, setMpNotice] = useState(null);
+  const [mpBusy, setMpBusy] = useState(false);
+  const myGamesUnsubRef = useRef(null);
+  const gameMetaUnsubRef = useRef(null);
+  const gameStateUnsubRef = useRef(null);
+  const hostDealtRef = useRef(false); // guard the deal-on-guest-join from firing twice
+  const bootstrappedRef = useRef(false); // one-time mount routing
+
   const [deck, setDeck] = useState([]);
   const [discardPiles, setDiscardPiles] = useState([[], [], [], []]); // Per-player discard piles
   const [stuckCounts, setStuckCounts] = useState([0, 0, 0, 0]); // Track stuck discards per player
@@ -69,11 +148,23 @@ export default function PegsAndJokers() {
   const [jokerMode, setJokerMode] = useState(false); // true when waiting for target selection
   const [jokerSourcePeg, setJokerSourcePeg] = useState(null); // which of player's pegs to move
   const [discardMode, setDiscardMode] = useState(false); // true when player is selecting a card to discard
-  const [gameMessage, setGameMessage] = useState('Your turn! Select a card and peg to move.');
+  // Transient feedback only — "Invalid move. Try again." The *status* is
+  // derived (see `phase` / `statusLine` below) and is never set imperatively.
+  const [notice, setNotice] = useState(null);
   const [winner, setWinner] = useState(null);
-  const [moveHistory, setMoveHistory] = useState([]);
+  // What the game ended on, for the end-of-game overlay: who made the winning
+  // move and what it was. Remotely this can be a move you never saw.
+  const [endInfo, setEndInfo] = useState(null);
+  // The overlay covers the board, so it can be dismissed to inspect the final
+  // position and reopened from the status line.
+  const [endOverlayDismissed, setEndOverlayDismissed] = useState(false);
   const [lastMoves, setLastMoves] = useState([null, null, null, null]); // Last move description per player
+
+  // Replaces every `currentPlayer === 0` turn gate in the component.
+  const isMyTurn = isMyTurnFor(seatOwners, currentPlayer);
+
   const aiProcessingRef = useRef(false); // Prevent AI from running twice on same turn
+  const aiTimerRef = useRef(null); // the AI's "thinking" timeout, so endGame can cancel it
   const prevPlayerRef = useRef(null); // Detect the turn passing back to the human
 
   // Animation state
@@ -90,13 +181,28 @@ export default function PegsAndJokers() {
 
   // Per-game tallies, folded into stats when the game ends. Refs so updating
   // them mid-turn never triggers a re-render.
-  const turnsRef = useRef(0); // completed player turns (transitions)
-  const prevTurnPlayerRef = useRef(null);
-  const jokersThisGameRef = useRef(0);
-  const bumpsDeliveredThisGameRef = useRef(0);
-  const timesBumpedThisGameRef = useRef(0);
-  const startModeRef = useRef('chosen'); // 'chosen' | 'random'
-  const gameRecordedRef = useRef(false); // guard against double-recording a win
+  //
+  // `turnsRef` is a plain shared counter, incremented once per seat that
+  // actually moves (Package 4's turn-counter fix) — directly at each site that
+  // ends a turn, not by watching `currentPlayer` for a transition. The old
+  // transition-watching effect miscounted the moment a remote state could jump
+  // `currentPlayer` by more than one seat in a single adopt (and counted
+  // differently on each client, since each only sees its own transitions).
+  //
+  // jokersPlayed/bumpsDelivered/timesBumped are per-seat arrays [n0,n1,n2,n3],
+  // not personal totals — see the comment on serializeGame's tallies in
+  // persistence.js for why. Whichever client actually simulates a seat's move
+  // records it at that seat's index; stats-record time sums over `mySeats`.
+  const turnsRef = useRef(0);
+  const jokersPlayedRef = useRef([0, 0, 0, 0]);
+  const bumpsDeliveredRef = useRef([0, 0, 0, 0]);
+  const timesBumpedRef = useRef([0, 0, 0, 0]);
+  const startModeRef = useRef('chosen'); // 'chosen' | 'random' | null (remote)
+  // Every game has an id (a fresh uuid locally, the server row id remotely).
+  // Stats are recorded against it, so a game can only ever be counted once
+  // however many times its end is observed.
+  const gameIdRef = useRef(null);
+  const endedRef = useRef(false); // guard against a second terminal transition
 
   // Bump fly-back animation: { player, pegIndex, from: {x,y}, to: {x,y}, progress: 0-1 }
   const [bumpFx, setBumpFx] = useState(null);
@@ -109,17 +215,46 @@ export default function PegsAndJokers() {
   const [replayInfo, setReplayInfo] = useState(null); // { player, description, index, total }
   const [replayReady, setReplayReady] = useState(0);
   const replayLogRef = useRef([]);        // recorded frames for the current round
+  // Frames THIS client has itself simulated since it last adopted a wire seed
+  // — a subset of replayLogRef, which also holds the seed (the frames adopted
+  // from the wire). Publishing must use only this: the seed is always the
+  // *recipient's own earlier move(s)*, since with exactly two humans strictly
+  // alternating publishes, whoever I'm about to publish to is exactly whoever
+  // my current seed originated from. Reusing replayLogRef (seed + own) for the
+  // wire re-forwards the recipient's own move back to them, and the next hop
+  // does it again — the buffer grows every round and eventually "replays the
+  // whole game". See commitTurn.
+  const replayOwnRef = useRef([]);
   const replayCancelRef = useRef(false);  // set to abort an in-flight replay
   const replaySegTimerRef = useRef(null); // per-step interval
   const replayFrameTimerRef = useRef(null); // between-frame / lead-in timeout
   const replayRestoreRef = useRef(null);  // true current board, restored when replay ends
   const replayPrevPlayerRef = useRef(0);  // detect the human handing off to start a fresh round
+  // Package 5: set when a remote state is adopted, so the buffer (wire frames,
+  // then whatever this client simulates locally) auto-plays once it becomes
+  // this client's turn — or once the game ends, if the win happened during
+  // silent AI simulation and control never actually reaches this seat. Cleared
+  // the moment the auto-play effect consumes it.
+  const pendingAutoReplayRef = useRef(false);
 
   // Append an AI move to the replay buffer. Peg snapshots are immutable (the
   // engine never mutates), so storing references is safe.
+  // A reactive mirror of replayLogRef's descriptions, for the text summary
+  // shown in place of auto-play when animations are disabled (§5.2) — the
+  // buffer itself lives in a ref (no re-render on every AI frame), so this is
+  // the one place its contents become visible to render.
+  const [replayDescriptions, setReplayDescriptions] = useState([]);
+
+  // Called only for a move THIS client is simulating (an AI move, or another
+  // seat's stuck discard) — never for this client's own move, which builds a
+  // frame and hands it straight to commitTurn. So every call here is, by
+  // construction, new-since-the-seed: append to both the full display buffer
+  // and the wire-only "own" buffer.
   const recordReplayFrame = useCallback((frame) => {
-    replayLogRef.current = [...replayLogRef.current, frame];
+    replayLogRef.current = appendReplayFrame(replayLogRef.current, frame);
+    replayOwnRef.current = appendReplayFrame(replayOwnRef.current, frame);
     setReplayReady(replayLogRef.current.length);
+    setReplayDescriptions(replayLogRef.current.map(f => ({ player: f.player, description: f.description })));
   }, []);
 
   // Tear down any in-flight replay and empty the buffer (used on new game / load).
@@ -129,7 +264,9 @@ export default function PegsAndJokers() {
     if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
     replayRestoreRef.current = null;
     replayLogRef.current = [];
+    replayOwnRef.current = [];
     setReplayReady(0);
+    setReplayDescriptions([]);
     setReplayInfo(null);
     setIsReplaying(false);
   }, []);
@@ -145,18 +282,83 @@ export default function PegsAndJokers() {
   const [pendingResume, setPendingResume] = useState(null);
   const [showResumeModal, setShowResumeModal] = useState(false);
 
+  // The one terminal transition. Every win-detection site routes through here —
+  // your move, a split that completes the win, an AI move, and later a finished
+  // state arriving over the wire — so a finished game looks the same however it
+  // was observed, and nothing is left running behind it.
+  const endGame = useCallback((winnerIdx, { winningSeat = null, description = null } = {}) => {
+    if (winnerIdx === null || winnerIdx === undefined) return;
+    if (endedRef.current) return; // already terminal
+    endedRef.current = true;
+
+    // 1. Cancel everything pending. A timer that fires after the game ends and
+    //    overwrites the result is the bug this whole package exists to remove.
+    if (animationRef.current) { clearInterval(animationRef.current); animationRef.current = null; }
+    if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
+    if (replaySegTimerRef.current) { clearInterval(replaySegTimerRef.current); replaySegTimerRef.current = null; }
+    if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
+    if (spinIntervalRef.current) { clearInterval(spinIntervalRef.current); spinIntervalRef.current = null; }
+    if (aiTimerRef.current) { clearTimeout(aiTimerRef.current); aiTimerRef.current = null; }
+    replayCancelRef.current = true;
+    aiProcessingRef.current = false;
+    setAnimatingPeg(null);
+    setBumpFx(null);
+    setIsReplaying(false);
+    setReplayInfo(null);
+    setNotice(null);
+    setSelectedCard(null);
+    setSelectedPeg(null);
+    setJokerMode(false);
+    setJokerSourcePeg(null);
+    setDiscardMode(false);
+    // A replay cut short by the end of the game leaves the board rewound.
+    if (replayRestoreRef.current) {
+      setPegs(replayRestoreRef.current);
+      replayRestoreRef.current = null;
+    }
+
+    // 2. The winner. Classic: a player index. Partners: a *team* index.
+    setWinner(winnerIdx);
+
+    // 3. Stats, from the terminal state and keyed by the game id, so it does
+    //    not matter whether this client was watching when the game ended, nor
+    //    whether the winning move was yours, your partner's or an AI's.
+    //    `turnsRef` is incremented directly at each site that ends a turn
+    //    (including the winning move itself), so it needs no "+1" here.
+    //    jokersPlayed/bumpsDelivered/timesBumped are per-seat arrays; sum only
+    //    the seats this client controls to get "my" lifetime tallies.
+    const sumMine = (perSeat) => mySeats.reduce((n, s) => n + (perSeat[s] || 0), 0);
+    const tallies = {
+      turns: turnsRef.current,
+      jokersPlayed: sumMine(jokersPlayedRef.current),
+      bumpsDelivered: sumMine(bumpsDeliveredRef.current),
+      timesBumped: sumMine(timesBumpedRef.current),
+    };
+    const { stats: updated } = recordFinishedGame(gameIdRef.current, {
+      won: didIWin(winnerIdx, gameMode, mySeats),
+      winner: winnerIdx,
+      mySeats,
+      startMode: startModeRef.current,
+      mode: gameMode,
+      ...tallies,
+    });
+    setStats(updated);
+    setEndInfo({ winner: winnerIdx, winningSeat, description, ...tallies });
+    setEndOverlayDismissed(false);
+  }, [gameMode, mySeats]);
+
   // In partner mode, once your own pegs are all home you play your hand on your
-  // partner's pegs; otherwise you always control your own (player 0). This is the
-  // "owner" of the pegs the human moves this turn.
+  // partner's pegs; otherwise you always control your own seat's pegs. This is
+  // the "owner" of the pegs you move this turn.
   const controlledOwnerFor = useCallback((pegState) => (
-    gameMode === GAME_MODES.PARTNERS && pegState[0].every(p => p.location === 'home')
-      ? getPartner(0)
-      : 0
-  ), [gameMode]);
+    gameMode === GAME_MODES.PARTNERS && pegState[mySeat].every(p => p.location === 'home')
+      ? getPartner(mySeat)
+      : mySeat
+  ), [gameMode, mySeat]);
 
   // Options threaded into the engine so it applies the partner friendly-bump rule
-  // (the human always acts as player 0).
-  const moveOptions = useMemo(() => ({ actor: 0, mode: gameMode }), [gameMode]);
+  // (you always act as your own seat).
+  const moveOptions = useMemo(() => ({ actor: mySeat, mode: gameMode }), [mySeat, gameMode]);
 
   const startGameWithPlayer = useCallback((firstPlayer) => {
     const newDeck = createDeck();
@@ -180,9 +382,8 @@ export default function PegsAndJokers() {
     setJokerMode(false);
     setJokerSourcePeg(null);
     setDiscardMode(false);
-    setGameMessage(firstPlayer === 0 ? 'Your turn! Select a card and peg to move.' : `${PLAYER_NAMES[firstPlayer]} is thinking...`);
+    setNotice(null);
     setWinner(null);
-    setMoveHistory([]);
     setLastMoves([null, null, null, null]);
     aiProcessingRef.current = false;
     setAnimatingPeg(null);
@@ -197,24 +398,26 @@ export default function PegsAndJokers() {
     }
     resetReplay();
     replayPrevPlayerRef.current = firstPlayer;
-    // Reset per-game stat tallies for the new game. Seed the turn tracker to the
-    // first player (not null) so the very first hand-off is counted — otherwise a
-    // game the first player wins is under-counted by one turn. (applySavedGame
-    // seeds it the same way when resuming.)
+    pendingAutoReplayRef.current = false;
+    // Reset per-game stat tallies for the new game. `turnsRef` starts at 0 —
+    // it is now incremented directly at each site a turn ends (including the
+    // winning move), not inferred from a currentPlayer transition.
     turnsRef.current = 0;
-    prevTurnPlayerRef.current = firstPlayer;
-    jokersThisGameRef.current = 0;
-    bumpsDeliveredThisGameRef.current = 0;
-    timesBumpedThisGameRef.current = 0;
-    gameRecordedRef.current = false;
+    jokersPlayedRef.current = [0, 0, 0, 0];
+    bumpsDeliveredRef.current = [0, 0, 0, 0];
+    timesBumpedRef.current = [0, 0, 0, 0];
+    gameIdRef.current = newGameId();
+    endedRef.current = false;
+    setEndInfo(null);
+    setEndOverlayDismissed(false);
     setShowFirstPlayerModal(false);
-  }, [resetReplay]);
+  }, [resetReplay, ownsSeat]);
 
   const handleGoFirst = useCallback(() => {
     unlockAudio();
     startModeRef.current = 'chosen';
-    startGameWithPlayer(0);
-  }, [startGameWithPlayer]);
+    startGameWithPlayer(mySeat);
+  }, [startGameWithPlayer, mySeat]);
 
   const handleRandomFirst = useCallback(() => {
     unlockAudio();
@@ -293,7 +496,6 @@ export default function PegsAndJokers() {
     setSplitOwner(saved.splitOwner ?? null);
     setSplitUndo(null); // no undo snapshot survives a save/resume
     setLastMoves(saved.lastMoves ?? [null, null, null, null]);
-    setMoveHistory(saved.moveHistory ?? []);
 
     // Clear transient selection/interaction state.
     setSelectedCard(null);
@@ -305,45 +507,452 @@ export default function PegsAndJokers() {
     setBumpFx(null);
 
     // Restore per-game stat tallies so a resumed game still records correctly.
+    // jokersPlayed/bumpsDelivered/timesBumped are per-seat arrays on the wire;
+    // coerce a legacy single-number tally (an old local save) onto seat 0.
+    const toPerSeat = (v) => (Array.isArray(v) ? [v[0] ?? 0, v[1] ?? 0, v[2] ?? 0, v[3] ?? 0] : [v ?? 0, 0, 0, 0]);
     const t = saved.tallies || {};
     turnsRef.current = t.turns ?? 0;
-    jokersThisGameRef.current = t.jokersPlayed ?? 0;
-    bumpsDeliveredThisGameRef.current = t.bumpsDelivered ?? 0;
-    timesBumpedThisGameRef.current = t.timesBumped ?? 0;
-    startModeRef.current = t.startMode ?? 'chosen';
-    gameRecordedRef.current = false;
+    jokersPlayedRef.current = toPerSeat(t.jokersPlayed);
+    bumpsDeliveredRef.current = toPerSeat(t.bumpsDelivered);
+    timesBumpedRef.current = toPerSeat(t.timesBumped);
+    // A legacy save with no startMode at all defaults to 'chosen'; an explicit
+    // `null` (a remote game) must stay null, not fall back — `??` would treat
+    // both the same, which is exactly the bug this distinction exists to avoid.
+    startModeRef.current = t.startMode === undefined ? 'chosen' : t.startMode;
+    // Keep the saved game's identity so resuming it cannot record it twice.
+    gameIdRef.current = saved.gameId ?? newGameId();
+    endedRef.current = false;
+    setEndInfo(null);
+    setEndOverlayDismissed(false);
 
-    // Seed the turn/return trackers to the restored player so resuming doesn't
-    // count a spurious turn or fire a "your turn" chime.
-    prevTurnPlayerRef.current = saved.currentPlayer;
+    // Seed the turn-return tracker to the restored player so resuming doesn't
+    // fire a spurious "your turn" chime.
     prevPlayerRef.current = saved.currentPlayer;
     aiProcessingRef.current = false;
 
-    // No replay is available for a freshly resumed game until a new AI round runs.
+    // No replay is available for a freshly resumed game until a new AI round
+    // runs (or, remotely, handleRemoteState seeds one right after this call).
     resetReplay();
     replayPrevPlayerRef.current = saved.currentPlayer;
+    pendingAutoReplayRef.current = false;
 
-    setGameMessage(
-      saved.currentPlayer === 0
-        ? 'Welcome back! Your turn — select a card and peg to move.'
-        : `${PLAYER_NAMES[saved.currentPlayer]} is thinking...`
-    );
+    setNotice(null);
 
     setPendingResume(null);
     setShowResumeModal(false);
     setShowFirstPlayerModal(false);
-  }, [resetReplay]);
+  }, [resetReplay, ownsSeat]);
 
-  // On mount, offer to resume a saved game if one exists; otherwise start fresh.
+  // --- Remote play: sessions, listeners, create/join, switching ---------------
+  //
+  // The discipline that used to be "clear the interval" is now "detach the
+  // listener" (a leaked listener costs money). Every path that changes the open
+  // game — switching, joining, unmount — goes through detachGameListeners first.
+
+  // Keep the ref in step with the state so async listeners always see the game
+  // that is actually open, not the one that was open when they were created.
+  const setActiveSession = useCallback((next) => {
+    sessionRef.current = next;
+    setSession(next);
+  }, []);
+
+  const detachGameListeners = useCallback(() => {
+    if (gameMetaUnsubRef.current) { gameMetaUnsubRef.current(); gameMetaUnsubRef.current = null; }
+    if (gameStateUnsubRef.current) { gameStateUnsubRef.current(); gameStateUnsubRef.current = null; }
+  }, []);
+
+  // Publish exactly once, at the end of a human turn (§4.1) — the only call
+  // site any of executeMove/completeSplit/discardAndDraw's human
+  // branch/handleJokerTarget should ever reach for a remote publish. No-op in
+  // solo (sessionRef.current is null there).
+  //
+  // Component state setters are async, so `snapshot` must be the fresh values
+  // the call site just computed (its local `newPegs`/`newHands`/...), never
+  // the stale `pegs`/`hands`/... closures — those still hold last render's
+  // values at the moment a handler runs. A half-finished split never crosses
+  // the wire (§4.1's "consequence worth knowing"): splitRemaining/splitCard/
+  // splitPegIndex/splitOwner always publish as cleared, so a disconnect
+  // mid-split just restarts the turn from the pre-split state.
+  //
+  // `frame` is this client's own move, described the same way an AI move is
+  // (§5.3's frame shape) — it rides the wire appended after whatever this
+  // client already had buffered (the AI moves it simulated since its last
+  // turn; see the reset-on-handoff effect below), so the receiving client
+  // replays everything that happened, in order (`seedReplay`/
+  // `appendReplayFrame` in net/replay.js).
+  const commitTurn = useCallback(({
+    nextPlayer, pegs: nextPegs, hands: nextHands, deck: nextDeck, discardPiles: nextDiscardPiles,
+    stuckCounts: nextStuckCounts, lastMoves: nextLastMoves, frame = null,
+    winner: winnerIdx = null, winningSeat = null, description = null,
+  }) => {
+    // Advance locally regardless of whether a session is open — this is the
+    // one place every human-turn-end site hands off to the next player.
+    setCurrentPlayer(nextPlayer);
+    const s = sessionRef.current;
+    if (!s) return; // solo — nothing to publish
+    const waitingOn = winnerIdx !== null ? null : nextHumanSeat(nextPlayer, seatOwners);
+    const wireState = serializeGame({
+      gameId: gameIdRef.current,
+      mode: gameMode,
+      pegs: nextPegs,
+      hands: nextHands,
+      deck: nextDeck,
+      discardPiles: nextDiscardPiles,
+      stuckCounts: nextStuckCounts,
+      currentPlayer: nextPlayer,
+      splitRemaining: 0, splitCard: null, splitPegIndex: null, splitOwner: null,
+      lastMoves: nextLastMoves,
+      turns: turnsRef.current,
+      jokersPlayed: jokersPlayedRef.current,
+      bumpsDelivered: bumpsDeliveredRef.current,
+      timesBumped: timesBumpedRef.current,
+      startMode: null, // remote: counts toward neither chosenFirst nor randomFirst
+    });
+    // Use replayOwnRef, not replayLogRef: replayLogRef also holds the seed
+    // (frames adopted from the wire), which is always the recipient's own
+    // earlier move — re-publishing it back to them is the bug that made the
+    // replay grow to "the whole game" over a few rounds. See the comment on
+    // replayOwnRef's declaration.
+    const wireReplay = frame ? appendReplayFrame(replayOwnRef.current, frame) : seedReplay(replayOwnRef.current);
+    publishState(s.id, {
+      state: wireState, replay: wireReplay, currentPlayer: nextPlayer, waitingOn,
+      winner: winnerIdx, winningSeat, description,
+    }, s.version).then((newVersion) => {
+      if (sessionRef.current && sessionRef.current.id === s.id) {
+        setActiveSession({ ...sessionRef.current, version: newVersion });
+      }
+    }).catch((err) => {
+      // The mover already committed locally — a failed publish must never
+      // leave the local board stuck. Non-fatal: the next successful publish,
+      // or re-adopting after a VersionConflict, reconciles it.
+      setMpNotice(
+        err instanceof VersionConflict
+          ? 'Could not sync — reopen this game from My Games to catch up.'
+          : 'Move saved locally, but could not sync to your partner. Check your connection.'
+      );
+    });
+  }, [gameMode, seatOwners, setActiveSession]);
+
+  // The seat + description of the winning move, once the corresponding state
+  // (at the same version) has actually been adopted. Metadata and live/current
+  // are written in one transaction but delivered by two independent listeners,
+  // so a winner can arrive here before its state has landed — wait for the
+  // versions to line up rather than showing a stale board under a win.
+  const maybeEndFromMeta = useCallback((meta) => {
+    if (!meta || meta.winner == null) return;
+    const s = sessionRef.current;
+    if (!s) return;
+    if (typeof meta.version === 'number' && (s.version == null || s.version < meta.version)) return;
+    endGame(meta.winner, { winningSeat: meta.winningSeat ?? null, description: meta.description ?? null });
+  }, [endGame]);
+
+  // The metadata delivered for the open game, mirrored into a ref so
+  // handleRemoteState (a different listener) can check the freshest winner
+  // without waiting for a render.
+  const openMetaRef = useRef(null);
+
+  // Adopt a state snapshot arriving over the wire for the open game. In
+  // Package 3 this is how the guest receives the initial deal; Package 4/5
+  // layer turn exchange, win detection and auto-replay on top of the same
+  // seam. Ignore our own echo.
+  const handleRemoteState = useCallback((id, payload, info) => {
+    const s = sessionRef.current;
+    if (!s || s.id !== id) return; // a stale delivery from a game we left
+    if (!payload || !payload.state) return; // not dealt yet
+    if (info && info.isEcho(s.version)) return; // our own write coming back
+    applySavedGame(payload.state); // resets replayLogRef — seed it back below
+    replayLogRef.current = seedReplay(payload.replay);
+    replayOwnRef.current = []; // the seed is not "own" — see its declaration
+    setReplayReady(replayLogRef.current.length);
+    setReplayDescriptions(replayLogRef.current.map(f => ({ player: f.player, description: f.description })));
+    setActiveSession({ ...s, version: payload.version });
+    // §4.3: adopt first, then endGame — a terminal state can be adopted any
+    // number of times safely (recordFinishedGame is idempotent on gameId).
+    // §5.1: otherwise, queue the auto-replay for when the AI chain this client
+    // is responsible for (if any) delivers control to isMyTurn — or, if the
+    // game ends *during* that silent simulation, to `winner !== null` instead,
+    // since control may never actually reach this seat.
+    pendingAutoReplayRef.current = true;
+    maybeEndFromMeta(openMetaRef.current);
+  }, [applySavedGame, setActiveSession, maybeEndFromMeta]);
+
+  // Deal the opening board as host and publish it, once a guest has claimed the
+  // seat. Host goes first — a simple, deterministic rule for Phase 1; wiring the
+  // existing first-player spinner into hosting is a later nicety. This does
+  // everything a solo deal does, but also serialises the state onto the wire so
+  // the guest can adopt it.
+  const dealAndStartAsHost = useCallback(async (id) => {
+    const firstPlayer = HOST_SEAT;
+    const newDeck = createDeck();
+    const hands = [newDeck.splice(0, 6), newDeck.splice(0, 6), newDeck.splice(0, 6), newDeck.splice(0, 6)];
+    const saved = serializeGame({
+      gameId: id,
+      mode: GAME_MODES.PARTNERS,
+      pegs: createInitialPegs(),
+      hands,
+      deck: newDeck,
+      discardPiles: [[], [], [], []],
+      stuckCounts: [0, 0, 0, 0],
+      currentPlayer: firstPlayer,
+      splitRemaining: 0, splitCard: null, splitPegIndex: null, splitOwner: null,
+      lastMoves: [null, null, null, null],
+      turns: 0,
+      jokersPlayed: [0, 0, 0, 0], bumpsDelivered: [0, 0, 0, 0], timesBumped: [0, 0, 0, 0],
+      // Remote games count toward neither the chosenFirst nor randomFirst
+      // bucket — "did I choose to go first" isn't a meaningful question when
+      // the host always goes first by fixed rule and the guest never chose.
+      startMode: null,
+    });
+    setSeatOwners(HOST_SEAT_OWNERS);
+    setGameMode(GAME_MODES.PARTNERS);
+    applySavedGame(saved);
+    setActiveSession({ id, seat: HOST_SEAT, version: 1 });
+    setHostInfo(null);
+    setMpScreen(null);
+    try {
+      await startGame(id, {
+        state: saved,
+        replay: [],
+        currentPlayer: firstPlayer,
+        waitingOn: nextHumanSeat(firstPlayer, HOST_SEAT_OWNERS),
+      });
+    } catch {
+      setMpNotice('Dealt locally, but could not publish. Check your connection.');
+    }
+  }, [applySavedGame, setActiveSession]);
+
+  // Metadata listener for the open game: whose turn / status for display, and —
+  // for the host waiting on a partner — the trigger to deal once a guest
+  // appears. Also the second of the two places a winner can arrive (§4.3):
+  // metadata and live/current are written together but delivered by two
+  // independent listeners, so check here too in case this one lands second.
+  const handleOpenMeta = useCallback((id, meta) => {
+    const s = sessionRef.current;
+    if (!s || s.id !== id) return;
+    setOpenMeta(meta);
+    openMetaRef.current = meta;
+    if (!meta) return;
+    if (s.seat === HOST_SEAT && meta.status === STATUS.LOBBY && meta.guestUid && !hostDealtRef.current) {
+      hostDealtRef.current = true;
+      dealAndStartAsHost(id);
+      return;
+    }
+    maybeEndFromMeta(meta);
+  }, [dealAndStartAsHost, maybeEndFromMeta]);
+
+  const attachGameListeners = useCallback((id) => {
+    detachGameListeners();
+    gameMetaUnsubRef.current = subscribeGameMeta(id, (meta) => handleOpenMeta(id, meta));
+    gameStateUnsubRef.current = subscribeGameState(id, (payload, info) => handleRemoteState(id, payload, info));
+  }, [detachGameListeners, handleOpenMeta, handleRemoteState]);
+
+  // Open a remote game this device already belongs to: orient the board from the
+  // seat, fetch the current state (adopting it if the game is dealt), and attach
+  // the live listeners. Used by joining and by switching in from the lobby.
+  const openRemoteGame = useCallback(async (id, seat) => {
+    hostDealtRef.current = false;
+    detachGameListeners();
+    setSeatOwners(remoteSeatOwners(seat));
+    setGameMode(GAME_MODES.PARTNERS);
+    setActiveSession({ id, seat, version: null });
+    setActiveId(id);
+    setShowLobby(false);
+    setMpScreen(null);
+    setShowFirstPlayerModal(false);
+    setShowResumeModal(false);
+    setOpenMeta(null);
+    openMetaRef.current = null;
+    try {
+      const snap = await fetchGame(id);
+      setOpenMeta(snap.meta);
+      openMetaRef.current = snap.meta;
+      if (snap.state) {
+        applySavedGame(snap.state); // resets replayLogRef — seed it back below
+        replayLogRef.current = seedReplay(snap.replay);
+        replayOwnRef.current = []; // the seed is not "own" — see its declaration
+        setReplayReady(replayLogRef.current.length);
+        setReplayDescriptions(replayLogRef.current.map(f => ({ player: f.player, description: f.description })));
+        setActiveSession({ id, seat, version: snap.version });
+        // Same seam as handleRemoteState (§4.3/§5.1): this one-shot fetch is
+        // just as much an "adopted state I didn't watch happen" as a live
+        // delivery — reopening an in-progress game or switching into one from
+        // the lobby should replay what happened and show a finished result,
+        // not silently skip both because it arrived via fetchGame instead of
+        // the listener.
+        pendingAutoReplayRef.current = true;
+        maybeEndFromMeta(snap.meta);
+      } else if (seat === HOST_SEAT && snap.meta.guestUid && snap.meta.status === STATUS.LOBBY) {
+        // Re-entering our own game that a guest joined while we were away.
+        hostDealtRef.current = true;
+        await dealAndStartAsHost(id);
+      }
+      attachGameListeners(id);
+    } catch {
+      setMpNotice('Could not open that game. It may have been removed.');
+    }
+  }, [applySavedGame, attachGameListeners, detachGameListeners, dealAndStartAsHost, setActiveSession, maybeEndFromMeta]);
+
+  // Host a new remote game: create it, cache it locally, show the code + share
+  // link, and wait. The metadata listener deals automatically when a guest joins.
+  const hostNewGame = useCallback(async (label) => {
+    setMpBusy(true);
+    setMpNotice(null);
+    try {
+      const uid = await signIn();
+      setMyUid(uid);
+      const { id, code } = await createGame(GAME_MODES.PARTNERS);
+      upsertLocalGame({ id, seat: HOST_SEAT, code, label: (label && label.trim()) || code, createdAt: Date.now() });
+      const link = `${window.location.origin}${window.location.pathname}?g=${id}`;
+      hostDealtRef.current = false;
+      detachGameListeners();
+      setSeatOwners(HOST_SEAT_OWNERS);
+      setGameMode(GAME_MODES.PARTNERS);
+      setActiveSession({ id, seat: HOST_SEAT, version: 0 });
+      setActiveId(id);
+      setHostInfo({ id, code, link });
+      setShowLobby(false);
+      setShowFirstPlayerModal(false);
+      setShowResumeModal(false);
+      setMpScreen('hosting');
+      setLabelInput('');
+      attachGameListeners(id);
+    } catch {
+      setMpNotice('Could not create a game. Check your connection.');
+    } finally {
+      setMpBusy(false);
+    }
+  }, [attachGameListeners, detachGameListeners, setActiveSession]);
+
+  // Join a game by code or by the id in a ?g= share link.
+  const beginJoin = useCallback(async (rawInput, { byId = false, label = '' } = {}) => {
+    setMpBusy(true);
+    setMpNotice(null);
+    try {
+      const uid = await signIn();
+      setMyUid(uid);
+      const { id, seat } = byId ? await joinGameById(rawInput) : await joinGame(rawInput);
+      upsertLocalGame({
+        id,
+        seat,
+        code: byId ? null : rawInput,
+        label: (label && label.trim()) || (byId ? null : rawInput),
+        createdAt: Date.now(),
+      });
+      setJoinInput('');
+      setLabelInput('');
+      await openRemoteGame(id, seat);
+    } catch {
+      setMpNotice(byId ? 'Could not open that invite link — the game may be gone.' : 'No game found for that code.');
+      setShowLobby(true);
+    } finally {
+      setMpBusy(false);
+    }
+  }, [openRemoteGame]);
+
+  // Switch which game is on screen. Blocked mid-split (a half-played 7 or 9 can't
+  // be persisted); everything else — a selected card/peg — is transient and
+  // dropped silently. Switching away from a remote game needs no write: state is
+  // only ever published at handoff, so an un-committed turn just starts over.
+  const switchToGame = useCallback(async (target) => {
+    if (splitRemaining !== 0) {
+      setMpNotice('Finish or undo your split first, then switch games.');
+      setShowLobby(true);
+      return;
+    }
+    detachGameListeners();
+    hostDealtRef.current = false;
+    setOpenMeta(null);
+    openMetaRef.current = null;
+    setMpNotice(null);
+    if (target === 'solo' || target == null) {
+      setActiveSession(null);
+      setActiveId(null);
+      setSeatOwners(SOLO_SEAT_OWNERS);
+      setShowLobby(false);
+      const saved = loadGame();
+      if (saved) applySavedGame(saved);
+      else initGame();
+      return;
+    }
+    const seat = target.seat ?? seatForUid(target, myUid) ?? GUEST_SEAT;
+    await openRemoteGame(target.id, seat);
+  }, [splitRemaining, detachGameListeners, setActiveSession, applySavedGame, initGame, myUid, openRemoteGame]);
+
+  // Hide a finished/abandoned game from the lobby without touching the document.
+  const archiveGame = useCallback((id) => {
+    archiveLocalGame(id);
+    setRemoteMeta((rows) => [...rows]); // nudge the derived lobby to recompute
+    if (sessionRef.current?.id === id) switchToGame('solo');
+  }, [switchToGame]);
+
+  // The header / end-overlay "New Game" button: leave any remote game cleanly
+  // (detach listeners, drop the session) and open the solo first-player modal.
+  const startNewSoloGame = useCallback(() => {
+    detachGameListeners();
+    hostDealtRef.current = false;
+    setActiveSession(null);
+    setActiveId(null);
+    setOpenMeta(null);
+    openMetaRef.current = null;
+    setSeatOwners(SOLO_SEAT_OWNERS);
+    initGame();
+  }, [detachGameListeners, setActiveSession, initGame]);
+
+  // On mount, route to the right starting screen (§3.4). The lobby subsumes the
+  // resume prompt, but ONLY for a device that actually has remote games — a
+  // solo-only player, even with the env vars set, gets today's exact flow and is
+  // never signed in.
   useEffect(() => {
+    if (bootstrappedRef.current) return;
+    bootstrappedRef.current = true;
+    const joinId = typeof window !== 'undefined'
+      ? new URLSearchParams(window.location.search).get('g')
+      : null;
     const saved = loadGame();
+
+    if (multiplayerConfigured && joinId) {
+      if (saved) setPendingResume(saved);
+      beginJoin(joinId, { byId: true });
+      return;
+    }
+    if (multiplayerConfigured && hasLocalGames()) {
+      const active = loadLocalGames().games.filter((g) => !g.archived);
+      if (active.length === 1) {
+        // Restore the single-game case to where you were.
+        openRemoteGame(active[0].id, active[0].seat);
+      } else {
+        if (saved) setPendingResume(saved);
+        setShowLobby(true);
+      }
+      return;
+    }
     if (saved) {
       setPendingResume(saved);
       setShowResumeModal(true);
     } else {
       initGame();
     }
-  }, [initGame]);
+  }, [initGame, multiplayerConfigured, beginJoin, openRemoteGame]);
+
+  // The lobby/badge listener. One subscription covers every game you are in and
+  // feeds both the list and the badge. Attach it only once the player has engaged
+  // with multiplayer — the lobby is open, a remote game is active, or the device
+  // already has games — so a solo-only player never signs in or loads the SDK.
+  useEffect(() => {
+    if (!multiplayerConfigured) return;
+    if (!(showLobby || session != null || hasLocalGames())) return;
+    if (myGamesUnsubRef.current) return;
+    myGamesUnsubRef.current = subscribeMyGames((rows) => setRemoteMeta(rows));
+    signIn().then(setMyUid).catch(() => {});
+  }, [multiplayerConfigured, showLobby, session]);
+
+  // Detach every listener on unmount. This is the discipline that replaces
+  // "clear the interval" — a leaked Firestore listener bills forever.
+  useEffect(() => () => {
+    if (myGamesUnsubRef.current) myGamesUnsubRef.current();
+    if (gameMetaUnsubRef.current) gameMetaUnsubRef.current();
+    if (gameStateUnsubRef.current) gameStateUnsubRef.current();
+  }, []);
 
   // Run animation for a move, then call onComplete when done
   const animateMove = useCallback((player, pegIndex, card, amount, currentPegs, onComplete) => {
@@ -402,12 +1011,14 @@ export default function PegsAndJokers() {
   // last turn.
   useEffect(() => {
     const prev = replayPrevPlayerRef.current;
-    if (prev === 0 && currentPlayer !== 0) {
+    if (ownsSeat(prev) && !ownsSeat(currentPlayer)) {
       replayLogRef.current = [];
+      replayOwnRef.current = [];
       setReplayReady(0);
+      setReplayDescriptions([]);
     }
     replayPrevPlayerRef.current = currentPlayer;
-  }, [currentPlayer]);
+  }, [currentPlayer, ownsSeat]);
 
   // Play back the buffered AI moves, slowed down, as an "instant replay". The
   // board is driven from the recorded snapshots and restored to the live state
@@ -514,6 +1125,28 @@ export default function PegsAndJokers() {
     }
   }, []);
 
+  // Package 5: auto-play the buffered frames once it becomes this client's
+  // turn — the wire frames (the partner's move, and anything the *other*
+  // client simulated) plus whatever this client just silently simulated
+  // itself. Solo never sets `pendingAutoReplayRef` (only handleRemoteState
+  // does), so this is a no-op there — the manual button stays the only way to
+  // watch a replay in solo, unchanged.
+  //
+  // Triggered on `isMyTurn` OR `winner !== null`, not `isMyTurn` alone: if the
+  // game ends during the silent AI simulation this client just ran, control
+  // never actually reaches this seat (the AI's winning move doesn't hand off),
+  // so `isMyTurn` would never become true — but the player should still watch
+  // the winning move play out before the end-of-game overlay appears.
+  useEffect(() => {
+    if (!session) return;
+    if (!pendingAutoReplayRef.current) return;
+    if (!(isMyTurn || winner !== null)) return;
+    pendingAutoReplayRef.current = false;
+    if (!replayLogRef.current.length) return; // first turn / fresh join: nothing to show
+    if (!animationsEnabled) return; // §5.2: text summary instead (see render)
+    startReplay();
+  }, [isMyTurn, winner, session, animationsEnabled, startReplay]);
+
   // Clean up replay timers if the component unmounts mid-playback.
   useEffect(() => () => {
     if (replaySegTimerRef.current) clearInterval(replaySegTimerRef.current);
@@ -529,11 +1162,17 @@ export default function PegsAndJokers() {
       : [];
     if (bumps.length === 0 && friendly.length === 0) return;
 
-    // Tally bumps for stats: pegs you sent home vs. your pegs sent home. Friendly
-    // partner bumps are cooperative and don't count.
+    // Tally bumps for stats, per seat — not gated on `ownsSeat`. That gate is
+    // exactly the bug the per-seat restructure exists to fix: a bump an AI
+    // seat delivers or receives while the *other* client is simulating it
+    // would never be counted anywhere. Recording objectively at the mover's
+    // and target's seat means whichever client actually simulates the move
+    // records it correctly, and each client sums only its own seats
+    // (`mySeats`) at stats-record time (see endGame). Friendly partner bumps
+    // are cooperative and don't count.
     for (const b of bumps) {
-      if (mover === 0 && b.player !== 0) bumpsDeliveredThisGameRef.current += 1;
-      if (mover !== 0 && b.player === 0) timesBumpedThisGameRef.current += 1;
+      bumpsDeliveredRef.current[mover] += 1;
+      timesBumpedRef.current[b.player] += 1;
     }
 
     sfx.bump();
@@ -551,12 +1190,12 @@ export default function PegsAndJokers() {
     }
   }, [animationsEnabled, gameMode, runBumpFx]);
 
-  // `owner` is whose peg moves (the human's partner once the human is all home);
-  // the human always acts as player 0, so the hand, discards and turn are theirs.
+  // `owner` is whose peg moves (your partner once you are all home); you always
+  // act as your own seat, so the hand, discards and turn are yours.
   const executeMove = useCallback((owner, pegIndex, card, splitAmount = null) => {
-    const actor = 0;
+    const actor = mySeat;
     if (!isValidMove(owner, pegIndex, card, pegs, splitAmount, moveOptions)) {
-      setGameMessage('Invalid move. Try again.');
+      setNotice('Invalid move. Try again.');
       return false;
     }
 
@@ -582,7 +1221,7 @@ export default function PegsAndJokers() {
       }
 
       if (!hasValidSecondPeg) {
-        setGameMessage(`Cannot split: no other peg can move ${Math.abs(remaining)} ${remaining > 0 ? 'forward' : 'backward'}.`);
+        setNotice(`Cannot split: no other peg can move ${Math.abs(remaining)} ${remaining > 0 ? 'forward' : 'backward'}.`);
         return false;
       }
     }
@@ -607,7 +1246,7 @@ export default function PegsAndJokers() {
       }
 
       if (!hasValidSecondPeg) {
-        setGameMessage(`Cannot split: no other peg can move the remaining ${remaining} spaces.`);
+        setNotice(`Cannot split: no other peg can move the remaining ${remaining} spaces.`);
         return false;
       }
     }
@@ -625,11 +1264,9 @@ export default function PegsAndJokers() {
 
     // Record last move description (under the acting human)
     const moveDescription = describeMoveAction(oldPeg, newPeg, card, splitAmount);
-    setLastMoves(prev => {
-      const updated = [...prev];
-      updated[actor] = moveDescription;
-      return updated;
-    });
+    const updatedLastMoves = [...lastMoves];
+    updatedLastMoves[actor] = moveDescription;
+    setLastMoves(updatedLastMoves);
 
     setPegs(newPegs);
 
@@ -642,7 +1279,7 @@ export default function PegsAndJokers() {
       setSplitOwner(owner); // and whose peg it was, so the completer collision check is owner-aware
       setSplitUndo({ pegs, lastMoves }); // pre-move board, so a mis-tap can be undone
       setSelectedPeg(null);
-      setGameMessage(`Tap a glowing peg to move the remaining ${remaining} spaces (or Undo).`);
+      setNotice(null); // the split prompt is part of the derived status line
       return true;
     }
 
@@ -656,13 +1293,33 @@ export default function PegsAndJokers() {
       setSplitOwner(owner); // and whose peg it was, so the completer collision check is owner-aware
       setSplitUndo({ pegs, lastMoves }); // pre-move board, so a mis-tap can be undone
       setSelectedPeg(null);
-      setGameMessage(`Tap a glowing peg to move ${remaining} spaces ${direction} (or Undo).`);
+      setNotice(null); // the split prompt is part of the derived status line
       return true;
     }
 
+    // The frame for the wire/replay: a single-peg move (see the AI effect's
+    // 'simple'/'start' case for the same shape). Split completions build their
+    // own frame in completeSplit; jokers in handleJokerTarget.
+    const frame = {
+      player: actor,
+      // §5.3: once your pegs are all home your cards move your partner's —
+      // say so explicitly, since the frame is attributed to the actor's turn.
+      description: attributeFrameDescription(moveDescription, actor, owner),
+      pegsBefore: pegs,
+      pegsAfter: newPegs,
+      segments: [{ owner, pegIndex, card, amount: splitAmount, fromPegs: pegs, toPegs: newPegs }],
+    };
+
+    turnsRef.current += 1; // §4.4: once per seat that actually moves
+
     const w = checkWinner(newPegs, gameMode);
     if (w !== null) {
-      setWinner(w);
+      endGame(w, { winningSeat: actor, description: moveDescription });
+      const nextPlayer = (actor + 1) % 4;
+      commitTurn({
+        nextPlayer, pegs: newPegs, hands, deck, discardPiles, stuckCounts,
+        lastMoves: updatedLastMoves, frame, winner: w, winningSeat: actor, description: moveDescription,
+      });
       return true;
     }
 
@@ -695,16 +1352,20 @@ export default function PegsAndJokers() {
     setSplitPegIndex(null);
     setSplitOwner(null);
 
-    // Switch to next player
+    // Switch to next player. §4.1: this is one of the four human-turn-end
+    // sites — publish exactly once, at handoff (no-op in solo).
     const nextPlayer = (actor + 1) % 4;
-    setCurrentPlayer(nextPlayer);
-    setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
+    commitTurn({
+      nextPlayer, pegs: newPegs, hands: newHands, deck: newDeck, discardPiles: updatedDiscardPiles,
+      stuckCounts: newStuckCounts, lastMoves: updatedLastMoves, frame,
+    });
+    setNotice(null);
 
     return true;
-  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode]);
+  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat, endGame, commitTurn]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
-    const actor = 0;
+    const actor = mySeat;
     const owner = controlledOwnerFor(pegs);
     // For both 7 and 9 cards, ensure different pegs are used — but only when the
     // completing peg is the same owner. A handoff split that finished your last
@@ -713,12 +1374,12 @@ export default function PegsAndJokers() {
     const cardInfo = CARD_VALUES[splitCard?.rank];
     if ((cardInfo?.mustSplit || cardInfo?.canSplit) && owner === splitOwner && pegIndex === splitPegIndex) {
       const cardName = cardInfo?.mustSplit ? 'Nine' : 'Seven';
-      setGameMessage(`${cardName} card must use two different pegs. Try again.`);
+      setNotice(`${cardName} card must use two different pegs. Try again.`);
       return false;
     }
 
     if (!isValidMove(owner, pegIndex, splitCard, pegs, amount, moveOptions)) {
-      setGameMessage('Invalid move for split. Try again.');
+      setNotice('Invalid move for split. Try again.');
       return false;
     }
 
@@ -735,17 +1396,36 @@ export default function PegsAndJokers() {
 
     // Update last move description to show split completion
     const secondMoveDesc = describeMoveAction(oldPeg, newPeg, splitCard, amount);
-    setLastMoves(prev => {
-      const updated = [...prev];
-      updated[actor] = `Split: ${prev[actor]}, ${secondMoveDesc}`;
-      return updated;
-    });
+    const splitDescription = `Split: ${lastMoves[actor]}, ${secondMoveDesc}`;
+    const updatedLastMoves = [...lastMoves];
+    updatedLastMoves[actor] = splitDescription;
+    setLastMoves(updatedLastMoves);
 
     setPegs(newPegs);
 
+    // The frame for the wire/replay. The second half's amount is known so it
+    // animates; the first half only shows as the frame's before/after (a snap
+    // rather than an animated glide) — a minor fidelity trade, not a
+    // correctness one, since pegsBefore/pegsAfter are exact either way.
+    const frame = {
+      player: actor,
+      // §5.3 attribution — see the same note in executeMove.
+      description: attributeFrameDescription(splitDescription, actor, owner),
+      pegsBefore: splitUndo?.pegs ?? pegs,
+      pegsAfter: newPegs,
+      segments: [{ owner, pegIndex, card: splitCard, amount, fromPegs: pegs, toPegs: newPegs }],
+    };
+
+    turnsRef.current += 1; // §4.4: once per seat that actually moves
+
     const w = checkWinner(newPegs, gameMode);
     if (w !== null) {
-      setWinner(w);
+      endGame(w, { winningSeat: actor, description: splitDescription });
+      const nextPlayer = (actor + 1) % 4;
+      commitTurn({
+        nextPlayer, pegs: newPegs, hands, deck, discardPiles, stuckCounts,
+        lastMoves: updatedLastMoves, frame, winner: w, winningSeat: actor, description: splitDescription,
+      });
       return true;
     }
 
@@ -778,11 +1458,14 @@ export default function PegsAndJokers() {
     setSplitOwner(null);
     setSplitUndo(null);
     const nextPlayer = (actor + 1) % 4;
-    setCurrentPlayer(nextPlayer);
-    setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
+    commitTurn({
+      nextPlayer, pegs: newPegs, hands: newHands, deck: newDeck, discardPiles: updatedDiscardPiles,
+      stuckCounts: newStuckCounts, lastMoves: updatedLastMoves, frame,
+    });
+    setNotice(null);
 
     return true;
-  }, [splitCard, splitPegIndex, splitOwner, pegs, hands, deck, discardPiles, stuckCounts, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode]);
+  }, [splitCard, splitPegIndex, splitOwner, splitUndo, pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat, endGame, commitTurn]);
 
   // Undo a half-finished split: restore the board (and anything the first half
   // bumped) to the snapshot taken before it, and return the turn to the point
@@ -805,7 +1488,7 @@ export default function PegsAndJokers() {
     setSplitOwner(null);
     setSplitUndo(null);
     setSelectedPeg(null); // keep the card selected so pegs re-glow for another try
-    setGameMessage('Split undone. Select a peg to move.');
+    setNotice('Split undone. Select a peg to move.');
   }, [splitUndo]);
 
   const discardAndDraw = useCallback((player, cardIndex = 0) => {
@@ -842,31 +1525,27 @@ export default function PegsAndJokers() {
         if (ok) {
           newPegs = afterStart;
           autoStarted = true;
-          if (player === 0) {
-            setGameMessage('After 3 stuck turns, you start a peg!');
-          }
         }
       }
       newStuckCounts[player] = 0; // Reset even if no peg to start
     }
 
     // Record last move description for discard
-    setLastMoves(prev => {
-      const updated = [...prev];
-      updated[player] = autoStarted ? 'Stuck 3x - Started a peg' : 'Discarded (stuck)';
-      return updated;
-    });
+    const updatedLastMoves = [...lastMoves];
+    updatedLastMoves[player] = autoStarted ? 'Stuck 3x - Started a peg' : 'Discarded (stuck)';
+    setLastMoves(updatedLastMoves);
 
-    // Log AI discards into the replay buffer too, so a stuck opponent's turn is
-    // still accounted for when you watch the replay.
-    if (player !== 0) {
-      recordReplayFrame({
-        player,
-        description: autoStarted ? 'Stuck 3x — started a peg' : 'No move — discarded',
-        pegsBefore: pegs,
-        pegsAfter: newPegs,
-        segments: [],
-      });
+    const discardFrame = {
+      player,
+      description: autoStarted ? 'Stuck 3x — started a peg' : 'No move — discarded',
+      pegsBefore: pegs,
+      pegsAfter: newPegs,
+      segments: [],
+    };
+    // Log other seats' discards into the replay buffer too, so a stuck
+    // opponent's turn is still accounted for when you watch the replay.
+    if (!ownsSeat(player)) {
+      recordReplayFrame(discardFrame);
     }
 
     if (autoStarted) triggerMoveEffects(pegs, newPegs, player);
@@ -880,59 +1559,73 @@ export default function PegsAndJokers() {
     setSelectedPeg(null);
     setDiscardMode(false);
 
-    if (player === 0) {
-      const nextPlayer = 1;
-      setCurrentPlayer(nextPlayer);
-      if (newStuckCounts[0] === 0 && newPegs !== pegs) {
-        // Delay message change so player sees the "start a peg" message
-        setTimeout(() => setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`), 1500);
-      } else {
-        setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
-      }
+    setNotice(null);
+
+    // Turns counter fix (§4.4): once per seat that actually moves — a stuck
+    // discard is still a turn.
+    turnsRef.current += 1;
+
+    // Hand off. What just happened is already visible on the board — the
+    // last-move label under the seat and its stuck counter — so nothing is
+    // announced here. The old code posted three messages on 1200/1500 ms
+    // timers, which then fired after a win had landed and overwrote the win
+    // text; the status line derives itself now and there are no timers left to
+    // outlive their turn.
+    const nextPlayer = (player + 1) % 4;
+    if (ownsSeat(player)) {
+      // §4.1: this is one of the four human-turn-end sites — publish exactly
+      // once, at handoff (no-op in solo).
+      commitTurn({
+        nextPlayer, pegs: newPegs, hands: newHands, deck: newDeck, discardPiles: updatedDiscardPiles,
+        stuckCounts: newStuckCounts, lastMoves: updatedLastMoves, frame: discardFrame,
+      });
     } else {
-      // AI player discarded - show message with stuck count, then advance player
-      const nextPlayer = (player + 1) % 4;
-
-      if (newStuckCounts[player] === 0 && newPegs !== pegs) {
-        setGameMessage(`${PLAYER_NAMES[player]} was stuck 3 turns and started a peg!`);
-      } else {
-        setGameMessage(`${PLAYER_NAMES[player]} discarded (stuck: ${newStuckCounts[player]}/3)`);
-      }
-
-      // Set next player immediately to prevent useEffect from re-triggering
       setCurrentPlayer(nextPlayer);
-      aiProcessingRef.current = false; // Allow next AI to process
-
-      // Delay the "thinking" message so discard message is visible
-      setTimeout(() => {
-        if (nextPlayer === 0) {
-          setGameMessage('Your turn! Select a card and peg to move.');
-        }
-        // If next is AI, the useEffect will set the message
-      }, 1200);
+      aiProcessingRef.current = false; // Allow the next AI seat to process
     }
-  }, [hands, deck, discardPiles, stuckCounts, pegs, triggerMoveEffects, recordReplayFrame, gameMode]);
+  }, [hands, deck, discardPiles, stuckCounts, pegs, lastMoves, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, commitTurn]);
 
-  // AI logic - handles players 1, 2, 3
+  // AI logic - drives the AI seats this client is responsible for.
+  //
+  // §4.2's gate: a client runs an AI seat forward only when the run of AI
+  // seats starting there terminates at one of ITS OWN seats — i.e. it is the
+  // client that will next need this AI's move to reach its own turn. This
+  // replaces the earlier (insufficient) `!isAISeat` check, which only stopped
+  // a client from running the *other* human's turn but let both clients
+  // simulate the same AI move independently (a double-simulation bug that had
+  // no write to race on yet, so nothing had caught it). `shouldSimulateAI` is
+  // `nextHumanSeat` + `ownsSeat` as one predicate (net/seats.js); in solo every
+  // chain leads back to seat 0, so this is always true there and solo behaviour
+  // is unchanged.
+  //
+  // In a remote game, this effect only ever runs as a *catch-up* simulation —
+  // never as a live continuation of this client's own move, because the fixed
+  // human/AI/human/AI layout means the seat right after your own move is
+  // always AI, and its chain always leads to the OTHER human, never back to
+  // you (see the gate trace in CLAUDE.md). So `session != null` is exactly
+  // "run this silently": no animation, no thinking delay, so the whole chain
+  // resolves as fast as React will commit it, ready for the auto-replay
+  // (Package 5) to play back at a watchable pace afterwards.
   useEffect(() => {
-    if (currentPlayer === 0 || winner !== null) return;
+    if (isMyTurn || winner !== null) return;
+    if (!shouldSimulateAI(currentPlayer, seatOwners)) return;
     if (aiProcessingRef.current) return; // Already processing this turn
 
     aiProcessingRef.current = true;
     const aiPlayer = currentPlayer;
     const nextPlayer = (currentPlayer + 1) % 4;
+    const silent = session != null;
 
     const timer = setTimeout(() => {
+      aiTimerRef.current = null;
       const aiHand = hands[aiPlayer];
 
       // Helper function to complete AI move
       const completeAIMove = (newPegs, card, moveDescription, moverPeg = null) => {
         // Record last move description for AI
-        setLastMoves(prev => {
-          const updated = [...prev];
-          updated[aiPlayer] = moveDescription;
-          return updated;
-        });
+        const updatedLastMoves = [...lastMoves];
+        updatedLastMoves[aiPlayer] = moveDescription;
+        setLastMoves(updatedLastMoves);
 
         triggerMoveEffects(pegs, newPegs, aiPlayer, moverPeg);
         sfx.peg();
@@ -960,20 +1653,36 @@ export default function PegsAndJokers() {
         newStuckCounts[aiPlayer] = 0;
         setStuckCounts(newStuckCounts);
 
+        // Turns counter fix (§4.4): count directly here, once per seat that
+        // actually moves — including the winning move — rather than inferring
+        // it from a currentPlayer transition (which double-counts or
+        // undercounts across an adopted remote state).
+        turnsRef.current += 1;
+
         const w = checkWinner(newPegs, gameMode);
         if (w !== null) {
-          setWinner(w);
-          aiProcessingRef.current = false;
+          endGame(w, { winningSeat: aiPlayer, description: moveDescription });
+          // A decision the plan doesn't spell out: §4.2 says the AI effect's
+          // own player-advance "must stay purely local", folded into this
+          // client's *next* human publish. But if the AI's move ends the
+          // game, there is no next human publish to fold it into — this
+          // client's own turn never arrives, so without publishing here the
+          // partner would never learn the game ended. A game-ending AI move
+          // is therefore the one case where this effect publishes directly,
+          // exactly as if it were the human turn that "ended" (no-op in
+          // solo). `frame` is omitted: recordReplayFrame already pushed this
+          // move onto replayLogRef above, so seedReplay(replayLogRef.current)
+          // already carries it as the last frame.
+          commitTurn({
+            nextPlayer, pegs: newPegs, hands: newHands, deck: newDeck, discardPiles: updatedDiscardPiles,
+            stuckCounts: newStuckCounts, lastMoves: updatedLastMoves,
+            winner: w, winningSeat: aiPlayer, description: moveDescription,
+          });
           return true;
         }
 
         setCurrentPlayer(nextPlayer);
         aiProcessingRef.current = false;
-        if (nextPlayer === 0) {
-          setGameMessage('Your turn! Select a card and peg to move.');
-        } else {
-          setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
-        }
         return false;
       };
 
@@ -1021,16 +1730,25 @@ export default function PegsAndJokers() {
         } else if (bestMove.type === 'simple' || bestMove.type === 'start') {
           replaySegments.push({ owner, pegIndex: bestMove.pegIndex, card: bestMove.card, amount: bestMove.amount, fromPegs: pegs, toPegs: bestMove.newPegs });
         }
+        // §5.3 attribution — see the same note in executeMove. A joker never
+        // moves the owner's own peg (it bumps a target), so it's excluded.
+        const frameDescription = bestMove.type === 'joker'
+          ? moveDescription
+          : attributeFrameDescription(moveDescription, aiPlayer, owner);
         recordReplayFrame({
           player: aiPlayer,
-          description: moveDescription,
+          description: frameDescription,
           pegsBefore: pegs,
           pegsAfter: bestMove.newPegs,
           segments: replaySegments,
         });
 
-        // If animations disabled, just complete immediately
-        if (!animationsEnabled) {
+        if (bestMove.type === 'joker') jokersPlayedRef.current[aiPlayer] += 1;
+
+        // If animations are disabled, or this is a silent catch-up simulation
+        // (Package 5 — remote, running ahead of the auto-replay), complete
+        // immediately with no per-peg animation.
+        if (!animationsEnabled || silent) {
           if (completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg)) return;
           return;
         }
@@ -1068,76 +1786,56 @@ export default function PegsAndJokers() {
 
       // No valid move, discard (discardAndDraw handles player transition for AI)
       discardAndDraw(aiPlayer);
-    }, 800);
+    }, silent ? 0 : 800); // §5.1: a silent catch-up simulation has no thinking delay
+    aiTimerRef.current = timer;
 
     return () => {
       clearTimeout(timer);
+      if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, winner, hands, pegs, deck, discardPiles, stuckCounts, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn]);
 
-  // Chime + gentle buzz when control passes back to the human player
+  // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
-    if (currentPlayer === 0 && prevPlayerRef.current !== null && prevPlayerRef.current !== 0 && winner === null) {
+    const prev = prevPlayerRef.current;
+    if (isMyTurn && prev !== null && !ownsSeat(prev) && winner === null) {
       sfx.yourTurn();
     }
     prevPlayerRef.current = currentPlayer;
-  }, [currentPlayer, winner]);
+  }, [currentPlayer, isMyTurn, winner, ownsSeat]);
 
-  // Count a completed turn each time control passes to a different player.
-  // The winning move doesn't switch players, so it's added on at record time.
-  useEffect(() => {
-    if (winner !== null) return;
-    if (prevTurnPlayerRef.current !== null && prevTurnPlayerRef.current !== currentPlayer) {
-      turnsRef.current += 1;
-    }
-    prevTurnPlayerRef.current = currentPlayer;
-  }, [currentPlayer, winner]);
-
-  // Fanfare on win, descending tone on loss
+  // Fanfare on win, descending tone on loss. Stats are NOT recorded here — a
+  // transition-watching effect only fires for whoever happened to be looking,
+  // which is wrong the moment a game can end on another device. endGame records
+  // them from the terminal state instead.
   useEffect(() => {
     if (winner === null) return;
-    if (winner === 0) {
+    if (didIWin(winner, gameMode, mySeats)) {
       sfx.win();
     } else {
       sfx.lose();
     }
-  }, [winner]);
-
-  // Fold the finished game into the persisted player stats exactly once.
-  useEffect(() => {
-    if (winner === null || gameRecordedRef.current) return;
-    gameRecordedRef.current = true;
-    const result = {
-      won: winner === 0,
-      winner,
-      turns: turnsRef.current + 1, // include the winning turn
-      startMode: startModeRef.current,
-      mode: gameMode,
-      jokersPlayed: jokersThisGameRef.current,
-      bumpsDelivered: bumpsDeliveredThisGameRef.current,
-      timesBumped: timesBumpedThisGameRef.current
-    };
-    setStats(prev => {
-      const updated = recordGame(prev, result);
-      saveStats(updated);
-      return updated;
-    });
-  }, [winner]);
+  }, [winner, gameMode, mySeats]);
 
   // Persist the in-progress game after every committed change so a mobile tab
   // eviction (a phone call mid-game) doesn't lose it. Skip while a modal is up
   // or before cards are dealt, and clear the save once the game is over so we
   // never offer to resume a finished game.
   useEffect(() => {
+    // The localStorage save is the source of truth for SOLO only, and there is
+    // exactly one solo game. In a remote game the server row is the save, so
+    // this effect must not overwrite the solo save with a remote board.
+    if (session) return;
     if (showFirstPlayerModal || showResumeModal) return;
     if (isReplaying) return; // don't persist the rewound board during a replay
-    if (!(hands[0]?.length > 0)) return; // no game in progress yet
+    if (!(hands[mySeat]?.length > 0)) return; // no game in progress yet
     if (winner !== null) {
       clearGame();
       return;
     }
     saveGame({
+      gameId: gameIdRef.current,
       mode: gameMode,
       pegs,
       hands,
@@ -1150,20 +1848,84 @@ export default function PegsAndJokers() {
       splitPegIndex,
       splitOwner,
       lastMoves,
-      moveHistory,
       turns: turnsRef.current,
-      jokersPlayed: jokersThisGameRef.current,
-      bumpsDelivered: bumpsDeliveredThisGameRef.current,
-      timesBumped: timesBumpedThisGameRef.current,
+      jokersPlayed: jokersPlayedRef.current,
+      bumpsDelivered: bumpsDeliveredRef.current,
+      timesBumped: timesBumpedRef.current,
       startMode: startModeRef.current,
     });
   }, [
     pegs, hands, deck, discardPiles, stuckCounts, currentPlayer,
-    splitRemaining, splitCard, splitPegIndex, splitOwner, lastMoves, moveHistory,
-    winner, showFirstPlayerModal, showResumeModal, gameMode, isReplaying,
+    splitRemaining, splitCard, splitPegIndex, splitOwner, lastMoves,
+    winner, showFirstPlayerModal, showResumeModal, gameMode, isReplaying, mySeat, session,
   ]);
 
-  const selectedCardObj = selectedCard !== null ? hands[0]?.[selectedCard] ?? null : null;
+  // The hand you play from — your own seat's, always (even in partner mode,
+  // where your cards may move your partner's pegs).
+  const myHand = hands[mySeat] ?? [];
+
+  const selectedCardObj = selectedCard !== null ? myHand[selectedCard] ?? null : null;
+
+  // --- Derived game phase and status ---
+  //
+  // `phase` is the single answer to "what is happening", and `statusLine` is how
+  // it reads. Both are computed from state every render, so neither can go
+  // stale and neither can be overwritten by a timer that outlived its turn.
+  // Nothing sets them; `notice` carries the only genuinely transient text.
+  const dealt = !showFirstPlayerModal && !showResumeModal && myHand.length > 0;
+
+  const phase = useMemo(
+    () => derivePhase({ winner, isReplaying, dealt, isMyTurn, currentPlayer, seatOwners }),
+    [winner, isReplaying, dealt, isMyTurn, currentPlayer, seatOwners]
+  );
+
+  const statusLine = useMemo(
+    () => describeStatus({
+      phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, mode: gameMode,
+    }),
+    [phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, gameMode]
+  );
+
+  const outcome = useMemo(
+    () => describeOutcome(winner, gameMode, mySeats),
+    [winner, gameMode, mySeats]
+  );
+
+  // --- Lobby derivations ------------------------------------------------------
+  // The lobby rows and the waiting-on-you badge come from a single listener's
+  // metadata rows plus the device's local labels, so the list and the badge can
+  // never disagree. "Your turn" is waitingOn === seat (see lobby.js), never
+  // currentPlayer, which is always parked on an AI seat.
+  const localGamesList = useMemo(
+    () => loadLocalGames().games,
+    [remoteMeta, showLobby, session, mpScreen]
+  );
+  const localById = useMemo(
+    () => Object.fromEntries(localGamesList.map((g) => [g.id, g])),
+    [localGamesList]
+  );
+  const lobbyRows = useMemo(
+    () => buildRemoteRows(remoteMeta, { myUid, localById }),
+    [remoteMeta, myUid, localById]
+  );
+  const waitingCount = useMemo(() => countWaitingOnMe(lobbyRows), [lobbyRows]);
+  const liveRows = useMemo(() => lobbyRows.filter((r) => !r.finished), [lobbyRows]);
+  const finishedRows = useMemo(() => lobbyRows.filter((r) => r.finished), [lobbyRows]);
+  const soloSaveExists = useMemo(
+    () => !session && !!loadGame(),
+    [session, showLobby, winner]
+  );
+  // A guest who has opened a game the host hasn't dealt yet is simply waiting.
+  const waitingForHostDeal = Boolean(
+    session && session.seat === GUEST_SEAT && openMeta && openMeta.status === STATUS.LOBBY
+  );
+
+  // A notice answers the action that produced it, so it dies with the phase.
+  const prevPhaseRef = useRef(null);
+  useEffect(() => {
+    if (prevPhaseRef.current !== null && prevPhaseRef.current !== phase) setNotice(null);
+    prevPhaseRef.current = phase;
+  }, [phase]);
 
   // Whose pegs the human is moving this turn (their own, or their partner's once
   // they've finished in partner mode).
@@ -1172,7 +1934,7 @@ export default function PegsAndJokers() {
   // Pegs the human can legally move right now (null = highlighting inactive).
   // During the second half of a split this is the set of pegs that can finish it.
   const movablePegSet = useMemo(() => {
-    if (currentPlayer !== 0 || winner !== null || discardMode || jokerMode || isReplaying) return null;
+    if (!isMyTurn || winner !== null || discardMode || jokerMode || isReplaying) return null;
     if (splitRemaining !== 0 && splitCard) {
       const set = new Set();
       for (let i = 0; i < 5; i++) {
@@ -1186,33 +1948,33 @@ export default function PegsAndJokers() {
     }
     if (!selectedCardObj) return null;
     return new Set(getMovablePegs(controlledOwner, selectedCardObj, pegs, moveOptions));
-  }, [currentPlayer, winner, discardMode, jokerMode, isReplaying, splitRemaining, splitCard, splitPegIndex, splitOwner, selectedCardObj, pegs, controlledOwner, moveOptions]);
+  }, [isMyTurn, winner, discardMode, jokerMode, isReplaying, splitRemaining, splitCard, splitPegIndex, splitOwner, selectedCardObj, pegs, controlledOwner, moveOptions]);
 
   // Tappable destination spaces for the selected peg with a 7 or 9 (ghost
   // circles on the board — tapping one picks that split amount)
   const ghostDestinations = useMemo(() => {
-    if (currentPlayer !== 0 || winner !== null || jokerMode || discardMode || isReplaying) return [];
+    if (!isMyTurn || winner !== null || jokerMode || discardMode || isReplaying) return [];
     if (splitRemaining !== 0 || !selectedCardObj || selectedPeg === null) return [];
     const info = CARD_VALUES[selectedCardObj.rank];
     if (!info.canSplit && !info.mustSplit) return [];
     return getValidDestinations(controlledOwner, selectedPeg, selectedCardObj, pegs, moveOptions);
-  }, [currentPlayer, winner, jokerMode, discardMode, isReplaying, splitRemaining, selectedCardObj, selectedPeg, pegs, controlledOwner, moveOptions]);
+  }, [isMyTurn, winner, jokerMode, discardMode, isReplaying, splitRemaining, selectedCardObj, selectedPeg, pegs, controlledOwner, moveOptions]);
 
   // Which cards in hand have at least one fully playable move (used to dim
   // dead cards; unlike hasAnyValidMove this requires splits to be completable)
   const playableCards = useMemo(() => {
-    if (currentPlayer !== 0 || winner !== null) return hands[0].map(() => true);
-    return hands[0].map(c => getMovablePegs(controlledOwner, c, pegs, moveOptions).length > 0);
-  }, [currentPlayer, winner, hands, pegs, controlledOwner, moveOptions]);
+    if (!isMyTurn || winner !== null) return myHand.map(() => true);
+    return myHand.map(c => getMovablePegs(controlledOwner, c, pegs, moveOptions).length > 0);
+  }, [isMyTurn, winner, myHand, pegs, controlledOwner, moveOptions]);
 
   const handleCardClick = (cardIndex) => {
-    if (currentPlayer !== 0 || winner !== null || isReplaying) return;
+    if (!isMyTurn || winner !== null || isReplaying) return;
     if (splitRemaining !== 0) return;
     unlockAudio();
 
     // In discard mode, clicking a card discards it
     if (discardMode) {
-      discardAndDraw(0, cardIndex);
+      discardAndDraw(mySeat, cardIndex);
       return;
     }
 
@@ -1226,14 +1988,14 @@ export default function PegsAndJokers() {
   };
 
   const handlePegClick = (player, pegIndex) => {
-    if (currentPlayer !== 0 || winner !== null || isReplaying) return;
+    if (!isMyTurn || winner !== null || isReplaying) return;
 
     // In joker mode, clicking your own peg cancels the selection
     if (jokerMode && player === controlledOwner) {
       setJokerMode(false);
       setJokerSourcePeg(null);
       setSelectedPeg(null);
-      setGameMessage('Joker cancelled. Select a card and peg to move.');
+      setNotice(null);
       return;
     }
 
@@ -1243,11 +2005,11 @@ export default function PegsAndJokers() {
       const cardInfo = CARD_VALUES[splitCard?.rank];
       if (controlledOwner === splitOwner && pegIndex === splitPegIndex) {
         const cardName = cardInfo?.mustSplit ? 'Nine' : 'Seven';
-        setGameMessage(`${cardName} card must use two different pegs. Try again.`);
+        setNotice(`${cardName} card must use two different pegs. Try again.`);
         return;
       }
       if (movablePegSet && !movablePegSet.has(pegIndex)) {
-        setGameMessage('That peg cannot finish the split. Tap a glowing peg.');
+        setNotice('That peg cannot finish the split. Tap a glowing peg.');
         return;
       }
       completeSplit(pegIndex, splitRemaining);
@@ -1255,35 +2017,31 @@ export default function PegsAndJokers() {
     }
 
     if (selectedCard === null) {
-      setGameMessage('Select a card first.');
+      setNotice('Select a card first.');
       return;
     }
 
     if (movablePegSet && !movablePegSet.has(pegIndex)) {
-      setGameMessage('That peg has no legal move with this card. Glowing pegs can move.');
+      setNotice('That peg has no legal move with this card. Glowing pegs can move.');
       return;
     }
 
     setSelectedPeg(pegIndex);
-    const card = hands[0][selectedCard];
+    const card = myHand[selectedCard];
     const cardInfo = CARD_VALUES[card.rank];
 
     // Handle Joker - enter selection mode for target
     if (cardInfo.isJoker) {
       setJokerMode(true);
       setJokerSourcePeg(pegIndex);
-      setGameMessage(
-        gameMode === GAME_MODES.PARTNERS
-          ? "Click a peg on the track to bump — hit your partner to send them to their home stretch."
-          : "Now click an opponent's peg on the track to bump it."
-      );
+      setNotice(null); // the joker prompt is part of the derived status line
       return;
     }
 
     if ((cardInfo.canSplit || cardInfo.mustSplit) &&
         (pegs[controlledOwner][pegIndex].location === 'track' || pegs[controlledOwner][pegIndex].location === 'home')) {
       // 7s and 9s: tap one of the ghost destination spaces to pick the amount
-      setGameMessage('Tap a pulsing space on the board to move this peg there.');
+      setNotice('Tap a pulsing space on the board to move this peg there.');
     } else {
       executeMove(controlledOwner, pegIndex, card);
     }
@@ -1292,7 +2050,7 @@ export default function PegsAndJokers() {
   const handleJokerTarget = (targetPlayer, targetPegIndex) => {
     if (isReplaying) return;
     if (!jokerMode || jokerSourcePeg === null || selectedCard === null) return;
-    const actor = 0;
+    const actor = mySeat;
     const owner = controlledOwnerFor(pegs);
     if (targetPlayer === owner) return; // Can't target the mover's own pegs
 
@@ -1304,21 +2062,20 @@ export default function PegsAndJokers() {
     // Execute the joker via the engine so the partner friendly-bump rule applies.
     const { newPegs, bumped } = applyJoker(owner, jokerSourcePeg, targetPlayer, targetPegIndex, pegs, moveOptions);
     if (!bumped) {
-      setGameMessage('That joker bump is not legal. Pick another target.');
+      setNotice('That joker bump is not legal. Pick another target.');
       return;
     }
 
     // Record last move for Joker
     const friendly = gameMode === GAME_MODES.PARTNERS && sameTeam(targetPlayer, actor);
-    setLastMoves(prev => {
-      const updated = [...prev];
-      updated[actor] = friendly
-        ? `Joker sent ${PLAYER_NAMES[targetPlayer]} to home stretch`
-        : `Joker bumped ${PLAYER_NAMES[targetPlayer]}`;
-      return updated;
-    });
+    const jokerDescription = friendly
+      ? `Joker sent ${PLAYER_NAMES[targetPlayer]} to home stretch`
+      : `Joker bumped ${PLAYER_NAMES[targetPlayer]}`;
+    const updatedLastMoves = [...lastMoves];
+    updatedLastMoves[actor] = jokerDescription;
+    setLastMoves(updatedLastMoves);
 
-    jokersThisGameRef.current += 1;
+    jokersPlayedRef.current[actor] += 1;
     triggerMoveEffects(pegs, newPegs, actor, { player: owner, pegIndex: jokerSourcePeg });
 
     setPegs(newPegs);
@@ -1351,16 +2108,37 @@ export default function PegsAndJokers() {
     setJokerMode(false);
     setJokerSourcePeg(null);
 
+    // A joker's animation path is empty (no gliding peg to show), so the
+    // frame carries only the before/after snapshot — same as the AI's joker
+    // frame above.
+    const frame = {
+      player: actor,
+      description: jokerDescription,
+      pegsBefore: pegs,
+      pegsAfter: newPegs,
+      segments: [],
+    };
+
+    turnsRef.current += 1; // §4.4: once per seat that actually moves
+
     const w = checkWinner(newPegs, gameMode);
+    const nextPlayer = (actor + 1) % 4;
     if (w !== null) {
-      setWinner(w);
+      endGame(w, { winningSeat: actor, description: jokerDescription });
+      commitTurn({
+        nextPlayer, pegs: newPegs, hands: newHands, deck: newDeck, discardPiles: updatedDiscardPiles,
+        stuckCounts: newStuckCounts, lastMoves: updatedLastMoves, frame, winner: w, winningSeat: actor, description: jokerDescription,
+      });
       return;
     }
 
-    // Next player
-    const nextPlayer = 1; // After player 0, always goes to player 1
-    setCurrentPlayer(nextPlayer);
-    setGameMessage(`${PLAYER_NAMES[nextPlayer]} is thinking...`);
+    // §4.1: this is one of the four human-turn-end sites — publish exactly
+    // once, at handoff (no-op in solo).
+    commitTurn({
+      nextPlayer, pegs: newPegs, hands: newHands, deck: newDeck, discardPiles: updatedDiscardPiles,
+      stuckCounts: newStuckCounts, lastMoves: updatedLastMoves, frame,
+    });
+    setNotice(null);
   };
 
   // Tap on a ghost destination circle: play the selected card with the amount
@@ -1368,7 +2146,7 @@ export default function PegsAndJokers() {
   const handleGhostClick = (dest) => {
     if (isReplaying) return;
     if (selectedCard === null || selectedPeg === null) return;
-    const card = hands[0][selectedCard];
+    const card = myHand[selectedCard];
     executeMove(controlledOwnerFor(pegs), selectedPeg, card, dest.amount);
   };
 
@@ -1379,8 +2157,9 @@ export default function PegsAndJokers() {
     const side = Math.floor(trackIndex / SPACES_PER_SIDE);
     const pos = trackIndex % SPACES_PER_SIDE;
 
-    // Rotate visual layout so player 0 (Yellow) is at the bottom
-    const visualSide = (side + 2) % 4;
+    // Rotate the visual layout so YOUR seat is at the bottom. With mySeat = 0
+    // this is the original (side + 2) % 4, so solo rendering is unchanged.
+    const visualSide = visualSideFor(side, mySeat);
 
     const topY = MARGIN;
     const bottomY = BOARD_SIZE - MARGIN;
@@ -1413,8 +2192,8 @@ export default function PegsAndJokers() {
   const getStartAreaPosition = (player, pegIndex) => {
     const trackPos8 = getTrackPosition(player * SPACES_PER_SIDE + 8);
 
-    // Rotate visual layout so player 0 (Yellow) is at the bottom
-    const visualSide = (player + 2) % 4;
+    // Rotate the visual layout so YOUR seat is at the bottom.
+    const visualSide = visualSideFor(player, mySeat);
 
     // Offset inward from track, close to the come-out space
     const inwardOffset = 22;
@@ -1450,8 +2229,8 @@ export default function PegsAndJokers() {
   const getHomePosition = (player, homePos) => {
     const trackPos3 = getTrackPosition(player * SPACES_PER_SIDE + 3);
 
-    // Rotate visual layout so player 0 (Yellow) is at the bottom
-    const visualSide = (player + 2) % 4;
+    // Rotate the visual layout so YOUR seat is at the bottom.
+    const visualSide = visualSideFor(player, mySeat);
 
     const spacing = 14;
 
@@ -1475,11 +2254,11 @@ export default function PegsAndJokers() {
 
   // Board label for a seat: "You", partner or opponent in partner mode, else AI.
   const roleLabel = (player) => {
-    if (player === 0) return 'You (Yellow)';
+    if (ownsSeat(player)) return `You (${PLAYER_NAMES[player]})`;
     if (gameMode === GAME_MODES.PARTNERS) {
-      return `${PLAYER_NAMES[player]} (${sameTeam(player, 0) ? 'Partner' : 'Opponent'})`;
+      return `${PLAYER_NAMES[player]} (${sameTeam(player, mySeat) ? 'Partner' : 'Opponent'})`;
     }
-    return `${PLAYER_NAMES[player]} (AI)`;
+    return `${PLAYER_NAMES[player]} (${isAISeat(seatOwners, player) ? 'AI' : 'Player'})`;
   };
 
   const renderCard = (card, index, isSelected, isPlayable = true) => {
@@ -1516,6 +2295,206 @@ export default function PegsAndJokers() {
     <div className="min-h-screen bg-gray-900 text-white p-2 sm:p-4">
       <InstallPrompt />
 
+      {/* My Games lobby. A modal overlay in the same style as the stats/resume
+          modals — not a route. Populated by one subscribeMyGames listener, so it
+          updates itself when a partner moves whether or not it is open. */}
+      {showLobby && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center p-5 pb-3 border-b border-gray-700 sticky top-0 bg-gray-800">
+              <h2 className="text-2xl font-bold">🎮 My Games</h2>
+              <button
+                onClick={() => setShowLobby(false)}
+                className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-lg leading-none"
+                aria-label="Close My Games"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-5 space-y-3">
+              {mpNotice && <div className="text-sm text-amber-300">{mpNotice}</div>}
+
+              {/* Your solo game. */}
+              <button
+                onClick={() => switchToGame('solo')}
+                className={`w-full text-left px-4 py-3 rounded-lg transition-colors ${
+                  !session ? 'bg-amber-700/60 ring-1 ring-amber-500' : 'bg-gray-700 hover:bg-gray-600'
+                }`}
+              >
+                <div className="flex justify-between items-center">
+                  <span className="font-semibold">🧩 Solo vs AI</span>
+                  <span className="text-xs text-gray-300">
+                    {!session ? 'On screen' : soloSaveExists ? 'Resume' : 'New game'}
+                  </span>
+                </div>
+              </button>
+
+              {/* Remote games waiting on you sort first. */}
+              {liveRows.map((row) => (
+                <div
+                  key={row.id}
+                  className={`px-4 py-3 rounded-lg ${
+                    session?.id === row.id
+                      ? 'bg-teal-800/70 ring-1 ring-teal-400'
+                      : row.yourTurn
+                        ? 'bg-amber-700/50'
+                        : 'bg-gray-700'
+                  }`}
+                >
+                  <div className="flex justify-between items-center gap-2">
+                    <button className="flex-1 text-left" onClick={() => switchToGame(row)}>
+                      <div className="font-semibold truncate">{row.label}</div>
+                      <div className="text-xs text-gray-300">
+                        {row.lobby
+                          ? 'Waiting for your partner to join…'
+                          : row.yourTurn
+                            ? '⏳ Your turn'
+                            : `Waiting on partner · ${relativeTime(row.updatedAtMs)}`}
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => archiveGame(row.id)}
+                      className="text-xs px-2 py-1 rounded bg-gray-600 hover:bg-gray-500 flex-shrink-0"
+                      aria-label={`Archive ${row.label}`}
+                    >
+                      Archive
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              {/* Finished games, collapsed. */}
+              {finishedRows.length > 0 && (
+                <details className="bg-gray-700/40 rounded-lg px-4 py-2">
+                  <summary className="cursor-pointer text-sm text-gray-300">
+                    Finished games ({finishedRows.length})
+                  </summary>
+                  <div className="mt-2 space-y-2">
+                    {finishedRows.map((row) => (
+                      <div key={row.id} className="flex justify-between items-center text-sm">
+                        <button className="text-left flex-1 truncate" onClick={() => switchToGame(row)}>
+                          {row.label} — over
+                        </button>
+                        <button
+                          onClick={() => archiveGame(row.id)}
+                          className="text-xs px-2 py-1 rounded bg-gray-600 hover:bg-gray-500"
+                        >
+                          Archive
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+
+              {/* Start a new game. */}
+              <div className="border-t border-gray-700 pt-4 space-y-2">
+                <div className="text-sm text-gray-400">Start a new game</div>
+                <input
+                  type="text"
+                  value={labelInput}
+                  onChange={(e) => setLabelInput(e.target.value)}
+                  placeholder="Partner's name (optional)"
+                  className="w-full px-3 py-2 rounded bg-gray-700 text-white placeholder-gray-500"
+                />
+                <button
+                  disabled={mpBusy}
+                  onClick={() => { unlockAudio(); hostNewGame(labelInput); }}
+                  className="w-full px-4 py-3 bg-teal-600 hover:bg-teal-700 rounded-lg font-semibold disabled:opacity-50"
+                >
+                  ➕ Create game & get a code
+                </button>
+              </div>
+
+              {/* Join by code. */}
+              <div className="border-t border-gray-700 pt-4 space-y-2">
+                <div className="text-sm text-gray-400">Join with a code</div>
+                <input
+                  type="text"
+                  value={joinInput}
+                  onChange={(e) => setJoinInput(e.target.value.toUpperCase())}
+                  placeholder="6-character code"
+                  maxLength={8}
+                  className="w-full px-3 py-2 rounded bg-gray-700 text-white placeholder-gray-500 tracking-widest"
+                />
+                <button
+                  disabled={mpBusy || !joinInput.trim()}
+                  onClick={() => { unlockAudio(); beginJoin(joinInput, { label: labelInput }); }}
+                  className="w-full px-4 py-3 bg-purple-600 hover:bg-purple-700 rounded-lg font-semibold disabled:opacity-50"
+                >
+                  🔑 Join game
+                </button>
+              </div>
+
+              <p className="text-xs text-gray-500 pt-2">
+                Games live on this device. Clearing site data loses access to
+                games in progress.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hosting: the code + share link, waiting for a partner to join. The
+          metadata listener deals automatically the moment they do. */}
+      {hostInfo && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full p-6 text-center">
+            <h2 className="text-2xl font-bold mb-2">Waiting for your partner…</h2>
+            <p className="text-gray-300 mb-5 text-sm">
+              Share the code or the link. The game deals itself the moment they join.
+            </p>
+            <div className="bg-gray-900 rounded-lg py-4 mb-4">
+              <div className="text-xs text-gray-400 mb-1">Game code</div>
+              <div className="text-4xl font-bold tracking-[0.3em]">{hostInfo.code}</div>
+            </div>
+            <button
+              onClick={() => {
+                if (navigator.clipboard) navigator.clipboard.writeText(hostInfo.link).catch(() => {});
+                setMpNotice('Link copied.');
+              }}
+              className="w-full px-4 py-3 bg-teal-600 hover:bg-teal-700 rounded-lg font-semibold mb-3"
+            >
+              📋 Copy invite link
+            </button>
+            <div className="text-xs text-gray-500 break-all mb-5">{hostInfo.link}</div>
+            <div className="flex items-center justify-center gap-2 text-gray-300 mb-5">
+              <span className="inline-block w-3 h-3 rounded-full bg-amber-400 animate-pulse" />
+              Waiting…
+            </div>
+            <button
+              onClick={() => { setHostInfo(null); switchToGame('solo'); }}
+              className="text-sm text-gray-400 hover:text-gray-200"
+            >
+              Cancel and return to solo
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* A guest who opened a game the host hasn't dealt yet. */}
+      {waitingForHostDeal && !hostInfo && !showLobby && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-40 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full p-6 text-center">
+            <h2 className="text-xl font-bold mb-2">You're in!</h2>
+            <p className="text-gray-300 mb-5 text-sm">
+              Waiting for the host to deal. The board appears as soon as they do.
+            </p>
+            <div className="flex items-center justify-center gap-2 text-gray-300 mb-5">
+              <span className="inline-block w-3 h-3 rounded-full bg-amber-400 animate-pulse" />
+              Waiting…
+            </div>
+            <button
+              onClick={() => setShowLobby(true)}
+              className="text-sm text-gray-400 hover:text-gray-200"
+            >
+              My Games
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Resume Saved Game Modal */}
       {showResumeModal && pendingResume && (
         <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
@@ -1523,7 +2502,7 @@ export default function PegsAndJokers() {
             <h2 className="text-2xl font-bold mb-3 text-center">Resume game?</h2>
             <p className="text-center text-gray-300 mb-6">
               You have a game in progress
-              {pendingResume.currentPlayer === 0 ? (
+              {ownsSeat(pendingResume.currentPlayer) ? (
                 <> — it's <span className="font-semibold text-amber-400">your turn</span>.</>
               ) : (
                 <>
@@ -1629,6 +2608,14 @@ export default function PegsAndJokers() {
                 >
                   Random First Player
                 </button>
+                {multiplayerConfigured && (
+                  <button
+                    onClick={() => { unlockAudio(); setMpNotice(null); setShowFirstPlayerModal(false); setShowLobby(true); }}
+                    className="w-full px-6 py-4 bg-teal-600 hover:bg-teal-700 rounded-lg text-lg font-semibold transition-colors"
+                  >
+                    🎮 Play with a Friend
+                  </button>
+                )}
               </div>
             ) : (
               <div className="text-center">
@@ -1652,6 +2639,114 @@ export default function PegsAndJokers() {
                 </div>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* End-of-game overlay. Replaces the old inline green banner, which
+          rendered independently of the status line and so could sit above a
+          stale "Blue is thinking…". */}
+      {/* Package 5's settle/present split: `winner` is set immediately when
+          the game ends (endGame), but the overlay itself waits for any
+          in-flight replay to finish — a remote win auto-replays the winning
+          move first, so the player sees it before the result appears. */}
+      {winner !== null && outcome && !isReplaying && !endOverlayDismissed && (
+        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full max-h-[90vh] overflow-y-auto p-6">
+            <h2 className={`text-3xl font-bold mb-1 text-center ${outcome.won ? 'text-green-400' : 'text-gray-200'}`}>
+              {outcome.won ? '🎉 ' : ''}{outcome.text}
+            </h2>
+            <p className="text-center text-sm text-gray-400 mb-5">
+              {gameMode === GAME_MODES.PARTNERS ? 'Partner game' : 'Classic game'}
+            </p>
+
+            {/* The winning move. Worth spelling out because remotely the game
+                can end on a move you never saw happen. */}
+            {endInfo?.description && (
+              <div className="bg-gray-700/50 rounded-lg px-4 py-3 mb-5">
+                <div className="text-xs text-gray-400 mb-1">Winning move</div>
+                <div className="text-sm">
+                  <span
+                    className="font-semibold"
+                    style={{ color: PLAYER_COLORS[endInfo.winningSeat ?? 0] }}
+                  >
+                    {endInfo.winningSeat !== null && ownsSeat(endInfo.winningSeat)
+                      ? `You (${PLAYER_NAMES[endInfo.winningSeat]})`
+                      : PLAYER_NAMES[endInfo.winningSeat ?? 0]}
+                  </span>
+                  <span className="text-gray-200"> — {endInfo.description}</span>
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-4 gap-2 mb-5 text-center">
+              <div className="bg-gray-700 rounded-lg p-2">
+                <div className="text-lg font-bold">{endInfo?.turns ?? 0}</div>
+                <div className="text-[10px] text-gray-400">Turns</div>
+              </div>
+              <div className="bg-gray-700 rounded-lg p-2">
+                <div className="text-lg font-bold">{endInfo?.jokersPlayed ?? 0}</div>
+                <div className="text-[10px] text-gray-400">Jokers</div>
+              </div>
+              <div className="bg-gray-700 rounded-lg p-2">
+                <div className="text-lg font-bold text-green-400">{endInfo?.bumpsDelivered ?? 0}</div>
+                <div className="text-[10px] text-gray-400">Bumps</div>
+              </div>
+              <div className="bg-gray-700 rounded-lg p-2">
+                <div className="text-lg font-bold text-red-400">{endInfo?.timesBumped ?? 0}</div>
+                <div className="text-[10px] text-gray-400">Bumped</div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 mb-6 text-center">
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <div className="text-lg font-bold">{stats.gamesPlayed}</div>
+                <div className="text-[10px] text-gray-400">Games</div>
+              </div>
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <div className="text-lg font-bold text-amber-400">{Math.round(winRate(stats) * 100)}%</div>
+                <div className="text-[10px] text-gray-400">Win rate</div>
+              </div>
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <div className={`text-lg font-bold ${stats.currentStreak > 0 ? 'text-green-400' : stats.currentStreak < 0 ? 'text-red-400' : ''}`}>
+                  {formatStreak(stats.currentStreak)}
+                </div>
+                <div className="text-[10px] text-gray-400">Streak</div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <button
+                onClick={() => {
+                  unlockAudio();
+                  startModeRef.current = 'chosen';
+                  startGameWithPlayer(mySeat);
+                }}
+                className="w-full px-6 py-3 bg-amber-600 hover:bg-amber-700 rounded-lg font-semibold transition-colors"
+              >
+                Rematch
+              </button>
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  onClick={startNewSoloGame}
+                  className="px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-semibold transition-colors"
+                >
+                  New Game
+                </button>
+                <button
+                  onClick={() => setShowStats(true)}
+                  className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg text-sm font-semibold transition-colors"
+                >
+                  📊 Stats
+                </button>
+                <button
+                  onClick={() => setEndOverlayDismissed(true)}
+                  className="px-3 py-2 bg-gray-600 hover:bg-gray-700 rounded-lg text-sm font-semibold transition-colors"
+                >
+                  View board
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -1858,6 +2953,22 @@ export default function PegsAndJokers() {
             >
               {animationsEnabled ? 'Animations On' : 'Animations Off'}
             </button>
+            {multiplayerConfigured && (
+              <button
+                onClick={() => setShowLobby(true)}
+                className="relative px-4 py-2 bg-teal-600 rounded hover:bg-teal-700"
+              >
+                🎮 My Games
+                {waitingCount > 0 && (
+                  <span
+                    className="absolute -top-1 -right-1 min-w-[20px] h-5 px-1 flex items-center justify-center rounded-full bg-amber-500 text-xs font-bold text-gray-900"
+                    aria-label={`${waitingCount} games waiting on you`}
+                  >
+                    {waitingCount}
+                  </span>
+                )}
+              </button>
+            )}
             <button
               onClick={() => setShowStats(true)}
               className="px-4 py-2 bg-indigo-600 rounded hover:bg-indigo-700"
@@ -1865,7 +2976,7 @@ export default function PegsAndJokers() {
               📊 Stats
             </button>
             <button
-              onClick={initGame}
+              onClick={startNewSoloGame}
               className="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700"
             >
               New Game
@@ -1873,21 +2984,26 @@ export default function PegsAndJokers() {
           </div>
         </div>
 
-        {winner !== null && (
-          <div className="text-center text-2xl font-bold mb-4 p-4 bg-green-600 rounded">
-            {gameMode === GAME_MODES.PARTNERS
-              ? (winner === 0 ? 'Your team wins! 🎉' : 'Opponents win!')
-              : (winner === 0 ? 'You Win!' : 'Opponent Wins!')}
-          </div>
-        )}
-
+        {/* The status line is derived from `phase` — it can never be stale, and
+            in particular never reads "Blue is thinking…" after the game ends.
+            `notice` sits under it for transient feedback and clears itself on
+            the next phase change. */}
         <div className="text-center mb-4 p-2 bg-gray-800 rounded">
-          {gameMessage}
+          <div>{statusLine}</div>
+          {notice && <div className="text-sm text-amber-300 mt-1">{notice}</div>}
+          {phase === PHASES.FINISHED && endOverlayDismissed && (
+            <button
+              onClick={() => setEndOverlayDismissed(false)}
+              className="mt-2 px-3 py-1 bg-amber-600 hover:bg-amber-700 rounded text-sm font-semibold"
+            >
+              🏁 Show result
+            </button>
+          )}
         </div>
 
         {/* Undo a mis-tapped split: only available between the two halves of a
             split, before the second peg commits the move */}
-        {splitUndo && splitRemaining !== 0 && currentPlayer === 0 && winner === null && !isReplaying && (
+        {splitUndo && splitRemaining !== 0 && isMyTurn && winner === null && !isReplaying && (
           <div className="text-center mb-4">
             <button
               onClick={undoSplit}
@@ -1898,8 +3014,24 @@ export default function PegsAndJokers() {
           </div>
         )}
 
+        {/* §5.2: remote, but animations are off — no auto-replay (there'd be
+            nothing to watch), so summarize what happened as text instead. */}
+        {session && !animationsEnabled && !isReplaying && replayDescriptions.length > 0 && isMyTurn && winner === null && (
+          <div className="mb-4 p-3 rounded bg-gray-800 text-sm">
+            <div className="font-semibold mb-1">Since your last turn:</div>
+            <ul className="space-y-0.5">
+              {replayDescriptions.map((f, i) => (
+                <li key={i}>
+                  <span className="font-semibold" style={{ color: PLAYER_COLORS[f.player] }}>{PLAYER_NAMES[f.player]}</span>
+                  <span className="text-gray-300"> — {f.description}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         {/* Instant replay: offer a rewind when it's your turn and the AI just moved */}
-        {!isReplaying && replayReady > 0 && currentPlayer === 0 && winner === null && (
+        {!isReplaying && replayReady > 0 && isMyTurn && winner === null && (
           <div className="text-center mb-4">
             <button
               onClick={startReplay}
@@ -1962,7 +3094,7 @@ export default function PegsAndJokers() {
                     // While a bumped peg is flying back, its start slot renders empty
                     const isFlyingBack = bumpFx && bumpFx.player === player && bumpFx.pegIndex === i;
                     const hasPeg = pegs[player][i]?.location === 'start' && !isFlyingBack;
-                    const isClickable = currentPlayer === 0 && player === controlledOwner && hasPeg && !jokerMode;
+                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && !jokerMode;
                     const isSelected = player === controlledOwner && (i === selectedPeg || i === jokerSourcePeg) && pegs[player][i]?.location === 'start';
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(i);
                     const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(i);
@@ -1996,7 +3128,7 @@ export default function PegsAndJokers() {
                     const { x, y } = getHomePosition(player, i);
                     const hasPeg = pegs[player].some(p => p.location === 'home' && p.homePosition === i);
                     const pegIndex = pegs[player].findIndex(p => p.location === 'home' && p.homePosition === i);
-                    const isClickable = currentPlayer === 0 && player === controlledOwner && hasPeg && i < 4 && !jokerMode;
+                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && i < 4 && !jokerMode;
                     const isSelected = player === controlledOwner && pegIndex === selectedPeg && hasPeg;
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(pegIndex);
                     const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(pegIndex);
@@ -2042,7 +3174,7 @@ export default function PegsAndJokers() {
                   const isJokerSource = jokerMode && player === controlledOwner && pegIndex === jokerSourcePeg;
                   // The human can click the pegs they control when not in joker mode,
                   // target pegs in joker mode, or their controlled pegs to cancel.
-                  const isClickable = currentPlayer === 0 && (player === controlledOwner || isJokerTarget);
+                  const isClickable = isMyTurn && (player === controlledOwner || isJokerTarget);
                   const isSelected = player === controlledOwner && (pegIndex === selectedPeg || isJokerSource);
                   const isMovable = player === controlledOwner && !jokerMode && movablePegSet != null && movablePegSet.has(pegIndex);
                   const isDimmed = player === controlledOwner && !jokerMode && movablePegSet != null && !movablePegSet.has(pegIndex);
@@ -2061,7 +3193,7 @@ export default function PegsAndJokers() {
                             setJokerMode(false);
                             setJokerSourcePeg(null);
                             setSelectedPeg(null);
-                            setGameMessage('Joker cancelled. Select a card and peg to move.');
+                            setNotice(null);
                           } else {
                             handlePegClick(player, pegIndex);
                           }
@@ -2168,14 +3300,15 @@ export default function PegsAndJokers() {
 
               {/* Per-player discard piles with stuck counters */}
               {[0, 1, 2, 3].map(player => {
-                // Position discard piles in corners around center draw pile (rotated so Yellow is at bottom)
+                // Discard piles sit in the corners around the centre draw pile,
+                // indexed by *visual side* so they follow the board rotation.
                 const positions = [
-                  { x: 220, y: 240 },  // Yellow - bottom-right of center
-                  { x: 130, y: 240 },  // Blue - bottom-left of center
-                  { x: 130, y: 140 },  // Pink - top-left of center
-                  { x: 220, y: 140 }   // Green - top-right of center
+                  { x: 130, y: 140 },  // top side - top-left of center
+                  { x: 220, y: 140 },  // right side - top-right of center
+                  { x: 220, y: 240 },  // bottom side (yours) - bottom-right of center
+                  { x: 130, y: 240 }   // left side - bottom-left of center
                 ];
-                const pos = positions[player];
+                const pos = positions[visualSideFor(player, mySeat)];
                 const lastCard = discardPiles[player]?.[discardPiles[player].length - 1];
                 const stuckCount = stuckCounts[player];
 
@@ -2229,23 +3362,34 @@ export default function PegsAndJokers() {
                 );
               })}
 
-              {/* Labels with last move - rotated so Yellow (player 0) is at bottom */}
-              <g>
-                <text x="200" y="20" textAnchor="middle" fill={PLAYER_COLORS[2]} fontSize="11" fontWeight="bold">{roleLabel(2)}</text>
-                {lastMoves[2] && <text x="200" y="31" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[2]}</text>}
-              </g>
-              <g transform="rotate(90 378 205)">
-                <text x="378" y="200" textAnchor="middle" fill={PLAYER_COLORS[3]} fontSize="11" fontWeight="bold">{roleLabel(3)}</text>
-                {lastMoves[3] && <text x="378" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[3]}</text>}
-              </g>
-              <g>
-                <text x="200" y="383" textAnchor="middle" fill={PLAYER_COLORS[0]} fontSize="11" fontWeight="bold">{roleLabel(0)}</text>
-                {lastMoves[0] && <text x="200" y="394" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[0]}</text>}
-              </g>
-              <g transform="rotate(-90 22 205)">
-                <text x="22" y="200" textAnchor="middle" fill={PLAYER_COLORS[1]} fontSize="11" fontWeight="bold">{roleLabel(1)}</text>
-                {lastMoves[1] && <text x="22" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[1]}</text>}
-              </g>
+              {/* Labels with last move, placed by visual side so YOUR seat is
+                  always the one at the bottom */}
+              {(() => {
+                const top = seatAtVisualSide(0, mySeat);
+                const right = seatAtVisualSide(1, mySeat);
+                const bottom = seatAtVisualSide(2, mySeat);
+                const left = seatAtVisualSide(3, mySeat);
+                return (
+                  <>
+                    <g>
+                      <text x="200" y="20" textAnchor="middle" fill={PLAYER_COLORS[top]} fontSize="11" fontWeight="bold">{roleLabel(top)}</text>
+                      {lastMoves[top] && <text x="200" y="31" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[top]}</text>}
+                    </g>
+                    <g transform="rotate(90 378 205)">
+                      <text x="378" y="200" textAnchor="middle" fill={PLAYER_COLORS[right]} fontSize="11" fontWeight="bold">{roleLabel(right)}</text>
+                      {lastMoves[right] && <text x="378" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[right]}</text>}
+                    </g>
+                    <g>
+                      <text x="200" y="383" textAnchor="middle" fill={PLAYER_COLORS[bottom]} fontSize="11" fontWeight="bold">{roleLabel(bottom)}</text>
+                      {lastMoves[bottom] && <text x="200" y="394" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[bottom]}</text>}
+                    </g>
+                    <g transform="rotate(-90 22 205)">
+                      <text x="22" y="200" textAnchor="middle" fill={PLAYER_COLORS[left]} fontSize="11" fontWeight="bold">{roleLabel(left)}</text>
+                      {lastMoves[left] && <text x="22" y="211" textAnchor="middle" fill="#9CA3AF" fontSize="8">{lastMoves[left]}</text>}
+                    </g>
+                  </>
+                );
+              })()}
             </svg>
           </div>
 
@@ -2254,7 +3398,7 @@ export default function PegsAndJokers() {
             <div className="mb-4">
               <h3 className="text-lg font-semibold mb-2">Your Hand:</h3>
               <div className="flex gap-2 flex-wrap">
-                {hands[0].map((card, i) => renderCard(card, i, i === selectedCard, playableCards[i]))}
+                {myHand.map((card, i) => renderCard(card, i, i === selectedCard, playableCards[i]))}
               </div>
             </div>
 
@@ -2282,7 +3426,7 @@ export default function PegsAndJokers() {
                     setJokerMode(false);
                     setJokerSourcePeg(null);
                     setSelectedPeg(null);
-                    setGameMessage('Joker cancelled. Select a card and peg to move.');
+                    setNotice(null);
                   }}
                   className="px-3 py-1 bg-gray-600 rounded hover:bg-gray-700"
                 >
@@ -2298,7 +3442,7 @@ export default function PegsAndJokers() {
                 <button
                   onClick={() => {
                     setDiscardMode(false);
-                    setGameMessage('Your turn! Select a card and peg to move.');
+                    setNotice(null);
                   }}
                   className="px-3 py-1 bg-gray-600 rounded hover:bg-gray-700"
                 >
@@ -2310,7 +3454,7 @@ export default function PegsAndJokers() {
             {/* Discarding is only allowed when the player is genuinely stuck (no
                 legal move). If any card can be played, no discard option is shown
                 so the player can't skip a turn they're required to play. */}
-            {currentPlayer === 0 && !jokerMode && !splitRemaining && !discardMode && !isReplaying && hands[0]?.length > 0 && !playableCards.some(Boolean) && (
+            {isMyTurn && !jokerMode && !splitRemaining && !discardMode && !isReplaying && myHand.length > 0 && !playableCards.some(Boolean) && (
               <div className="mb-4">
                 <div>
                   <button
@@ -2318,13 +3462,13 @@ export default function PegsAndJokers() {
                       setDiscardMode(true);
                       setSelectedCard(null);
                       setSelectedPeg(null);
-                      setGameMessage('Select a card to discard.');
+                      setNotice(null);
                     }}
                     className="px-4 py-2 bg-red-600 rounded hover:bg-red-700 font-bold"
                   >
-                    No Valid Move - Select Card to Discard {stuckCounts[0] > 0 && `(${stuckCounts[0]}/3)`}
+                    No Valid Move - Select Card to Discard {stuckCounts[mySeat] > 0 && `(${stuckCounts[mySeat]}/3)`}
                   </button>
-                  {stuckCounts[0] === 2 && (
+                  {stuckCounts[mySeat] === 2 && (
                     <p className="text-yellow-400 text-sm mt-1">Next stuck discard will let you start a peg!</p>
                   )}
                 </div>
