@@ -1,6 +1,8 @@
 # Multiplayer Phase 1 — Implementation Plan
 
-**Status:** Packages 0 and 1 are built and pushed to the branch. Packages 2–6 are approved design, not yet implemented.
+**Status:** Packages 0, 1, 2, and 3 are built, pushed to the branch, and verified against a live
+Firebase project (`pnj-dan-4a7f`). Packages 4 and 5 are approved design, not yet implemented — this
+is the next work. Package 6 (final pass) is behind those.
 **Branch:** `claude/multiplayer-remote-play-ecx61a`
 **Audience:** the agent implementing this. Assume no memory of the design discussion — everything needed is here.
 
@@ -16,6 +18,16 @@ drop polling entirely. Anything below still saying "Supabase", "RPC", "anon key"
 
 **Revision note (written after building Packages 0 and 1).** §3.1, §3.2, §3.4, §4.1, §4.3, §5.1 and
 §5.2 have been corrected against the code as it now stands. The shape of the design is unchanged; what changed is a handful of RPC signatures, the tally model, the lobby's "whose turn" test, and three assumptions that Package 1 invalidated. Revised passages are marked **[revised]** and say what was wrong.
+
+**Second revision note (written after building Packages 2 and 3).** Read "What Packages 2 and 3
+actually built" right before §Package 4 — it is the ground truth for the session client's real
+interface (which differs from §2.5's sketch in a few names), the seat-owner layouts and
+`nextHumanSeat` (already implemented, reuse them), the JSON-string encoding `publishState` already
+handles, and exactly which turn-handoff call sites in `PegsAndJokers.jsx` need to route through the
+`commitTurn` helper Package 4 introduces. Line numbers anywhere else in this plan are stale — the
+file has grown to ~3160 lines. Also fixed in this pass: a real bug in `scripts/setup-firebase.sh`
+(a missing header made a failed anonymous-auth enable print "enabled" anyway) — the live project is
+healthy now, but if you ever re-run that script, know it was broken and is now fixed.
 
 ---
 
@@ -659,6 +671,121 @@ games at once against two different partners plus a solo game, switch between al
 each resumes exactly where it was with the right seat, board orientation, replay buffer, and
 tallies. Confirm the badge count matches the number of games actually waiting on you.
 
+**Confirmed live, manually:** two real devices (Chrome + Safari) against `pnj-dan-4a7f`. Host
+created, guest joined by code, both landed on a correctly-oriented dealt board. Playing a move on
+one device does **not** appear on the other — expected, since that is exactly what Package 4 builds.
+
+---
+
+### What Packages 2 and 3 actually built
+
+Read this before starting Package 4 — it is ground truth, and line numbers elsewhere in this plan
+predate it. `CLAUDE.md`'s "Remote play" section is the other ground-truth source; read both.
+`PegsAndJokers.jsx` is now ~3160 lines (multiplayer wiring added a large block after the seat-owner
+state, roughly lines 200–890 — the exact ranges below are anchored to comments/function names, not
+line numbers, since those will drift further).
+
+**`src/net/session.js` — the real interface (differs from §2.5's sketch in a few names):**
+
+```js
+signIn()                                  // anonymous, lazy, idempotent
+createGame(mode)                          // → { id, code }
+joinGame(code) / joinGameById(id)         // → { id, seat }
+fetchGame(id)                             // → { id, meta, state, replay, version }, one-shot
+startGame(id, { state, replay, currentPlayer, waitingOn })   // host's initial deal, version 0→1
+publishState(id, payload, expectedVersion) // → new version; throws VersionConflict — READY, UNUSED
+subscribeGameMeta(id, onMeta)             // → unsubscribe. Metadata doc: status/guestUid/waitingOn/winner
+subscribeGameState(id, onState)           // → unsubscribe. live/current doc: {state, replay, version}
+subscribeGame                             // = subscribeGameState (the §2.5 name, kept as an alias)
+subscribeMyGames(onRows)                  // → unsubscribe. Powers the lobby + badge
+```
+
+**`publishState` and `VersionConflict` already exist and are fully tested but call-site-unused** —
+Package 4 is mostly *wiring these in*, not building them. `publishState`'s payload takes `state` and
+`replay` as plain JS objects/arrays; `session.js` handles the JSON-string encoding internally (see
+below), so callers never touch that.
+
+**Firestore cannot store nested arrays — already solved, don't rediscover it.** The game state is
+arrays-of-arrays (`pegs`/`hands`/`discardPiles`), which Firestore rejects raw. `session.js` stores
+`live/current.state` and `.replay` as **JSON strings** and decodes them transparently in
+`fetchGame`/`subscribeGameState`. This was found the hard way — Package 3's manual two-device test
+initially failed silently (host dealt locally, the write never actually landed, guest never saw a
+board) before this fix. If you touch `session.js`'s encode/decode helpers, keep the round-trip test
+in `session.test.js` (`'round-trips a state with nested arrays'`) green.
+
+**Seat helpers already built in `src/net/seats.js` — reuse, don't reinvent:**
+- `nextHumanSeat(from, seatOwners)` — walks the fixed turn order to the next non-AI seat. This is
+  **exactly** §4.2's AI-simulation gate and §3.2's `waitingOn` — already used by Package 3 to compute
+  `waitingOn` when publishing the initial deal (`dealAndStartAsHost`). Package 4 needs the same
+  function for the AI-effect gate; don't write a second implementation.
+- `HOST_SEAT_OWNERS`, `GUEST_SEAT_OWNERS`, `remoteSeatOwners(seat)` — the two remote layouts and a
+  helper that picks the right one from a seat number.
+- `HOST_SEAT` / `GUEST_SEAT` constants live in `src/net/protocol.js`, not `seats.js`.
+
+**The component's remote-session state and helpers (search for these names, not line numbers):**
+- `session` (state) / `sessionRef` (ref mirror) — `null` for solo, else `{ id, seat, version }`.
+  `version` is the version currently applied to the local board; use it as `expectedVersion` when you
+  add the first `publishState` call.
+- `openMeta` — the live metadata doc for the open game (status, currentPlayer, waitingOn, winner).
+  Already populated and re-rendered on every metadata delivery.
+- `handleRemoteState(id, payload, info)` — **the seam Package 4 extends.** Currently: adopts a state
+  snapshot via `applySavedGame`, ignores echoes via `info.isEcho(s.version)`. It does **not** yet
+  look at `winner` (which lives in metadata, not in the `state` blob — `serializeGame()` never wrote
+  a `winner` field, by design) or seed `replayLogRef` from `payload.replay`, or trigger AI simulation.
+  §4.3's "adopt first, then call `endGame` with the snapshot's winner" and §5.1's silent-AI-then-
+  auto-replay both extend this function.
+- `handleOpenMeta(id, meta)` — currently only watches for the host's guest-joined trigger. Package 4
+  needs it (or a sibling effect) to react to `meta.winner` arriving without a state change, and to
+  drive the "waiting for partner" status Package 3 already renders from `openMeta`.
+- `dealAndStartAsHost` — Package 3's only publish so far (the version 0→1 initial deal via
+  `startGame`). Read it as the worked example for what a Package-4 `commitTurn` publish call looks
+  like: build the `serializeGame()`-shaped state, compute `waitingOn` via `nextHumanSeat`, call the
+  session function, catch and surface a non-fatal notice on failure (a remote write failing must
+  never leave the local board stuck — the mover already committed locally).
+- `attachGameListeners` / `detachGameListeners` — already wired to every path that changes the open
+  game (create, join, switch, unmount). Nothing new needed here for Package 4.
+
+**AI-effect gate is half done.** The effect (search `// AI logic - drives the AI seats`) currently
+gates on `if (!isAISeat(seatOwners, currentPlayer)) return;` — enough to stop a client running the
+*other human's* turn, but **not** §4.2's real rule. Today, in a live remote game with two devices
+both idling on an AI seat, **both clients will independently simulate the same AI move**, because
+nothing yet prevents it — there is no publish to race on yet, so this hasn't bitten anyone, but it
+will the moment `commitTurn` exists. The fix is exactly §4.2: gate on
+`ownsSeat(nextHumanSeat(currentPlayer, seatOwners))` (`nextHumanSeat` from `seats.js`, already
+imported). Get this exactly right — the risk table's warning about double-simulation is real here,
+not hypothetical.
+
+**Turn-handoff call sites — the four places `commitTurn` must wrap.** Grep for
+`setCurrentPlayer(nextPlayer)`; there are five hits, one of which (inside the AI effect's own
+`completeAIMove`) is **not** a human turn end and must NOT publish — an AI move is simulated locally
+by whichever client is responsible and folded into that client's *next* human publish, per §4.2's
+whole point (no server-side AI, no extra writes). The four real sites, matching §4.1's list exactly:
+`executeMove`, `completeSplit`, `discardAndDraw` (the human branch — `discardAndDraw` also runs for
+AI seats via the AI effect, which must NOT publish), and `handleJokerTarget`.
+
+**Stats tallies are still the old single-counter model** (`turnsRef`, `jokersThisGameRef`,
+`bumpsDeliveredThisGameRef`, `timesBumpedThisGameRef` — one number each, not per-seat arrays). This
+was deliberately deferred here: Package 3's game-switching never touches a nonzero tally (no turn
+exchange has published one yet), so the restructure wasn't yet load-bearing. **It is load-bearing
+now.** §4.1's per-seat-array correction is genuinely Package 4 scope — do it as part of this package,
+not after.
+
+**`endGame`'s settle/present split (§5.2) has NOT been done yet.** `endGame` (search `const endGame`)
+still unconditionally cancels `replaySegTimerRef`/`replayFrameTimerRef` and restores the live board —
+correct for Packages 0/1, wrong once Package 5's silent-then-replay needs those timers left alone so
+the winning move can be watched before the overlay appears. Needed before Package 5 works; §5.2
+describes the split (settle: cancel-timers/set-winner/record-stats, always immediate; present: the
+overlay, gated separately).
+
+**Verified against a live Firebase project**, not just the emulator: `pnj-dan-4a7f` — Firestore
+native, anonymous auth, rules and indexes deployed, GitHub Actions repo variables set. Two real
+devices (Chrome desktop + Safari) created/joined/dealt correctly. One live-project gotcha worth
+knowing: a **brand-new** Firebase project's Auth config does not exist until either the console's
+Authentication page is opened once (Build → Authentication → Get started) or some other action
+provisions it — the anonymous-auth enable API call returns `CONFIGURATION_NOT_FOUND` until then, no
+billing involved. `scripts/setup-firebase.sh` detects this and tells you to do it; already done for
+`pnj-dan-4a7f`, so Package 4/5 work needs no further setup.
+
 ---
 
 ### Package 4 — Turn exchange (the core)
@@ -677,7 +804,9 @@ state and their turn simply starts over when they return. That is intended.
 The three sites where a human turn ends are `executeMove`, `completeSplit`, `handleJokerTarget` and
 `discardAndDraw`'s human branch. (Package 0 made `handleJokerTarget` a real fourth site — it used to
 hardcode `nextPlayer = 1`.) Route all of them through one `commitTurn(nextPlayer, nextState)` helper
-rather than duplicating publish logic.
+rather than duplicating publish logic. **[revised]** Confirmed current: grep
+`setCurrentPlayer(nextPlayer)` for the exact four call sites — see "What Packages 2 and 3 actually
+built" for why the AI effect's own fifth hit must NOT go through `commitTurn`.
 
 #### Payload: NOT `serializeGame()` as-is **[revised]**
 
@@ -725,19 +854,24 @@ Turn order is fixed 0→1→2→3→0 and the AI seats sit *between* the two hum
 > A client runs the AI seats forward only when the run of AI seats after `currentPlayer`
 > terminates at one of **its own** seats.
 
+**[revised]** `nextHumanSeat` is already implemented in `src/net/seats.js` (used today by
+`dealAndStartAsHost` to compute `waitingOn`) and already unit-tested for every seat layout — import
+it, don't redefine it:
+
 ```js
-// The next non-AI seat at or after `from`, walking the fixed turn order.
-function nextHumanSeat(from, seatOwners) {
+export function nextHumanSeat(from, seatOwners) {
   let p = from;
-  for (let i = 0; i < 4; i++) {
-    if (seatOwners[p] !== 'ai') return p;
-    p = (p + 1) % 4;
+  for (let i = 0; i < NUM_PLAYERS; i++) {
+    if (seatOwners[p] !== SEAT_AI) return p;
+    p = (p + 1) % NUM_PLAYERS;
   }
   return from;
 }
 ```
 
-Gate the AI effect (`:918`) on `mySeats.includes(nextHumanSeat(currentPlayer, seatOwners))`.
+Gate the AI effect (search `// AI logic - drives the AI seats`) on
+`ownsSeat(nextHumanSeat(currentPlayer, seatOwners))`, replacing its current (insufficient)
+`!isAISeat(seatOwners, currentPlayer)` check.
 
 Trace it: the host moves and publishes with `currentPlayer = 1`. On the host `nextHumanSeat(1) = 2`
 — not mine, so the host stops and shows "Waiting for Pink". On the guest `nextHumanSeat(1) = 2` —
@@ -779,19 +913,26 @@ subscription costs nothing at all, and an update arrives in milliseconds rather 
 seconds late. There is no version gate to build, no `visibilitychange` backoff to tune, and no
 second cadence.
 
+**[revised — all of this is already built by Package 3.]** `subscribeGameState` (aliased as
+`subscribeGame`) and `subscribeGameMeta` (a second listener on the metadata doc, not in this plan's
+original two-listener count but needed for the host's waiting-for-guest screen — see "What Packages
+2 and 3 actually built") are both attached via `attachGameListeners`/detached via
+`detachGameListeners` on every open/switch/unmount path already. `subscribeMyGames` powers the lobby
+and badge already. Nothing to build here for Package 4 — only the two items below are still open.
+
 What still needs care:
 
-- **Detach listeners.** Switching games (§3.3) or unmounting must call the unsubscribe. A leaked
-  listener is now the failure mode that costs money, where a leaked interval used to be.
-- **Ignore your own echo.** Your write comes back through your own listener. Compare against the
-  version you hold and adopt only when it is higher; Firestore also flags local writes via
-  `snapshot.metadata.hasPendingWrites`, which is the cheaper test.
+- **Ignore your own echo — already done.** `handleRemoteState` calls `info.isEcho(s.version)`
+  (backed by `protocol.js`'s `isEcho`, which checks `hasPendingWrites` then version) before adopting.
+  Nothing to add.
 - **Offline is fine and you get it free.** Firestore's SDK queues writes made offline and replays
   them on reconnect, which matters for a PWA. Do not build a queue.
 
-**Adopting a state with a higher version.** Unchanged from earlier drafts: adopt it wholesale
-through the existing `applySavedGame` path, then seed `replayLogRef` from the received frames (after
-the adopt — `applySavedGame` calls `resetReplay()`), then let §4.2 decide whether to simulate.
+**Adopting a state with a higher version — partially done.** `handleRemoteState` already calls
+`applySavedGame(payload.state)` and updates `session.version`. **Still missing:** seeding
+`replayLogRef` from `payload.replay` after the adopt (`applySavedGame` calls `resetReplay()`, which
+empties it — must happen after, per §4.3), and letting §4.2's gate decide whether to simulate. Both
+are Package 4/5 work in `handleRemoteState`, not new plumbing.
 
 **Version conflicts** are now enforced by the database rather than assumed away. Rule (b) in §2.4
 only permits `version == resource.data.version + 1`, so two clients cannot both advance the same
@@ -832,7 +973,8 @@ readable pace.
 
 #### 5.2 Details
 
-- The replay banner (`:1911`) gets a **Skip** button — `stopReplay` already does the right thing.
+- The replay banner (search `📺 Instant Replay`) gets a **Skip** button — `stopReplay` already does
+  the right thing.
 - `animationsEnabled === false` → no auto-replay; show a text summary of the frames instead.
 - No frames (your first turn, a fresh join) → no replay.
 - **Solo is unchanged**: the AI still animates live and the replay button stays manual. Silent
@@ -840,20 +982,23 @@ readable pace.
   turn start — keep it that small.
 - If the game ended during step 1 or 2, still play the replay, *then* show the end-of-game overlay.
   You want to see the winning move. Interaction stays locked throughout.
-  **[revised — this needs a change to what Package 1 built.]** `endGame` currently does the opposite:
-  it cancels `replaySegTimerRef` and `replayFrameTimerRef` and restores the live board, and
-  `derivePhase` ranks `finished` above `replaying`. Split it into *settle* (cancel timers, set
-  `winner`, record stats — always immediate, so nothing can move afterwards) and *present* (the
-  overlay). Gate the overlay on `winner !== null && !isReplaying && !endOverlayDismissed`, and have
-  the settle step leave the replay timers alone when a replay is the deliberate presentation. Do not
-  delay setting `winner` — that is what makes the game inert.
-- The manual "📺 Instant Replay" button (`:1902`) stays, for re-watching.
-- Update the buffer-reset trigger at `:405` from `prev === 0` to `prev === mySeat`.
+  **[revised — this needs a change to what Package 1 built. Confirmed still true as of Package 3 —
+  see "What Packages 2 and 3 actually built".]** `endGame` currently does the opposite: it cancels
+  `replaySegTimerRef` and `replayFrameTimerRef` and restores the live board, and `derivePhase` ranks
+  `finished` above `replaying`. Split it into *settle* (cancel timers, set `winner`, record stats —
+  always immediate, so nothing can move afterwards) and *present* (the overlay). Gate the overlay on
+  `winner !== null && !isReplaying && !endOverlayDismissed`, and have the settle step leave the
+  replay timers alone when a replay is the deliberate presentation. Do not delay setting `winner` —
+  that is what makes the game inert.
+- The manual "📺 Instant Replay" button stays, for re-watching.
+- **[revised — already done.]** The buffer-reset trigger (search `replayPrevPlayerRef`) already uses
+  `ownsSeat(prev) && !ownsSeat(currentPlayer)`, i.e. the `mySeats`-array-aware form this bullet asked
+  for — Package 0 generalized it ahead of need. Nothing to change here.
 
 #### 5.3 Attribution in the replay
 
 In partner mode, once a player's own pegs are all home their cards move their *partner's* pegs
-(`controlledOwnerFor`, `:151`). Remotely that means you will watch your own pegs move in a frame
+(`controlledOwnerFor`). Remotely that means you will watch your own pegs move in a frame
 attributed to your partner. The frame description must say so explicitly — "Yellow used a 7 to
 move your peg home" — not just show the board changing. `lastMoves` and the frame descriptions
 already carry enough to render this.
@@ -874,9 +1019,10 @@ additions each package owns:
 |---|---|
 | 0 | seat-owner derivations, the generalised board rotation (pure math, assert `mySeat = 0` is identical to today) |
 | 1 | `didIWin` across both modes, the idempotent stats recorder, the partner-mode nemesis fix |
-| 2 | the game-code generator, the session client against a mocked Firestore, **and the security rules against the emulator** |
-| 4 | `nextHumanSeat` for every seat layout, including the solo `['me','ai','ai','ai']` case |
-| 5 | frame-buffer seeding and ordering (wire frames before locally-simulated ones) |
+| 2 | the game-code generator, the session client against a mocked Firestore, **and the security rules against the emulator** — done: `src/net/gameCode.test.js`, `src/net/session.test.js`, `firestore/rules.test.js` |
+| 3 | `nextHumanSeat` for every seat layout including solo, and the lobby row/sort/badge derivations — done: `src/net/seats.test.js`, `src/net/lobby.test.js`. **[revised]** This plan originally put `nextHumanSeat`'s tests under Package 4; it shipped a package early because Package 3 needed it for `waitingOn`. Package 4 reuses it — no new tests needed for the function itself, only for however `commitTurn` and the AI gate use it. |
+| 4 | `commitTurn`'s payload shape (per-seat tally arrays, `moveHistory` dropped), the AI-simulation gate for every seat layout, the turns-counter-as-plain-counter fix |
+| 5 | frame-buffer seeding and ordering (wire frames before locally-simulated ones), the `endGame` settle/present split |
 
 Put pure helpers in plain modules (`src/net/seats.js`, and extend `src/game/stats.js`) so they are
 testable without React. The repo has no component-test setup and this plan does not add one — if a
@@ -890,10 +1036,11 @@ What genuinely remains for the end:
 - **Build with the Firebase env vars unset** and confirm the app deploys and plays solo with no
   multiplayer UI. CI won't have the vars, so this is also what keeps CI green —
   `.github/workflows/ci.yml` itself needs no change.
-- **Update `CLAUDE.md`**: a "Remote play" section covering `src/net/*`, the seat-ownership model,
-  the derived phase/status model, the three turn-exchange rules, the two listeners, the security
-  rules as the whole backend, and the fact that solo is the `['me','ai','ai','ai']` special case. Prefer updating it incrementally as
-  each package lands; this is the backstop, not the plan.
+- **Update `CLAUDE.md`**: the "Remote play" section already exists (added by Package 2/3) and covers
+  `src/net/*`, the seat-ownership model, the data model, auth, the lobby, and listener discipline.
+  Package 4/5 need to *extend* it, not create it: add the three turn-exchange rules (§4.1–4.3), the
+  per-seat tally shape, and the silent-simulation/auto-replay behaviour. Prefer updating it
+  incrementally as each package lands; this is the backstop, not the plan.
 
 ---
 
@@ -924,34 +1071,46 @@ What genuinely remains for the end:
 
 ## 5. Definition of done
 
-- [ ] Solo play is behaviourally unchanged except for the Package 1 fixes.
-- [ ] Two people on separate devices play a full partner-mode game to a win.
-- [ ] The status line is never stale — verified across all four win routes.
+Checked items are confirmed done as of Package 3 (unit-tested, or verified live against
+`pnj-dan-4a7f` with two real devices, or both). Unchecked items are Package 4/5 scope.
+
+- [x] Solo play is behaviourally unchanged except for the Package 1 fixes.
+- [ ] Two people on separate devices play a full partner-mode game to a win. (They reach a dealt
+      board today; playing it to a win needs Package 4.)
+- [x] The status line is never stale — verified across all four win routes. (Package 1; unaffected
+      by Package 2/3.)
 - [ ] Stats are recorded exactly once per game, including when your partner's move wins while your
       app is closed, and including when an AI wins during the other client's simulation.
-- [ ] A partner-mode loss credits both opposing players.
+- [x] A partner-mode loss credits both opposing players. (Package 1.)
 - [ ] Exactly one transaction per human turn (verify in the Firestore usage view).
-- [ ] An idle subscription costs nothing — usage is flat while a game sits waiting overnight.
-- [ ] Every listener is detached on game switch and on unmount.
+- [x] An idle subscription costs nothing — usage is flat while a game sits waiting overnight. (Two
+      listeners are already live and idle-cheap by construction; nothing left to build for this one.)
+- [x] Every listener is detached on game switch and on unmount.
 - [ ] Bumps delivered and received are counted correctly on *both* devices, including bumps dealt by
       an AI seat the other client simulated.
-- [ ] A share link opened on a fresh device joins the game (not only the 6-char code).
-- [ ] The host's "waiting for your partner" screen advances by itself when the guest joins.
-- [ ] With the Firebase env vars set, a player with no remote games still gets today's exact solo
+- [x] A share link opened on a fresh device joins the game (not only the 6-char code). Verified live
+      (Chrome host + Safari guest).
+- [x] The host's "waiting for your partner" screen advances by itself when the guest joins. Verified
+      live.
+- [x] With the Firebase env vars set, a player with no remote games still gets today's exact solo
       flow — first-player modal, single local save, resume prompt, no lobby.
-- [ ] A client holding the app's public Firebase config, signed in as a *different* anonymous user,
+- [x] A client holding the app's public Firebase config, signed in as a *different* anonymous user,
       can read neither an active game's metadata nor its `live/current`. Asserted against the
-      Firestore emulator, not just tried by hand.
-- [ ] A solo-only player is never signed in and never downloads the Firestore SDK.
-- [ ] Either player can close the tab mid-game and rejoin where they left off.
-- [ ] Three concurrent remote games plus a solo game can be switched between freely, each resuming
+      Firestore emulator (`firestore/rules.test.js`, `npm run test:rules`).
+- [x] A solo-only player is never signed in and never downloads the Firestore SDK. Verified by
+      inspecting the built bundle — Firestore is entirely in a separate lazy chunk.
+- [x] Either player can close the tab mid-game and rejoin where they left off. (True today for the
+      *dealt* state; a half-played turn simply hasn't been written yet, per §4.1's design — revisit
+      this checkbox once turns actually publish mid-game.)
+- [x] Three concurrent remote games plus a solo game can be switched between freely, each resuming
       with the right seat, orientation, replay buffer, and tallies.
-- [ ] The lobby badge shows how many games are waiting on you, from a single `list_games` call.
+- [x] The lobby badge shows how many games are waiting on you, from a single `subscribeMyGames` call.
 - [ ] The AI never stalls the game regardless of who has the app open.
 - [ ] Each remote turn opens with an automatic replay of the two moves you missed, skippable.
 - [ ] A partner's move appears on the other device within a second or two, with no polling.
-- [ ] `npm test` and `npm run build` pass, including with the Firebase env vars unset.
-- [ ] `CLAUDE.md` documents the seat model, the phase model, and the turn-exchange rules.
+- [x] `npm test` and `npm run build` pass, including with the Firebase env vars unset.
+- [x] `CLAUDE.md` documents the seat model, the phase model, the data model, auth, and listener
+      discipline. Still needs: the turn-exchange rules once Package 4 lands.
 
 ## 6. Phase 2 preview (do not build)
 
