@@ -215,6 +215,16 @@ export default function PegsAndJokers() {
   const [replayInfo, setReplayInfo] = useState(null); // { player, description, index, total }
   const [replayReady, setReplayReady] = useState(0);
   const replayLogRef = useRef([]);        // recorded frames for the current round
+  // Frames THIS client has itself simulated since it last adopted a wire seed
+  // — a subset of replayLogRef, which also holds the seed (the frames adopted
+  // from the wire). Publishing must use only this: the seed is always the
+  // *recipient's own earlier move(s)*, since with exactly two humans strictly
+  // alternating publishes, whoever I'm about to publish to is exactly whoever
+  // my current seed originated from. Reusing replayLogRef (seed + own) for the
+  // wire re-forwards the recipient's own move back to them, and the next hop
+  // does it again — the buffer grows every round and eventually "replays the
+  // whole game". See commitTurn.
+  const replayOwnRef = useRef([]);
   const replayCancelRef = useRef(false);  // set to abort an in-flight replay
   const replaySegTimerRef = useRef(null); // per-step interval
   const replayFrameTimerRef = useRef(null); // between-frame / lead-in timeout
@@ -235,8 +245,14 @@ export default function PegsAndJokers() {
   // the one place its contents become visible to render.
   const [replayDescriptions, setReplayDescriptions] = useState([]);
 
+  // Called only for a move THIS client is simulating (an AI move, or another
+  // seat's stuck discard) — never for this client's own move, which builds a
+  // frame and hands it straight to commitTurn. So every call here is, by
+  // construction, new-since-the-seed: append to both the full display buffer
+  // and the wire-only "own" buffer.
   const recordReplayFrame = useCallback((frame) => {
     replayLogRef.current = appendReplayFrame(replayLogRef.current, frame);
+    replayOwnRef.current = appendReplayFrame(replayOwnRef.current, frame);
     setReplayReady(replayLogRef.current.length);
     setReplayDescriptions(replayLogRef.current.map(f => ({ player: f.player, description: f.description })));
   }, []);
@@ -248,6 +264,7 @@ export default function PegsAndJokers() {
     if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
     replayRestoreRef.current = null;
     replayLogRef.current = [];
+    replayOwnRef.current = [];
     setReplayReady(0);
     setReplayDescriptions([]);
     setReplayInfo(null);
@@ -591,7 +608,12 @@ export default function PegsAndJokers() {
       timesBumped: timesBumpedRef.current,
       startMode: null, // remote: counts toward neither chosenFirst nor randomFirst
     });
-    const wireReplay = frame ? appendReplayFrame(replayLogRef.current, frame) : seedReplay(replayLogRef.current);
+    // Use replayOwnRef, not replayLogRef: replayLogRef also holds the seed
+    // (frames adopted from the wire), which is always the recipient's own
+    // earlier move — re-publishing it back to them is the bug that made the
+    // replay grow to "the whole game" over a few rounds. See the comment on
+    // replayOwnRef's declaration.
+    const wireReplay = frame ? appendReplayFrame(replayOwnRef.current, frame) : seedReplay(replayOwnRef.current);
     publishState(s.id, {
       state: wireState, replay: wireReplay, currentPlayer: nextPlayer, waitingOn,
       winner: winnerIdx, winningSeat, description,
@@ -640,6 +662,7 @@ export default function PegsAndJokers() {
     if (info && info.isEcho(s.version)) return; // our own write coming back
     applySavedGame(payload.state); // resets replayLogRef — seed it back below
     replayLogRef.current = seedReplay(payload.replay);
+    replayOwnRef.current = []; // the seed is not "own" — see its declaration
     setReplayReady(replayLogRef.current.length);
     setReplayDescriptions(replayLogRef.current.map(f => ({ player: f.player, description: f.description })));
     setActiveSession({ ...s, version: payload.version });
@@ -746,6 +769,7 @@ export default function PegsAndJokers() {
       if (snap.state) {
         applySavedGame(snap.state); // resets replayLogRef — seed it back below
         replayLogRef.current = seedReplay(snap.replay);
+        replayOwnRef.current = []; // the seed is not "own" — see its declaration
         setReplayReady(replayLogRef.current.length);
         setReplayDescriptions(replayLogRef.current.map(f => ({ player: f.player, description: f.description })));
         setActiveSession({ id, seat, version: snap.version });
@@ -989,7 +1013,9 @@ export default function PegsAndJokers() {
     const prev = replayPrevPlayerRef.current;
     if (ownsSeat(prev) && !ownsSeat(currentPlayer)) {
       replayLogRef.current = [];
+      replayOwnRef.current = [];
       setReplayReady(0);
+      setReplayDescriptions([]);
     }
     replayPrevPlayerRef.current = currentPlayer;
   }, [currentPlayer, ownsSeat]);

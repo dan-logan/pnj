@@ -1054,6 +1054,21 @@ A few decisions this pass made that the plan didn't spell out:
   didn't route through it — without the same `seedReplay`/`pendingAutoReplayRef` wiring added there,
   switching into a game from the lobby (or a reload) would silently skip both the "what happened"
   replay and a possible already-finished result.
+- **Found after the initial Package 4/5 commit, from live user testing: the replay grew to "the
+  whole game" after a few rounds.** The wire `replay` payload was being built from the same buffer
+  used for local display (`replayLogRef`), which holds the seed (frames adopted from the wire) plus
+  whatever this client simulated locally. That's correct for what a client should *watch*, but wrong
+  for what it should *publish*: with exactly two humans strictly alternating publishes, the seed is
+  always the **recipient's own earlier move** (it's literally what they published to get you here).
+  Re-publishing it back re-forwards someone their own move, and the next hop does it again — the
+  buffer never shrinks, so within a few rounds a "since your last turn" replay actually replays the
+  whole game. Fixed with a second buffer, `replayOwnRef` — never seeded, only appended to via
+  `recordReplayFrame` — that `commitTurn` publishes instead of `replayLogRef`. See CLAUDE.md's
+  "Two replay buffers, not one" and the regression test in `src/net/replay.test.js`. This is exactly
+  the kind of bug unit tests over `seedReplay`/`appendReplayFrame` in isolation can't catch, because
+  they're correct in isolation — the bug was in which buffer the component fed them at the
+  multi-hop, two-human level. Manual live testing (or a multi-hop simulation test, which is what the
+  regression test now is) is what surfaces it.
 
 ---
 
