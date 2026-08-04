@@ -93,13 +93,34 @@ const REPLAY_LEADIN_MS = 320;   // beat on the "before" board so the start regis
 const REPLAY_FRAME_PAUSE_MS = 600; // pause after each move before the next one
 
 export default function PegsAndJokers() {
-  const [gameMode, setGameMode] = useState(GAME_MODES.CLASSIC);
+  const [gameMode, setGameModeState] = useState(GAME_MODES.CLASSIC);
 
   // Who owns each seat from THIS client's point of view. Solo is the layout
   // where seat 0 is the only non-AI seat; remote play swaps one AI seat for
   // 'them' and (for the guest) moves 'me' to seat 2. Nothing below may assume
   // "the local human is player 0" — derive from here instead.
-  const [seatOwners, setSeatOwners] = useState(SOLO_SEAT_OWNERS);
+  const [seatOwners, setSeatOwnersState] = useState(SOLO_SEAT_OWNERS);
+
+  // Refs mirroring the two values above, for the same reason sessionRef mirrors
+  // session: which mode is being played and which seats are mine are *identity*
+  // facts that async code must read as of now, not as of the render that
+  // created it. Opening a remote game sets both and then awaits a fetch, so a
+  // callback holding last render's `gameMode`/`mySeats` sees "classic, seat 0" —
+  // which is how a partner win adopted on open got filed under Solo. Always
+  // write through the wrappers so state and ref move together.
+  const gameModeRef = useRef(GAME_MODES.CLASSIC);
+  const seatOwnersRef = useRef(SOLO_SEAT_OWNERS);
+  const mySeatsRef = useRef(mySeatsOf(SOLO_SEAT_OWNERS));
+  const setGameMode = useCallback((mode) => {
+    gameModeRef.current = mode;
+    setGameModeState(mode);
+  }, []);
+  const setSeatOwners = useCallback((owners) => {
+    seatOwnersRef.current = owners;
+    mySeatsRef.current = mySeatsOf(owners);
+    setSeatOwnersState(owners);
+  }, []);
+
   const mySeats = useMemo(() => mySeatsOf(seatOwners), [seatOwners]);
   const mySeat = useMemo(() => primarySeat(seatOwners), [seatOwners]);
   const ownsSeat = useCallback((player) => mySeats.includes(player), [mySeats]);
@@ -327,7 +348,17 @@ export default function PegsAndJokers() {
     //    (including the winning move itself), so it needs no "+1" here.
     //    jokersPlayed/bumpsDelivered/timesBumped are per-seat arrays; sum only
     //    the seats this client controls to get "my" lifetime tallies.
-    const sumMine = (perSeat) => mySeats.reduce((n, s) => n + (perSeat[s] || 0), 0);
+    //
+    //    Mode and seats come from the refs, never the render closure: a game
+    //    can end on the *other* device, in which case this runs from the fetch
+    //    or listener that adopted the finished state, whose closure predates
+    //    the setGameMode/setSeatOwners that opened the game. Reading the
+    //    closure there recorded a partner win as a classic one played from
+    //    seat 0 — the right win/loss by luck (team 0 contains seat 0), filed in
+    //    the Solo bucket, with the wrong seat's joker/bump tallies.
+    const mode = gameModeRef.current;
+    const seats = mySeatsRef.current;
+    const sumMine = (perSeat) => seats.reduce((n, s) => n + (perSeat[s] || 0), 0);
     const tallies = {
       turns: turnsRef.current,
       jokersPlayed: sumMine(jokersPlayedRef.current),
@@ -335,17 +366,17 @@ export default function PegsAndJokers() {
       timesBumped: sumMine(timesBumpedRef.current),
     };
     const { stats: updated } = recordFinishedGame(gameIdRef.current, {
-      won: didIWin(winnerIdx, gameMode, mySeats),
+      won: didIWin(winnerIdx, mode, seats),
       winner: winnerIdx,
-      mySeats,
+      mySeats: seats,
       startMode: startModeRef.current,
-      mode: gameMode,
+      mode,
       ...tallies,
     });
     setStats(updated);
     setEndInfo({ winner: winnerIdx, winningSeat, description, ...tallies });
     setEndOverlayDismissed(false);
-  }, [gameMode, mySeats]);
+  }, []);
 
   // In partner mode, once your own pegs are all home you play your hand on your
   // partner's pegs; otherwise you always control your own seat's pegs. This is
@@ -590,10 +621,10 @@ export default function PegsAndJokers() {
     setCurrentPlayer(nextPlayer);
     const s = sessionRef.current;
     if (!s) return; // solo — nothing to publish
-    const waitingOn = winnerIdx !== null ? null : nextHumanSeat(nextPlayer, seatOwners);
+    const waitingOn = winnerIdx !== null ? null : nextHumanSeat(nextPlayer, seatOwnersRef.current);
     const wireState = serializeGame({
       gameId: gameIdRef.current,
-      mode: gameMode,
+      mode: gameModeRef.current,
       pegs: nextPegs,
       hands: nextHands,
       deck: nextDeck,
@@ -631,7 +662,10 @@ export default function PegsAndJokers() {
           : 'Move saved locally, but could not sync to your partner. Check your connection.'
       );
     });
-  }, [gameMode, seatOwners, setActiveSession]);
+    // Mode and seat layout are read from the refs (see their declaration), so
+    // this is stable and can never publish a turn labelled with the mode of a
+    // game that is no longer the open one.
+  }, [setActiveSession]);
 
   // The seat + description of the winning move, once the corresponding state
   // (at the same version) has actually been adopted. Metadata and live/current
