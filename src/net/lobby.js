@@ -104,3 +104,26 @@ export function relativeTime(thenMs, nowMs = Date.now()) {
   const months = Math.round(days / 30);
   return `${months} month${months === 1 ? '' : 's'} ago`;
 }
+
+// What opening a game should actually do, from its metadata and whether the
+// live document holds a state yet. Pure, because the branch it replaces is the
+// one that made two different games look like the same game:
+//
+//   'adopt'       — there is a dealt state; show it.
+//   'deal'        — our own game, a guest has claimed the seat, nobody has
+//                   dealt: deal it now and publish.
+//   'await_guest' — our own game, still nobody in the other seat: show the
+//                   code and the invite link again.
+//   'await_deal'  — we are the guest and the host hasn't dealt: just wait.
+//
+// Only 'adopt' has a board to show. Every other answer means the board must be
+// BLANKED, not left as it was — leaving it was the bug: switching from a game
+// in progress to one still waiting for a partner kept the first game's board on
+// screen, under the second game's session.
+export function openActionFor({ meta, hasState, seat }) {
+  if (hasState) return 'adopt';
+  if (seat === HOST_SEAT && meta?.status === STATUS.LOBBY) {
+    return meta.guestUid ? 'deal' : 'await_guest';
+  }
+  return 'await_deal';
+}
