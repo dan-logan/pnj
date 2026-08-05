@@ -85,6 +85,7 @@ import {
 } from './net/lobby.js';
 import InstallPrompt from './InstallPrompt.jsx';
 import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
+import { syncAppBadge } from './badge.js';
 
 // Instant-replay pacing. Deliberately slower than the 150ms live step so a
 // round of AI moves is easy to follow when it's played back.
@@ -1943,6 +1944,19 @@ export default function PegsAndJokers() {
     [remoteMeta, myUid, localById]
   );
   const waitingCount = useMemo(() => countWaitingOnMe(lobbyRows), [lobbyRows]);
+
+  // Mirror that same count onto the home-screen icon, so a game waiting on you
+  // is visible without opening the app. Free to run: setAppBadge is a local OS
+  // call, and the count is already derived for the in-app badge — no extra
+  // listener, no extra read. Deliberately no cleanup function: the badge must
+  // survive unmount, or closing the app would wipe the only signal there is
+  // (see badge.js). A solo player never attaches the lobby listener, so
+  // waitingCount stays 0 here and this only ever clears a badge that is
+  // already empty.
+  useEffect(() => {
+    syncAppBadge(waitingCount);
+  }, [waitingCount]);
+
   const liveRows = useMemo(() => lobbyRows.filter((r) => !r.finished), [lobbyRows]);
   const finishedRows = useMemo(() => lobbyRows.filter((r) => r.finished), [lobbyRows]);
   const soloSaveExists = useMemo(
