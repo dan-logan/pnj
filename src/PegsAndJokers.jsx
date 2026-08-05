@@ -75,11 +75,13 @@ import {
   hasLocalGames,
   upsertLocalGame,
   archiveLocalGame,
+  getLocalGame,
   setActiveId,
 } from './net/localSession.js';
 import {
   buildRemoteRows,
   countWaitingOnMe,
+  openActionFor,
   relativeTime,
   seatForUid,
 } from './net/lobby.js';
@@ -92,6 +94,13 @@ import { syncAppBadge } from './badge.js';
 const REPLAY_SEG_MS = 280;      // per-step while a peg animates during replay
 const REPLAY_LEADIN_MS = 320;   // beat on the "before" board so the start registers
 const REPLAY_FRAME_PAUSE_MS = 600; // pause after each move before the next one
+
+// The ?g= invite link for a game. Needed both when a game is created and when
+// its host reopens it while still waiting for a partner to join.
+function inviteLinkFor(id) {
+  if (typeof window === 'undefined') return '';
+  return `${window.location.origin}${window.location.pathname}?g=${id}`;
+}
 
 export default function PegsAndJokers() {
   const [gameMode, setGameModeState] = useState(GAME_MODES.CLASSIC);
@@ -575,6 +584,70 @@ export default function PegsAndJokers() {
     setShowFirstPlayerModal(false);
   }, [resetReplay, ownsSeat]);
 
+  // Blank the board: no hands, pegs at start, nothing pending.
+  //
+  // The counterpart to applySavedGame, for opening a game that has *no* state
+  // to adopt — a host still waiting for a partner to join, or a guest whose
+  // host hasn't dealt. Without it, opening such a game left the previously
+  // open game's board on screen: switching between a dealt game and an undealt
+  // one in the lobby showed the same board both times, so two different games
+  // looked like one game. Worse, that stale board sat under the newly-opened
+  // game's session, so a move made on it would have been published to the
+  // wrong game.
+  //
+  // `parkOn` is the seat the empty board waits on. With no hands dealt the
+  // phase is `dealing` either way, but parking on a seat this client owns also
+  // keeps the AI-simulation effect from reaching for a hand that isn't there.
+  const clearBoard = useCallback((parkOn = 0) => {
+    if (animationRef.current) { clearInterval(animationRef.current); animationRef.current = null; }
+    if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
+    if (spinIntervalRef.current) { clearInterval(spinIntervalRef.current); spinIntervalRef.current = null; }
+    if (aiTimerRef.current) { clearTimeout(aiTimerRef.current); aiTimerRef.current = null; }
+    aiProcessingRef.current = false;
+
+    setDeck([]);
+    setDiscardPiles([[], [], [], []]);
+    setStuckCounts([0, 0, 0, 0]);
+    setHands([[], [], [], []]);
+    setPegs(createInitialPegs());
+    setCurrentPlayer(parkOn);
+    setLastMoves([null, null, null, null]);
+
+    setSelectedCard(null);
+    setSelectedPeg(null);
+    setSplitRemaining(0);
+    setSplitCard(null);
+    setSplitPegIndex(null);
+    setSplitOwner(null);
+    setSplitUndo(null);
+    setJokerMode(false);
+    setJokerSourcePeg(null);
+    setDiscardMode(false);
+    setAnimatingPeg(null);
+    setBumpFx(null);
+    setIsSpinning(false);
+    setSpinningPlayer(0);
+
+    setWinner(null);
+    setNotice(null);
+    setEndInfo(null);
+    setEndOverlayDismissed(false);
+    endedRef.current = false;
+
+    // No game is in progress, so nothing may be carried into the one that is
+    // dealt next — applySavedGame / dealAndStartAsHost set these for real.
+    turnsRef.current = 0;
+    jokersPlayedRef.current = [0, 0, 0, 0];
+    bumpsDeliveredRef.current = [0, 0, 0, 0];
+    timesBumpedRef.current = [0, 0, 0, 0];
+    startModeRef.current = null;
+
+    resetReplay();
+    replayPrevPlayerRef.current = parkOn;
+    prevPlayerRef.current = parkOn;
+    pendingAutoReplayRef.current = false;
+  }, [resetReplay]);
+
   // --- Remote play: sessions, listeners, create/join, switching ---------------
   //
   // The discipline that used to be "clear the interval" is now "detach the
@@ -793,15 +866,21 @@ export default function PegsAndJokers() {
     setActiveId(id);
     setShowLobby(false);
     setMpScreen(null);
+    setHostInfo(null);
     setShowFirstPlayerModal(false);
     setShowResumeModal(false);
     setOpenMeta(null);
     openMetaRef.current = null;
+    // Nothing of the game we just left may survive the switch — not while the
+    // fetch is in flight, and not at all if the game we are opening turns out
+    // to have no state yet. Whatever comes back below replaces this.
+    clearBoard(seat);
     try {
       const snap = await fetchGame(id);
       setOpenMeta(snap.meta);
       openMetaRef.current = snap.meta;
-      if (snap.state) {
+      const action = openActionFor({ meta: snap.meta, hasState: Boolean(snap.state), seat });
+      if (action === 'adopt') {
         applySavedGame(snap.state); // resets replayLogRef — seed it back below
         replayLogRef.current = seedReplay(snap.replay);
         replayOwnRef.current = []; // the seed is not "own" — see its declaration
@@ -816,16 +895,30 @@ export default function PegsAndJokers() {
         // the listener.
         pendingAutoReplayRef.current = true;
         maybeEndFromMeta(snap.meta);
-      } else if (seat === HOST_SEAT && snap.meta.guestUid && snap.meta.status === STATUS.LOBBY) {
+      } else if (action === 'deal') {
         // Re-entering our own game that a guest joined while we were away.
         hostDealtRef.current = true;
         await dealAndStartAsHost(id);
+      } else if (action === 'await_guest') {
+        // Our own game, still with nobody in the other seat: show the code and
+        // the invite link again, exactly as at create time. The metadata
+        // listener attached below deals the moment a partner joins. Without
+        // this the board is (correctly) blank but nothing says why.
+        setHostInfo({
+          id,
+          code: snap.meta.code ?? getLocalGame(id)?.code ?? '',
+          link: inviteLinkFor(id),
+        });
+        setMpScreen('hosting');
       }
       attachGameListeners(id);
     } catch {
       setMpNotice('Could not open that game. It may have been removed.');
+      // The board is blank at this point, so send them somewhere they can act
+      // rather than leaving them staring at an empty board.
+      setShowLobby(true);
     }
-  }, [applySavedGame, attachGameListeners, detachGameListeners, dealAndStartAsHost, setActiveSession, maybeEndFromMeta]);
+  }, [applySavedGame, attachGameListeners, clearBoard, detachGameListeners, dealAndStartAsHost, setActiveSession, maybeEndFromMeta]);
 
   // Host a new remote game: create it, cache it locally, show the code + share
   // link, and wait. The metadata listener deals automatically when a guest joins.
@@ -904,14 +997,15 @@ export default function PegsAndJokers() {
       setActiveId(null);
       setSeatOwners(SOLO_SEAT_OWNERS);
       setShowLobby(false);
+      setHostInfo(null);
       const saved = loadGame();
       if (saved) applySavedGame(saved);
-      else initGame();
+      else { clearBoard(0); initGame(); }
       return;
     }
     const seat = target.seat ?? seatForUid(target, myUid) ?? GUEST_SEAT;
     await openRemoteGame(target.id, seat);
-  }, [splitRemaining, detachGameListeners, setActiveSession, applySavedGame, initGame, myUid, openRemoteGame]);
+  }, [splitRemaining, detachGameListeners, setActiveSession, applySavedGame, clearBoard, initGame, myUid, openRemoteGame]);
 
   // Hide a finished/abandoned game from the lobby without touching the document.
   const archiveGame = useCallback((id) => {
@@ -929,9 +1023,11 @@ export default function PegsAndJokers() {
     setActiveId(null);
     setOpenMeta(null);
     openMetaRef.current = null;
+    setHostInfo(null);
     setSeatOwners(SOLO_SEAT_OWNERS);
+    clearBoard(0);
     initGame();
-  }, [detachGameListeners, setActiveSession, initGame]);
+  }, [detachGameListeners, setActiveSession, clearBoard, initGame]);
 
   // On mount, route to the right starting screen (§3.4). The lobby subsumes the
   // resume prompt, but ONLY for a device that actually has remote games — a
@@ -2485,8 +2581,9 @@ export default function PegsAndJokers() {
       )}
 
       {/* Hosting: the code + share link, waiting for a partner to join. The
-          metadata listener deals automatically the moment they do. */}
-      {hostInfo && (
+          metadata listener deals automatically the moment they do. Yields to
+          the lobby (both are z-50 overlays) so "My Games" below can open it. */}
+      {hostInfo && !showLobby && (
         <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
           <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full p-6 text-center">
             <h2 className="text-2xl font-bold mb-2">Waiting for your partner…</h2>
@@ -2511,12 +2608,22 @@ export default function PegsAndJokers() {
               <span className="inline-block w-3 h-3 rounded-full bg-amber-400 animate-pulse" />
               Waiting…
             </div>
-            <button
-              onClick={() => { setHostInfo(null); switchToGame('solo'); }}
-              className="text-sm text-gray-400 hover:text-gray-200"
-            >
-              Cancel and return to solo
-            </button>
+            {/* Two ways out, because this modal covers the whole screen: a host
+                waiting here still needs to reach their other games. */}
+            <div className="flex items-center justify-center gap-4">
+              <button
+                onClick={() => setShowLobby(true)}
+                className="text-sm text-gray-400 hover:text-gray-200"
+              >
+                My Games
+              </button>
+              <button
+                onClick={() => { setHostInfo(null); switchToGame('solo'); }}
+                className="text-sm text-gray-400 hover:text-gray-200"
+              >
+                Return to solo
+              </button>
+            </div>
           </div>
         </div>
       )}

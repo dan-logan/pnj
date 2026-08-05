@@ -6,9 +6,10 @@ import {
   buildRemoteRows,
   sortLobbyRows,
   countWaitingOnMe,
+  openActionFor,
   relativeTime,
 } from './lobby.js';
-import { STATUS } from './protocol.js';
+import { STATUS, HOST_SEAT, GUEST_SEAT } from './protocol.js';
 
 const meta = (over = {}) => ({
   id: 'g1',
@@ -135,5 +136,46 @@ describe('relativeTime', () => {
   });
   it('is empty for a missing timestamp', () => {
     expect(relativeTime(null, now)).toBe('');
+  });
+});
+
+describe('openActionFor', () => {
+  it('adopts a dealt game, from either seat', () => {
+    expect(openActionFor({ meta: meta(), hasState: true, seat: HOST_SEAT })).toBe('adopt');
+    expect(openActionFor({ meta: meta(), hasState: true, seat: GUEST_SEAT })).toBe('adopt');
+  });
+
+  it('deals our own game once a guest has claimed the seat', () => {
+    const m = meta({ status: STATUS.LOBBY, guestUid: 'guest' });
+    expect(openActionFor({ meta: m, hasState: false, seat: HOST_SEAT })).toBe('deal');
+  });
+
+  it('waits for a guest on our own game that nobody has joined', () => {
+    const m = meta({ status: STATUS.LOBBY, guestUid: null });
+    expect(openActionFor({ meta: m, hasState: false, seat: HOST_SEAT })).toBe('await_guest');
+  });
+
+  it('waits for the deal as the guest', () => {
+    const m = meta({ status: STATUS.LOBBY, guestUid: 'guest' });
+    expect(openActionFor({ meta: m, hasState: false, seat: GUEST_SEAT })).toBe('await_deal');
+  });
+
+  // The regression: an un-joined game and a game in progress are DIFFERENT
+  // answers. They used to collapse — the un-joined one fell through every
+  // branch, so opening it left the other game's board on screen and the two
+  // games looked identical.
+  it('never answers "adopt" for a game with no state', () => {
+    for (const seat of [HOST_SEAT, GUEST_SEAT]) {
+      for (const status of [STATUS.LOBBY, STATUS.ACTIVE, STATUS.FINISHED]) {
+        for (const guestUid of ['guest', null]) {
+          const action = openActionFor({ meta: meta({ status, guestUid }), hasState: false, seat });
+          expect(action).not.toBe('adopt');
+        }
+      }
+    }
+  });
+
+  it('waits rather than dealing when metadata is missing entirely', () => {
+    expect(openActionFor({ meta: null, hasState: false, seat: HOST_SEAT })).toBe('await_deal');
   });
 });
