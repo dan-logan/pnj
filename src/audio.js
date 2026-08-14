@@ -66,6 +66,16 @@ export function vibrate(pattern) {
   }
 }
 
+// Each seat gets its own base pitch, so you can hear *who* is moving without
+// looking up from your hand — the same way you'd know by the sound of someone's
+// voice at the table. Yellow, Blue, Pink, Green: C5, G4, D#5, A4, spread wide
+// enough apart to tell two of them apart back to back.
+export const PLAYER_TONES = [523.25, 392.0, 622.25, 440.0];
+
+function toneFor(player) {
+  return PLAYER_TONES[player % PLAYER_TONES.length] ?? PLAYER_TONES[0];
+}
+
 export const sfx = {
   // Your card lands a move
   cardPlay() {
@@ -75,15 +85,67 @@ export const sfx = {
   peg() {
     tone({ freq: 440, duration: 0.05, type: 'triangle', volume: 0.05 });
   },
-  // A peg gets bumped back to start
-  bump() {
+  // One space of travel — the "click" of a peg being counted along the board.
+  // `index` is the space number (0-based) and `total` the length of the move,
+  // so the pitch creeps up as the count goes on and the final space lands on a
+  // clear accent: you can hear a move finish without watching it.
+  step(player, index = 0, total = 1) {
+    const base = toneFor(player);
+    const last = index >= total - 1;
+    if (last) {
+      tone({ freq: base * 1.5, duration: 0.09, type: 'triangle', volume: 0.1 });
+      return;
+    }
+    // Capped so a 13-space King doesn't climb into a whistle.
+    tone({
+      freq: base * Math.pow(1.03, Math.min(index, 12)),
+      duration: 0.035,
+      type: 'square',
+      volume: 0.05,
+    });
+  },
+  // A peg leaves the start area for the track
+  comeOut(player = 0) {
+    const base = toneFor(player);
+    tone({ freq: base * 0.75, duration: 0.07, type: 'triangle', volume: 0.11 });
+    tone({ freq: base * 1.25, start: 0.06, duration: 0.12, type: 'triangle', volume: 0.13 });
+    vibrate(25);
+  },
+  // You (or a seat you own) knocked someone back to start
+  bumpDelivered() {
     tone({ freq: 320, endFreq: 110, duration: 0.28, type: 'sawtooth', volume: 0.16 });
     vibrate(80);
   },
+  // One of your own pegs got knocked back — lower, longer and unmistakably
+  // the bad one of the pair.
+  bumpReceived() {
+    tone({ freq: 260, endFreq: 70, duration: 0.42, type: 'sawtooth', volume: 0.18 });
+    tone({ freq: 190, start: 0.1, endFreq: 60, duration: 0.35, type: 'square', volume: 0.1 });
+    vibrate([120, 60, 90]);
+  },
+  // A partner bump in partner mode: it sends your teammate to their home
+  // entrance, so it should sound like the good thing it is.
+  friendlyBump(player = 0) {
+    const base = toneFor(player);
+    tone({ freq: base, duration: 0.08, type: 'triangle', volume: 0.12 });
+    tone({ freq: base * 1.5, start: 0.07, duration: 0.14, type: 'triangle', volume: 0.13 });
+    vibrate(40);
+  },
   // A peg enters or advances in the home corridor
-  home() {
-    tone({ freq: 523, duration: 0.1 });
-    tone({ freq: 784, start: 0.09, duration: 0.16 });
+  home(player = 0) {
+    const base = toneFor(player);
+    tone({ freq: base, duration: 0.1 });
+    tone({ freq: base * 1.5, start: 0.09, duration: 0.16 });
+  },
+  // A player's fifth and final peg lands: the whole seat is home. Bigger than
+  // `home`, deliberately smaller than `win` — in partner mode it can happen
+  // half a game before anyone actually wins.
+  allHome(player = 0) {
+    const base = toneFor(player);
+    [1, 1.25, 1.5, 2].forEach((mult, i) =>
+      tone({ freq: base * mult, start: i * 0.1, duration: 0.24, volume: 0.14 })
+    );
+    vibrate([60, 40, 60, 40, 120]);
   },
   // Control returns to the human player
   yourTurn() {
