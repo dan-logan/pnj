@@ -804,8 +804,12 @@ export function calculateMovePath(player, pegIndex, card, amount, currentPegs) {
     }
 
     if (willEnterHome) {
-      // Animate to home entrance, then into home
-      for (let step = 1; step <= stepsToHome; step++) {
+      // Animate up to the home entrance, then into home.
+      // The step that would land on `homeEntrance + 1` is the step into home
+      // slot 0 (that is what makes `homeSteps = moveAmount - stepsToHome` the
+      // final slot), so it must not also be drawn as a track space — otherwise
+      // the peg counts one space more than the card played.
+      for (let step = 1; step < stepsToHome; step++) {
         const pos = (currentPos + step) % TRACK_LENGTH;
         path.push({ type: 'track', position: pos });
       }

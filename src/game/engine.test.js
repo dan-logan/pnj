@@ -15,6 +15,7 @@ import {
   getMovablePegs,
   findBumps
 } from './engine.js';
+import { TRACK_LENGTH } from './constants.js';
 
 const card = (rank, suit = '♠') => ({ rank, suit, id: `${rank}${suit}test` });
 
@@ -314,7 +315,59 @@ describe('calculateMovePath', () => {
   it('routes into home when entering the corridor', () => {
     const pegs = pegState([[0, 0, onTrack(0)]]);
     const path = calculateMovePath(0, 0, card('5'), null, pegs);
+    expect(path).toHaveLength(5);
     expect(path[path.length - 1]).toEqual({ type: 'home', position: 1 });
+    // Space 4 is home slot 0, so it is never drawn as a track space.
+    expect(path).toEqual([
+      { type: 'track', position: 1 },
+      { type: 'track', position: 2 },
+      { type: 'track', position: 3 },
+      { type: 'home', position: 0 },
+      { type: 'home', position: 1 }
+    ]);
+  });
+
+  it('emits exactly one step per space when entering home from the entrance', () => {
+    // Green (player 3) sits on its own home entrance (57) and plays a 5,
+    // landing in Home 4. That is five spaces, not six.
+    const pegs = pegState([[3, 0, onTrack(getHomeEntrance(3))]]);
+    const path = calculateMovePath(3, 0, card('5'), null, pegs);
+    expect(path).toEqual([
+      { type: 'home', position: 0 },
+      { type: 'home', position: 1 },
+      { type: 'home', position: 2 },
+      { type: 'home', position: 3 },
+      { type: 'home', position: 4 }
+    ]);
+  });
+
+  it('never counts more spaces than the card is worth on any home entry', () => {
+    for (const player of [0, 1, 2, 3]) {
+      const entrance = getHomeEntrance(player);
+      for (const value of [2, 3, 4, 5, 6, 10, 12, 13]) {
+        // Place the peg so the move ends on home slot (value - stepsToHome).
+        for (let stepsToHome = 1; stepsToHome <= value; stepsToHome++) {
+          const homeSteps = value - stepsToHome;
+          if (homeSteps >= 5) continue;
+          const from = (entrance + 1 - stepsToHome + TRACK_LENGTH) % TRACK_LENGTH;
+          const pegs = pegState([[player, 0, onTrack(from)]]);
+          const rank = value === 10 ? '10' : value === 12 ? 'Q' : value === 13 ? 'K' : String(value);
+          const path = calculateMovePath(player, 0, card(rank), null, pegs);
+          expect(path).toHaveLength(value);
+          expect(path[path.length - 1]).toEqual({ type: 'home', position: homeSteps });
+        }
+      }
+    }
+  });
+
+  it('agrees with applyMove about where the peg ends up', () => {
+    const pegs = pegState([[3, 0, onTrack(getHomeEntrance(3))]]);
+    const path = calculateMovePath(3, 0, card('5'), null, pegs);
+    const { newPegs } = applyMove(3, 0, card('5'), null, pegs);
+    expect(path[path.length - 1]).toEqual({
+      type: 'home',
+      position: newPegs[3][0].homePosition
+    });
   });
 
   it('is empty for jokers (handled without step animation)', () => {
