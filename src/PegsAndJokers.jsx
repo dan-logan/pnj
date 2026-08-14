@@ -88,12 +88,27 @@ import {
 import InstallPrompt from './InstallPrompt.jsx';
 import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
 import { syncAppBadge } from './badge.js';
+import { diffPegEvents } from './game/events.js';
+import {
+  DEFAULT_SPEED,
+  settingsFor,
+  animationsOn,
+  nextSpeed,
+  loadSpeed,
+  saveSpeed,
+} from './anim.js';
 
-// Instant-replay pacing. Deliberately slower than the 150ms live step so a
-// round of AI moves is easy to follow when it's played back.
-const REPLAY_SEG_MS = 280;      // per-step while a peg animates during replay
+// Instant-replay pacing. Deliberately slower than the live step so a round of
+// AI moves is easy to follow when it's played back. The per-step figure is the
+// live one from the speed setting, floored so a replay is never *faster* than
+// a slow live move (see `replayStepMs`).
+const REPLAY_MIN_STEP_MS = 280; // per-step floor while a peg animates during replay
 const REPLAY_LEADIN_MS = 320;   // beat on the "before" board so the start registers
 const REPLAY_FRAME_PAUSE_MS = 600; // pause after each move before the next one
+
+// How many entries the move log keeps. Enough to cover a full round of four
+// seats plus your own last move, short enough to stay readable at a glance.
+const MOVE_LOG_SIZE = 6;
 
 // The ?g= invite link for a game. Needed both when a game is created and when
 // its host reopens it while still waiting for a partner to join.
@@ -198,10 +213,58 @@ export default function PegsAndJokers() {
   const aiTimerRef = useRef(null); // the AI's "thinking" timeout, so endGame can cancel it
   const prevPlayerRef = useRef(null); // Detect the turn passing back to the human
 
-  // Animation state
-  const [animationsEnabled, setAnimationsEnabled] = useState(true);
-  const [animatingPeg, setAnimatingPeg] = useState(null); // { player, pegIndex, positions: [], currentStep: 0 }
+  // Animation state. The pace is a four-way setting (`src/anim.js`), not a
+  // boolean: `slow` is the default because a peg that crosses the board faster
+  // than you can follow it is the single biggest reason the game is hard to
+  // read. `animationsEnabled` is derived from it so every existing "are
+  // animations on?" question still has one answer.
+  const [animationSpeed, setAnimationSpeedState] = useState(DEFAULT_SPEED);
+  const animationsEnabled = animationsOn(animationSpeed);
+  const pacing = settingsFor(animationSpeed);
+  // { player, pegIndex, path: [], currentStep, from, count } — `from` is the
+  // space the peg left, so the board can leave a ghost behind it, and the
+  // traversed prefix of `path` is drawn as a fading trail.
+  const [animatingPeg, setAnimatingPeg] = useState(null);
   const animationRef = useRef(null);
+  // A purely cosmetic playback of a move whose state has *already* committed
+  // (see `playMoveVisual`). The AI effect waits on it so an opponent doesn't
+  // start moving while your own peg is still counting itself along the board.
+  const [visualBusy, setVisualBusy] = useState(false);
+  const settleTimerRef = useRef(null);
+  // Arrival chimes deferred to the end of a cosmetic playback (see
+  // triggerMoveEffects). Held so a win, a new game or a game switch can cancel
+  // them — a "peg is home" chime that fires after the result banner is exactly
+  // the class of stale-timer bug the status rewrite got rid of.
+  const arrivalTimersRef = useRef([]);
+
+  // The mover, the card they played and what it did, shown large while the
+  // move animates. The board's own per-seat labels are 8px SVG text — legible
+  // if you already know where to look, useless otherwise.
+  const [nowPlaying, setNowPlaying] = useState(null); // { player, card, description }
+  // The last few moves, newest first: { id, player, description, card }.
+  const [moveLog, setMoveLog] = useState([]);
+  const moveLogSeqRef = useRef(0);
+
+  // Load the saved pace once on mount rather than in a useState initialiser, so
+  // the module stays safe to import where there is no localStorage.
+  useEffect(() => {
+    setAnimationSpeedState(loadSpeed());
+  }, []);
+
+  const setAnimationSpeed = useCallback((speed) => {
+    setAnimationSpeedState(speed);
+    saveSpeed(speed);
+  }, []);
+
+  // Push a completed move onto the visible log. Called from every site that
+  // ends a turn — yours, your partner's, an AI's, and a stuck discard — so the
+  // log is the one place that answers "what just happened?".
+  const logMove = useCallback((player, description, card = null) => {
+    if (!description) return;
+    moveLogSeqRef.current += 1;
+    const entry = { id: moveLogSeqRef.current, player, description, card };
+    setMoveLog(prev => [entry, ...prev].slice(0, MOVE_LOG_SIZE));
+  }, []);
 
   // Sound / haptics
   const [soundOn, setSoundOn] = useState(() => !isMuted());
@@ -330,9 +393,14 @@ export default function PegsAndJokers() {
     if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
     if (spinIntervalRef.current) { clearInterval(spinIntervalRef.current); spinIntervalRef.current = null; }
     if (aiTimerRef.current) { clearTimeout(aiTimerRef.current); aiTimerRef.current = null; }
+    if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
+    arrivalTimersRef.current.forEach(clearTimeout);
+    arrivalTimersRef.current = [];
     replayCancelRef.current = true;
     aiProcessingRef.current = false;
     setAnimatingPeg(null);
+    setVisualBusy(false);
+    setNowPlaying(null);
     setBumpFx(null);
     setIsReplaying(false);
     setReplayInfo(null);
@@ -426,12 +494,18 @@ export default function PegsAndJokers() {
     setNotice(null);
     setWinner(null);
     setLastMoves([null, null, null, null]);
+    setMoveLog([]);
+    setNowPlaying(null);
     aiProcessingRef.current = false;
     setAnimatingPeg(null);
+    setVisualBusy(false);
     if (animationRef.current) {
       clearInterval(animationRef.current);
       animationRef.current = null;
     }
+    if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
+    arrivalTimersRef.current.forEach(clearTimeout);
+    arrivalTimersRef.current = [];
     setBumpFx(null);
     if (bumpFxRef.current) {
       clearInterval(bumpFxRef.current);
@@ -545,6 +619,12 @@ export default function PegsAndJokers() {
     setJokerSourcePeg(null);
     setDiscardMode(false);
     setAnimatingPeg(null);
+    setVisualBusy(false);
+    setNowPlaying(null);
+    // The move log is a live commentary, not game state: it isn't saved, and
+    // resuming (or switching games) starts it empty rather than showing the
+    // previous game's moves.
+    setMoveLog([]);
     setBumpFx(null);
 
     // Restore per-game stat tallies so a resumed game still records correctly.
@@ -603,6 +683,9 @@ export default function PegsAndJokers() {
     if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
     if (spinIntervalRef.current) { clearInterval(spinIntervalRef.current); spinIntervalRef.current = null; }
     if (aiTimerRef.current) { clearTimeout(aiTimerRef.current); aiTimerRef.current = null; }
+    if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
+    arrivalTimersRef.current.forEach(clearTimeout);
+    arrivalTimersRef.current = [];
     aiProcessingRef.current = false;
 
     setDeck([]);
@@ -624,6 +707,9 @@ export default function PegsAndJokers() {
     setJokerSourcePeg(null);
     setDiscardMode(false);
     setAnimatingPeg(null);
+    setVisualBusy(false);
+    setNowPlaying(null);
+    setMoveLog([]);
     setBumpFx(null);
     setIsSpinning(false);
     setSpinningPlayer(0);
@@ -1085,23 +1171,45 @@ export default function PegsAndJokers() {
     if (gameStateUnsubRef.current) gameStateUnsubRef.current();
   }, []);
 
-  // Run animation for a move, then call onComplete when done
-  const animateMove = useCallback((player, pegIndex, card, amount, currentPegs, onComplete) => {
+  // Where a peg is sitting right now, in the shape `animatingPeg.path` uses, so
+  // the origin can be drawn as a ghost for as long as the move is in flight.
+  const pegAnchor = useCallback((peg, pegIndex) => {
+    if (!peg) return null;
+    if (peg.location === 'track') return { type: 'track', position: peg.position };
+    if (peg.location === 'home') return { type: 'home', position: peg.homePosition };
+    // A start slot is addressed by the peg's index in its own array, which is
+    // also how the start area is drawn — don't trust `peg.index`, which is only
+    // set at deal time.
+    if (peg.location === 'start') return { type: 'start', position: pegIndex };
+    return null;
+  }, []);
+
+  // Run animation for a move, then call onComplete when done.
+  //
+  // One space per tick, with a click on each — the peg counts itself along the
+  // board the way a hand would, instead of teleporting. `stepMs` comes from the
+  // pace setting, so "slow" really is slow all the way down to the sound.
+  const animateMove = useCallback((player, pegIndex, card, amount, currentPegs, onComplete, options = {}) => {
+    const { stepMs = pacing.stepMs } = options;
     const path = calculateMovePath(player, pegIndex, card, amount, currentPegs);
 
-    if (path.length === 0) {
-      // No animation needed (e.g., Joker), complete immediately
+    if (path.length === 0 || stepMs <= 0) {
+      // No animation needed (a joker has no path; `off` has no animation)
       onComplete();
       return;
     }
+
+    const from = pegAnchor(currentPegs?.[player]?.[pegIndex], pegIndex);
 
     // Start animation
     setAnimatingPeg({
       player,
       pegIndex,
       path,
-      currentStep: 0
+      currentStep: 0,
+      from,
     });
+    sfx.step(player, 0, path.length);
 
     let step = 0;
     animationRef.current = setInterval(() => {
@@ -1113,10 +1221,41 @@ export default function PegsAndJokers() {
         setAnimatingPeg(null);
         onComplete();
       } else {
+        sfx.step(player, step, path.length);
         setAnimatingPeg(prev => prev ? { ...prev, currentStep: step } : null);
       }
-    }, 150); // 150ms per step
-  }, []);
+    }, stepMs);
+  }, [pacing.stepMs, pegAnchor]);
+
+  // Replay the move that was *just committed*, for the eye only. Human turns
+  // apply their state synchronously (executeMove and friends validate, apply,
+  // publish and hand off in one pass, and unpicking that would put the wire
+  // protocol behind an animation timer), so your own peg used to jump straight
+  // to its destination while the AI's glided. This runs the same step-by-step
+  // glide over the already-final board: the real peg is hidden while it flies
+  // and a ghost marks where it started.
+  //
+  // `visualBusy` is what keeps it honest — the AI effect will not start a turn
+  // while a cosmetic playback is running, so the opponents wait for your peg to
+  // finish counting rather than moving over the top of it.
+  const playMoveVisual = useCallback((player, pegIndex, card, amount, fromPegs, meta = null) => {
+    if (!animationsEnabled) return;
+    const path = calculateMovePath(player, pegIndex, card, amount, fromPegs);
+    if (!path.length) return;
+    if (animationRef.current) { clearInterval(animationRef.current); animationRef.current = null; }
+    if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
+    setVisualBusy(true);
+    if (meta) setNowPlaying(meta);
+    animateMove(player, pegIndex, card, amount, fromPegs, () => {
+      // Hold the "now playing" banner through the settle beat, so the card that
+      // was played is still on screen when the peg stops.
+      settleTimerRef.current = setTimeout(() => {
+        settleTimerRef.current = null;
+        setNowPlaying(null);
+        setVisualBusy(false);
+      }, pacing.settleMs);
+    });
+  }, [animationsEnabled, animateMove, pacing.settleMs]);
 
   // Compare peg states around a move: if someone got bumped, play the bump
   // sound/haptic and fly the bumped peg back to its start slot.
@@ -1169,6 +1308,10 @@ export default function PegsAndJokers() {
     setDiscardMode(false);
 
     const total = frames.length;
+    // A replay is meant to be watchable, so it never runs faster than the
+    // floor — but if the player has chosen an even slower live pace, honour it
+    // rather than speeding their moves up when they play them back.
+    const replayStepMs = Math.max(REPLAY_MIN_STEP_MS, pacing.stepMs);
 
     const finish = () => {
       if (replaySegTimerRef.current) { clearInterval(replaySegTimerRef.current); replaySegTimerRef.current = null; }
@@ -1194,7 +1337,14 @@ export default function PegsAndJokers() {
         animateSegments(segments, idx + 1, done);
         return;
       }
-      setAnimatingPeg({ player: seg.owner, pegIndex: seg.pegIndex, path, currentStep: 0 });
+      setAnimatingPeg({
+        player: seg.owner,
+        pegIndex: seg.pegIndex,
+        path,
+        currentStep: 0,
+        from: pegAnchor(seg.fromPegs?.[seg.owner]?.[seg.pegIndex], seg.pegIndex),
+      });
+      sfx.step(seg.owner, 0, path.length);
       let step = 0;
       replaySegTimerRef.current = setInterval(() => {
         if (replayCancelRef.current) {
@@ -1210,9 +1360,10 @@ export default function PegsAndJokers() {
           setPegs(seg.toPegs);
           animateSegments(segments, idx + 1, done);
         } else {
+          sfx.step(seg.owner, step, path.length);
           setAnimatingPeg(prev => prev ? { ...prev, currentStep: step } : null);
         }
-      }, REPLAY_SEG_MS);
+      }, replayStepMs);
     };
 
     const playFrame = (i) => {
@@ -1240,7 +1391,7 @@ export default function PegsAndJokers() {
     };
 
     playFrame(0);
-  }, [isReplaying, pegs]);
+  }, [isReplaying, pegs, pacing.stepMs, pegAnchor]);
 
   // Abort an in-flight replay and snap the board back to the live state.
   const stopReplay = useCallback(() => {
@@ -1278,19 +1429,62 @@ export default function PegsAndJokers() {
     startReplay();
   }, [isMyTurn, winner, session, animationsEnabled, startReplay]);
 
-  // Clean up replay timers if the component unmounts mid-playback.
-  useEffect(() => () => {
-    if (replaySegTimerRef.current) clearInterval(replaySegTimerRef.current);
-    if (replayFrameTimerRef.current) clearTimeout(replayFrameTimerRef.current);
+  // Clean up replay and pacing timers if the component unmounts mid-playback.
+  useEffect(() => {
+    const arrivals = arrivalTimersRef;
+    return () => {
+      if (replaySegTimerRef.current) clearInterval(replaySegTimerRef.current);
+      if (replayFrameTimerRef.current) clearTimeout(replayFrameTimerRef.current);
+      if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
+      arrivals.current.forEach(clearTimeout);
+      arrivals.current = [];
+    };
   }, []);
 
   // `mover` is the acting player (for stats); `moverPeg` is the peg that moved
   // (so a friendly partner bump doesn't flag the mover itself).
-  const triggerMoveEffects = useCallback((oldPegs, updatedPegs, mover, moverPeg = null) => {
+  //
+  // `arrivalDelayMs` exists because the two kinds of caller sit on opposite
+  // sides of the animation. An AI move calls this *after* its peg has finished
+  // gliding, so its arrival sounds are already in time. A human move commits
+  // its state first and replays the glide cosmetically afterwards
+  // (`playMoveVisual`), so with no delay the "peg is home" chime would land
+  // several seconds before the peg does — badly wrong at the slow pace this
+  // whole change exists to support.
+  const triggerMoveEffects = useCallback((oldPegs, updatedPegs, mover, moverPeg = null, arrivalDelayMs = 0) => {
     const bumps = findBumps(oldPegs, updatedPegs);
     const friendly = gameMode === GAME_MODES.PARTNERS
       ? findFriendlyBumps(oldPegs, updatedPegs, moverPeg)
       : [];
+
+    // The events every player at a real table hears, whoever made the move:
+    // a peg coming out of start, a peg reaching home, and a seat finishing.
+    // Derived from the before/after boards (game/events.js) rather than from
+    // whichever call site happened to know, so an AI's peg going home sounds
+    // exactly like yours — which is the whole point of adding them.
+    const { cameOut, reachedHome, finishedAll } = diffPegEvents(oldPegs, updatedPegs);
+    const playArrivals = () => {
+      for (const p of cameOut) sfx.comeOut(p.player);
+      // `finishedAll` supersedes the plain home chime for that seat's last peg
+      // — one sound per peg, with the fifth one upgraded to the flourish.
+      const finishing = new Set(finishedAll);
+      for (const p of reachedHome) {
+        if (!finishing.has(p.player)) sfx.home(p.player);
+      }
+      for (const player of finishedAll) sfx.allHome(player);
+    };
+    if (cameOut.length || reachedHome.length || finishedAll.length) {
+      if (arrivalDelayMs > 0) {
+        const timer = setTimeout(() => {
+          arrivalTimersRef.current = arrivalTimersRef.current.filter(t => t !== timer);
+          playArrivals();
+        }, arrivalDelayMs);
+        arrivalTimersRef.current.push(timer);
+      } else {
+        playArrivals();
+      }
+    }
+
     if (bumps.length === 0 && friendly.length === 0) return;
 
     // Tally bumps for stats, per seat — not gated on `ownsSeat`. That gate is
@@ -1306,7 +1500,17 @@ export default function PegsAndJokers() {
       timesBumpedRef.current[b.player] += 1;
     }
 
-    sfx.bump();
+    // Three bump sounds, not one. Being knocked back is the worst thing that
+    // happens to you in this game and it used to sound identical to doing it to
+    // someone else; a partner bump is actively *good* and sounded like a
+    // punishment. Whose peg it was decides which you hear.
+    if (bumps.length > 0) {
+      const hitMe = bumps.some(b => ownsSeat(b.player));
+      if (hitMe) sfx.bumpReceived();
+      else sfx.bumpDelivered();
+    } else {
+      sfx.friendlyBump(friendly[0].player);
+    }
     if (!animationsEnabled) return;
 
     // Prefer animating a knock-back-to-start; otherwise fly a friendly bump forward.
@@ -1319,7 +1523,7 @@ export default function PegsAndJokers() {
       runBumpFx(fb.player, fb.pegIndex, getTrackPosition(fb.fromPosition),
         getTrackPosition(fb.toPosition), 'friendly');
     }
-  }, [animationsEnabled, gameMode, runBumpFx]);
+  }, [animationsEnabled, gameMode, runBumpFx, ownsSeat]);
 
   // `owner` is whose peg moves (your partner once you are all home); you always
   // act as your own seat, so the hand, discards and turn are yours.
@@ -1386,15 +1590,21 @@ export default function PegsAndJokers() {
     const { newPegs } = applyMove(owner, pegIndex, card, splitAmount, pegs, moveOptions);
     const newPeg = newPegs[owner][pegIndex];
 
-    triggerMoveEffects(pegs, newPegs, actor, { player: owner, pegIndex });
-    if (newPeg.location === 'home') {
-      sfx.home();
-    } else {
-      sfx.cardPlay();
-    }
-
     // Record last move description (under the acting human)
     const moveDescription = describeMoveAction(oldPeg, newPeg, card, splitAmount);
+
+    // The cosmetic glide runs over the already-committed board (see
+    // playMoveVisual); the arrival chimes are delayed to match it so the "peg
+    // is home" note lands when the peg does.
+    const travelMs = animationsEnabled
+      ? calculateMovePath(owner, pegIndex, card, splitAmount, pegs).length * pacing.stepMs
+      : 0;
+    triggerMoveEffects(pegs, newPegs, actor, { player: owner, pegIndex }, travelMs);
+    sfx.cardPlay();
+    playMoveVisual(owner, pegIndex, card, splitAmount, pegs, {
+      player: actor, card, description: moveDescription,
+    });
+
     const updatedLastMoves = [...lastMoves];
     updatedLastMoves[actor] = moveDescription;
     setLastMoves(updatedLastMoves);
@@ -1441,6 +1651,7 @@ export default function PegsAndJokers() {
       segments: [{ owner, pegIndex, card, amount: splitAmount, fromPegs: pegs, toPegs: newPegs }],
     };
 
+    logMove(actor, frame.description, card);
     turnsRef.current += 1; // §4.4: once per seat that actually moves
 
     const w = checkWinner(newPegs, gameMode);
@@ -1493,7 +1704,7 @@ export default function PegsAndJokers() {
     setNotice(null);
 
     return true;
-  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat, endGame, commitTurn]);
+  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat, endGame, commitTurn, animationsEnabled, pacing.stepMs, playMoveVisual, logMove]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
     const actor = mySeat;
@@ -1518,16 +1729,19 @@ export default function PegsAndJokers() {
     const { newPegs } = applyMove(owner, pegIndex, splitCard, amount, pegs, moveOptions);
     const newPeg = newPegs[owner][pegIndex];
 
-    triggerMoveEffects(pegs, newPegs, actor, { player: owner, pegIndex });
-    if (newPeg.location === 'home') {
-      sfx.home();
-    } else {
-      sfx.cardPlay();
-    }
-
     // Update last move description to show split completion
     const secondMoveDesc = describeMoveAction(oldPeg, newPeg, splitCard, amount);
     const splitDescription = `Split: ${lastMoves[actor]}, ${secondMoveDesc}`;
+
+    const travelMs = animationsEnabled
+      ? calculateMovePath(owner, pegIndex, splitCard, amount, pegs).length * pacing.stepMs
+      : 0;
+    triggerMoveEffects(pegs, newPegs, actor, { player: owner, pegIndex }, travelMs);
+    sfx.cardPlay();
+    playMoveVisual(owner, pegIndex, splitCard, amount, pegs, {
+      player: actor, card: splitCard, description: secondMoveDesc,
+    });
+
     const updatedLastMoves = [...lastMoves];
     updatedLastMoves[actor] = splitDescription;
     setLastMoves(updatedLastMoves);
@@ -1547,6 +1761,7 @@ export default function PegsAndJokers() {
       segments: [{ owner, pegIndex, card: splitCard, amount, fromPegs: pegs, toPegs: newPegs }],
     };
 
+    logMove(actor, frame.description, splitCard);
     turnsRef.current += 1; // §4.4: once per seat that actually moves
 
     const w = checkWinner(newPegs, gameMode);
@@ -1596,7 +1811,7 @@ export default function PegsAndJokers() {
     setNotice(null);
 
     return true;
-  }, [splitCard, splitPegIndex, splitOwner, splitUndo, pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat, endGame, commitTurn]);
+  }, [splitCard, splitPegIndex, splitOwner, splitUndo, pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat, endGame, commitTurn, animationsEnabled, pacing.stepMs, playMoveVisual, logMove]);
 
   // Undo a half-finished split: restore the board (and anything the first half
   // bumped) to the snapshot taken before it, and return the turn to the point
@@ -1680,6 +1895,7 @@ export default function PegsAndJokers() {
     }
 
     if (autoStarted) triggerMoveEffects(pegs, newPegs, player);
+    logMove(player, discardFrame.description, discarded);
 
     setPegs(newPegs);
     setHands(newHands);
@@ -1714,7 +1930,7 @@ export default function PegsAndJokers() {
       setCurrentPlayer(nextPlayer);
       aiProcessingRef.current = false; // Allow the next AI seat to process
     }
-  }, [hands, deck, discardPiles, stuckCounts, pegs, lastMoves, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, commitTurn]);
+  }, [hands, deck, discardPiles, stuckCounts, pegs, lastMoves, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, commitTurn, logMove]);
 
   // AI logic - drives the AI seats this client is responsible for.
   //
@@ -1740,6 +1956,10 @@ export default function PegsAndJokers() {
   useEffect(() => {
     if (isMyTurn || winner !== null) return;
     if (!shouldSimulateAI(currentPlayer, seatOwners)) return;
+    // Wait for a cosmetic playback to finish. This is what stops an opponent
+    // from starting its move while your own peg is still counting itself along
+    // the board, and what spaces consecutive AI turns apart by `settleMs`.
+    if (visualBusy) return;
     if (aiProcessingRef.current) return; // Already processing this turn
 
     aiProcessingRef.current = true;
@@ -1758,8 +1978,11 @@ export default function PegsAndJokers() {
         updatedLastMoves[aiPlayer] = moveDescription;
         setLastMoves(updatedLastMoves);
 
+        // No arrival delay: an AI move calls this *after* its peg has finished
+        // gliding, so the chimes are already in time with the board.
         triggerMoveEffects(pegs, newPegs, aiPlayer, moverPeg);
         sfx.peg();
+        logMove(aiPlayer, moveDescription, card);
 
         setPegs(newPegs);
 
@@ -1810,6 +2033,21 @@ export default function PegsAndJokers() {
             winner: w, winningSeat: aiPlayer, description: moveDescription,
           });
           return true;
+        }
+
+        // The settle beat: hold the board (and the "Blue played 7♠" banner) for
+        // a moment before the next seat starts thinking, so a run of three AI
+        // turns reads as three separate events instead of one blur. The next
+        // turn is gated on `visualBusy`, so this is the whole mechanism.
+        if (!silent && pacing.settleMs > 0) {
+          setVisualBusy(true);
+          settleTimerRef.current = setTimeout(() => {
+            settleTimerRef.current = null;
+            setNowPlaying(null);
+            setVisualBusy(false);
+          }, pacing.settleMs);
+        } else {
+          setNowPlaying(null);
         }
 
         setCurrentPlayer(nextPlayer);
@@ -1876,6 +2114,12 @@ export default function PegsAndJokers() {
 
         if (bestMove.type === 'joker') jokersPlayedRef.current[aiPlayer] += 1;
 
+        // Say who is moving and what they played, large, for as long as the
+        // move takes. Cleared by the settle beat in completeAIMove.
+        if (!silent) {
+          setNowPlaying({ player: aiPlayer, card: bestMove.card, description: moveDescription });
+        }
+
         // If animations are disabled, or this is a silent catch-up simulation
         // (Package 5 — remote, running ahead of the auto-replay), complete
         // immediately with no per-peg animation.
@@ -1917,7 +2161,10 @@ export default function PegsAndJokers() {
 
       // No valid move, discard (discardAndDraw handles player transition for AI)
       discardAndDraw(aiPlayer);
-    }, silent ? 0 : 800); // §5.1: a silent catch-up simulation has no thinking delay
+      // §5.1: a silent catch-up simulation has no thinking delay. Otherwise the
+      // pause comes from the pace setting — long enough at `slow` to notice
+      // whose turn it is before the board changes under you.
+    }, silent ? 0 : pacing.thinkMs);
     aiTimerRef.current = timer;
 
     return () => {
@@ -1925,7 +2172,7 @@ export default function PegsAndJokers() {
       if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, logMove]);
 
   // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
@@ -2013,8 +2260,9 @@ export default function PegsAndJokers() {
   const statusLine = useMemo(
     () => describeStatus({
       phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, mode: gameMode,
+      moving: animatingPeg != null,
     }),
-    [phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, gameMode]
+    [phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, gameMode, animatingPeg]
   );
 
   const outcome = useMemo(
@@ -2263,6 +2511,7 @@ export default function PegsAndJokers() {
       segments: [],
     };
 
+    logMove(actor, jokerDescription, card);
     turnsRef.current += 1; // §4.4: once per seat that actually moves
 
     const w = checkWinner(newPegs, gameMode);
@@ -2432,6 +2681,32 @@ export default function PegsAndJokers() {
         <span>{card.rank}</span>
         <span>{card.suit}</span>
       </div>
+    );
+  };
+
+  // A peg that is mid-glide is drawn once, by the animation layer — every other
+  // place that would draw it (its start slot, its home slot, its space on the
+  // track) renders empty instead, so a move never shows two of the same peg.
+  const isPegAnimating = (player, pegIndex) =>
+    animatingPeg != null && animatingPeg.player === player && animatingPeg.pegIndex === pegIndex;
+
+  // A small face-up card, for saying which card a move was played with. The
+  // board only ever showed the move's *effect* ("Moved 7 spaces"); at a real
+  // table you watch the card go down, and knowing an opponent just spent their
+  // King is half of following the game.
+  const renderCardChip = (card, big = false) => {
+    if (!card) return null;
+    const isRed = card.suit === '♥' || card.suit === '♦';
+    const isJoker = card.rank === 'JOKER';
+    return (
+      <span
+        className={`inline-flex items-center justify-center rounded border border-gray-300 bg-white font-bold align-middle ${
+          big ? 'px-2 py-1 text-lg min-w-[2.5rem]' : 'px-1.5 py-0.5 text-sm min-w-[2rem]'
+        }`}
+        style={{ color: isRed ? '#DC2626' : '#1F2937' }}
+      >
+        {isJoker ? '🃏' : `${card.rank}${card.suit}`}
+      </span>
     );
   };
 
@@ -3110,20 +3385,23 @@ export default function PegsAndJokers() {
             >
               {soundOn ? '🔊' : '🔇'}
             </button>
+            {/* Four-way pace control, cycling slow → normal → fast → off. It
+                replaced an on/off toggle: "off" was the only escape from a
+                150ms-per-space peg, which is not a choice anyone who wants to
+                *follow* the game should have to make. */}
             <button
-              onClick={() => setAnimationsEnabled(!animationsEnabled)}
+              onClick={() => setAnimationSpeed(nextSpeed(animationSpeed))}
               className={`px-2.5 sm:px-3 py-2 rounded text-sm whitespace-nowrap ${
                 animationsEnabled
                   ? 'bg-green-600 hover:bg-green-700'
                   : 'bg-gray-600 hover:bg-gray-700'
               }`}
-              aria-label={animationsEnabled ? 'Turn animations off' : 'Turn animations on'}
+              aria-label={`Move speed: ${pacing.label}. Tap to change.`}
+              title="How fast pegs move around the board"
             >
-              {/* "Animations" is the widest label in the row; on a phone the ✨
-                  carries the meaning and the word is dropped. */}
-              <span aria-hidden="true">✨</span>
-              <span className="hidden sm:inline"> Animations</span>
-              {animationsEnabled ? ' On' : ' Off'}
+              <span aria-hidden="true">{pacing.icon}</span>
+              <span className="hidden sm:inline"> Speed:</span>
+              {` ${pacing.label}`}
             </button>
           </div>
           <div className="flex gap-2 items-center w-full sm:w-auto">
@@ -3162,8 +3440,11 @@ export default function PegsAndJokers() {
             in particular never reads "Blue is thinking…" after the game ends.
             `notice` sits under it for transient feedback and clears itself on
             the next phase change. */}
-        <div className="text-center mb-4 p-2 bg-gray-800 rounded">
-          <div>{statusLine}</div>
+        {/* `aria-live` so a screen reader (or VoiceOver on an iPad, which is
+            how a lot of people play) speaks each change of turn instead of the
+            player having to notice it. Polite, so it never interrupts. */}
+        <div className="text-center mb-4 p-2 bg-gray-800 rounded" aria-live="polite">
+          <div className="text-base sm:text-lg">{statusLine}</div>
           {notice && <div className="text-sm text-amber-300 mt-1">{notice}</div>}
           {phase === PHASES.FINISHED && endOverlayDismissed && (
             <button
@@ -3174,6 +3455,36 @@ export default function PegsAndJokers() {
             </button>
           )}
         </div>
+
+        {/* Who is moving, with the card they played, held on screen for the
+            whole move and the settle beat after it. The board's own per-seat
+            labels are 8px SVG text on the rim — fine as a reference, useless as
+            an announcement. */}
+        {nowPlaying && !isReplaying && winner === null && (
+          <div
+            className="mb-4 p-3 rounded flex items-center gap-3 border-2"
+            style={{
+              borderColor: PLAYER_COLORS[nowPlaying.player],
+              backgroundColor: `${PLAYER_COLORS[nowPlaying.player]}22`,
+            }}
+          >
+            <span
+              className="w-5 h-5 rounded-full flex-shrink-0"
+              style={{ backgroundColor: PLAYER_COLORS[nowPlaying.player] }}
+              aria-hidden="true"
+            />
+            <div className="min-w-0 flex-1">
+              <div className="font-bold text-base sm:text-lg">
+                <span style={{ color: PLAYER_COLORS[nowPlaying.player] }}>
+                  {ownsSeat(nowPlaying.player) ? 'You' : PLAYER_NAMES[nowPlaying.player]}
+                </span>
+                {' played '}
+                {renderCardChip(nowPlaying.card, true)}
+              </div>
+              <div className="text-sm text-gray-200 truncate">{nowPlaying.description}</div>
+            </div>
+          </div>
+        )}
 
         {/* Undo a mis-tapped split: only available between the two halves of a
             split, before the second peg commits the move */}
@@ -3238,6 +3549,45 @@ export default function PegsAndJokers() {
           </div>
         )}
 
+        {/* Move log — the running commentary. Every seat's last few moves in
+            readable type, newest first, colour-coded and carrying the card that
+            was played. This replaces squinting at the 8px labels on the board
+            rim, which are still there but were never a serious answer to "what
+            did Blue just do?". Three entries on a phone, six from `sm` up, so
+            it never pushes the board off a small screen.
+
+            `aria-live="polite"` makes it a live region: a screen reader
+            announces each new move as it lands. */}
+        {moveLog.length > 0 && !isReplaying && (
+          <div className="mb-4 p-3 rounded bg-gray-800" aria-live="polite">
+            <div className="text-sm font-semibold text-gray-400 mb-1">Recent moves</div>
+            <ul className="space-y-1">
+              {moveLog.map((entry, i) => (
+                <li
+                  key={entry.id}
+                  className={`flex items-center gap-2 text-sm sm:text-base ${
+                    i >= 3 ? 'hidden sm:flex' : 'flex'
+                  } ${i === 0 ? '' : 'opacity-70'}`}
+                >
+                  <span
+                    className="w-3 h-3 rounded-full flex-shrink-0"
+                    style={{ backgroundColor: PLAYER_COLORS[entry.player] }}
+                    aria-hidden="true"
+                  />
+                  <span
+                    className="font-semibold flex-shrink-0"
+                    style={{ color: PLAYER_COLORS[entry.player] }}
+                  >
+                    {ownsSeat(entry.player) ? 'You' : PLAYER_NAMES[entry.player]}
+                  </span>
+                  {renderCardChip(entry.card)}
+                  <span className="text-gray-200 truncate">{entry.description}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         <div className="flex flex-col lg:flex-row gap-4 items-center lg:items-start">
           {/* Game Board */}
           <div className="flex-shrink-0 w-full max-w-[400px]">
@@ -3265,9 +3615,11 @@ export default function PegsAndJokers() {
                 <g key={`start-${player}`}>
                   {Array.from({ length: 5 }).map((_, i) => {
                     const { x, y } = getStartAreaPosition(player, i);
-                    // While a bumped peg is flying back, its start slot renders empty
+                    // While a bumped peg is flying back — or gliding through a
+                    // move — its start slot renders empty, so there is only ever
+                    // one of it on the board.
                     const isFlyingBack = bumpFx && bumpFx.player === player && bumpFx.pegIndex === i;
-                    const hasPeg = pegs[player][i]?.location === 'start' && !isFlyingBack;
+                    const hasPeg = pegs[player][i]?.location === 'start' && !isFlyingBack && !isPegAnimating(player, i);
                     const isClickable = isMyTurn && player === controlledOwner && hasPeg && !jokerMode;
                     const isSelected = player === controlledOwner && (i === selectedPeg || i === jokerSourcePeg) && pegs[player][i]?.location === 'start';
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(i);
@@ -3300,8 +3652,12 @@ export default function PegsAndJokers() {
                 <g key={`home-${player}`}>
                   {Array.from({ length: 5 }).map((_, i) => {
                     const { x, y } = getHomePosition(player, i);
-                    const hasPeg = pegs[player].some(p => p.location === 'home' && p.homePosition === i);
                     const pegIndex = pegs[player].findIndex(p => p.location === 'home' && p.homePosition === i);
+                    // Empty while that peg is mid-glide: a human move commits
+                    // its state before the cosmetic playback runs, so without
+                    // this the peg would be sitting in its home slot while a
+                    // copy of it is still counting its way there.
+                    const hasPeg = pegIndex !== -1 && !isPegAnimating(player, pegIndex);
                     const isClickable = isMyTurn && player === controlledOwner && hasPeg && i < 4 && !jokerMode;
                     const isSelected = player === controlledOwner && pegIndex === selectedPeg && hasPeg;
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(pegIndex);
@@ -3334,6 +3690,8 @@ export default function PegsAndJokers() {
                 playerPegs.map((peg, pegIndex) => {
                   // Skip pegs in start or home - they're rendered as filled circles
                   if (peg.location === 'start' || peg.location === 'home') return null;
+                  // The gliding copy is drawn separately, below.
+                  if (isPegAnimating(player, pegIndex)) return null;
 
                   let pos;
                   if (peg.location === 'track') {
@@ -3437,30 +3795,86 @@ export default function PegsAndJokers() {
                 );
               })()}
 
-              {/* Animating peg - shows peg moving step by step */}
+              {/* Animating peg — one space at a time, with everything needed to
+                  follow it: a ghost on the space it left, a fading trail over
+                  the spaces it has counted, a halo so the eye finds it, and the
+                  running count of spaces moved. Between them you can look away,
+                  look back, and still see where the peg came from and how far
+                  it has got. */}
               {animatingPeg && (() => {
+                const color = PLAYER_COLORS[animatingPeg.player];
+                const anchorXY = (anchor) => {
+                  if (!anchor) return null;
+                  if (anchor.type === 'track') return getTrackPosition(anchor.position);
+                  if (anchor.type === 'home') return getHomePosition(animatingPeg.player, anchor.position);
+                  if (anchor.type === 'start') return getStartAreaPosition(animatingPeg.player, anchor.position);
+                  return null;
+                };
+
                 const currentPos = animatingPeg.path[animatingPeg.currentStep];
-                if (!currentPos) return null;
-
-                let pos;
-                if (currentPos.type === 'track') {
-                  pos = getTrackPosition(currentPos.position);
-                } else if (currentPos.type === 'home') {
-                  pos = getHomePosition(animatingPeg.player, currentPos.position);
-                }
-
+                const pos = anchorXY(currentPos);
                 if (!pos) return null;
 
+                const ghost = anchorXY(animatingPeg.from);
+                // Spaces already counted, oldest first. Older breadcrumbs fade,
+                // so the direction of travel reads at a glance.
+                const trail = animatingPeg.path.slice(0, animatingPeg.currentStep);
+                const trailLen = trail.length;
+                const count = animatingPeg.currentStep + 1;
+
                 return (
-                  <circle
-                    cx={pos.x}
-                    cy={pos.y}
-                    r={8}
-                    fill={PLAYER_COLORS[animatingPeg.player]}
-                    stroke="white"
-                    strokeWidth={3}
-                    style={{ filter: 'drop-shadow(0 0 4px rgba(255,255,255,0.8))' }}
-                  />
+                  <g>
+                    {ghost && (
+                      <circle
+                        cx={ghost.x}
+                        cy={ghost.y}
+                        r={7}
+                        fill="none"
+                        stroke={color}
+                        strokeWidth={1.5}
+                        strokeDasharray="3 2"
+                        opacity={0.55}
+                      />
+                    )}
+                    {trail.map((anchor, i) => {
+                      const p = anchorXY(anchor);
+                      if (!p) return null;
+                      return (
+                        <circle
+                          key={`trail-${i}`}
+                          cx={p.x}
+                          cy={p.y}
+                          r={4}
+                          fill={color}
+                          opacity={0.15 + 0.35 * ((i + 1) / Math.max(trailLen, 1))}
+                        />
+                      );
+                    })}
+                    <circle cx={pos.x} cy={pos.y} r={13} fill={color} opacity={0.25} />
+                    <circle
+                      cx={pos.x}
+                      cy={pos.y}
+                      r={8}
+                      fill={color}
+                      stroke="white"
+                      strokeWidth={3}
+                      style={{ filter: 'drop-shadow(0 0 4px rgba(255,255,255,0.8))' }}
+                    />
+                    {/* The count, the way you'd say it out loud: one, two,
+                        three… Sits above the peg with its own dark plate so it
+                        stays readable over any part of the board. */}
+                    <circle cx={pos.x} cy={pos.y - 15} r={8} fill="#111827" opacity={0.85} />
+                    <text
+                      x={pos.x}
+                      y={pos.y - 12}
+                      textAnchor="middle"
+                      fill="white"
+                      fontSize="11"
+                      fontWeight="bold"
+                    >
+                      {count}
+                    </text>
+                  </g>
                 );
               })()}
 

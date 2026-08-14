@@ -69,6 +69,11 @@ export function describeStatus({
   discardMode = false,
   mode = GAME_MODES.CLASSIC,
   names = PLAYER_NAMES,
+  // True while a peg is actually travelling. "Blue is thinking…" printed over
+  // a peg that is visibly counting its way around the board is a small lie,
+  // and a confusing one for anyone relying on the words rather than the
+  // movement — the two halves of the screen should agree.
+  moving = false,
 }) {
   switch (phase) {
     case PHASES.FINISHED:
@@ -78,12 +83,13 @@ export function describeStatus({
     case PHASES.DEALING:
       return 'Dealing…';
     case PHASES.MY_TURN:
+      if (moving) return 'Moving…';
       return myTurnPrompt({ splitRemaining, splitCard, jokerMode, discardMode, mode });
     case PHASES.WAITING_PARTNER:
       return `Waiting for ${names[currentPlayer]} to play…`;
     case PHASES.AI_TURN:
     default:
-      return `${names[currentPlayer]} is thinking...`;
+      return `${names[currentPlayer]} is ${moving ? 'moving…' : 'thinking...'}`;
   }
 }
 

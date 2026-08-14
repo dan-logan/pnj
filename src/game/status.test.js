@@ -58,6 +58,25 @@ describe('derivePhase', () => {
   });
 });
 
+describe('describeStatus while a peg is travelling', () => {
+  it('says an AI is moving, not thinking, once its peg is on the way', () => {
+    expect(describeStatus({ phase: PHASES.AI_TURN, currentPlayer: 1, moving: true }))
+      .toBe('Blue is moving…');
+    expect(describeStatus({ phase: PHASES.AI_TURN, currentPlayer: 1 }))
+      .toBe('Blue is thinking...');
+  });
+
+  it('replaces your own prompt while your peg is counting itself along', () => {
+    expect(describeStatus({ phase: PHASES.MY_TURN, currentPlayer: 0, moving: true }))
+      .toBe('Moving…');
+  });
+
+  it('never overrides a finished game', () => {
+    expect(describeStatus({ phase: PHASES.FINISHED, currentPlayer: 1, moving: true }))
+      .toBe('Game over.');
+  });
+});
+
 describe('describeStatus', () => {
   it('says the game is over rather than who is thinking', () => {
     expect(describeStatus({ phase: PHASES.FINISHED, currentPlayer: 1 })).toBe('Game over.');
