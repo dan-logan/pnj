@@ -111,6 +111,7 @@ import {
   saveSpeed,
   stageBumpFlights,
   specialPlayHoldMs,
+  splitBeatMs,
   BUMP_FLY_STEPS,
   BUMP_FLY_TICK_MS,
   JOKER_CARD_MS,
@@ -265,6 +266,28 @@ export default function PegsAndJokers() {
   // traversed prefix of `path` is drawn as a fading trail.
   const [animatingPeg, setAnimatingPeg] = useState(null);
   const animationRef = useRef(null);
+  // Pegs that have finished travelling but that the board state has not caught
+  // up with yet — drawn, settled, on the space they actually landed on.
+  //
+  // Exactly one move needs this: an AI split. Both halves animate against the
+  // *pre-move* board and nothing is committed until the second one lands (see
+  // the split branch of the AI effect), so the instant the first peg's glide
+  // ended it was drawn from the stale board again and snapped back to the space
+  // it had just left — where it then sat for the whole second half. A split
+  // therefore read as one peg bouncing back to where it started and a second,
+  // unrelated peg moving for no reason, with both of them jumping to their real
+  // places at the end. Committing the half-played board would fix it too, but
+  // that is a save-state question (and would double-draw a bump the first half
+  // caused, since the fly-back is deliberately held until the whole move ends);
+  // pinning the peg is the animation-only answer, and it is the same discipline
+  // `isPegAnimating` and `isPegBumping` already use — the overlay owns the peg,
+  // every other place that would draw it renders empty.
+  //
+  // [{ player, pegIndex, at, from }], where `at`/`from` are anchors in the shape
+  // `pegAnchor` returns, resolved to coordinates at render time so they follow
+  // the board rotation for free.
+  const [landedPegs, setLandedPegs] = useState([]);
+  const splitBeatRef = useRef(null); // the pause between the halves of a split
   // A purely cosmetic playback of a move whose state has *already* committed
   // (see `playMoveVisual`). The AI effect waits on it so an opponent doesn't
   // start moving while your own peg is still counting itself along the board.
@@ -507,6 +530,17 @@ export default function PegsAndJokers() {
     setSpeechBubbles([]);
   }, []);
 
+  // Let go of a half-played split: the beat between its two halves, and the peg
+  // the first half left pinned at its destination. Called from every path that
+  // can end or replace a move in flight, for the same reason every other timer
+  // is cancelled there — a pinned peg that outlives its move is a peg the next
+  // move draws in two places at once, and a beat that outlives it starts the
+  // second half of a split into a game that is no longer on screen.
+  const clearSplitVisual = useCallback(() => {
+    if (splitBeatRef.current) { clearTimeout(splitBeatRef.current); splitBeatRef.current = null; }
+    setLandedPegs(prev => (prev.length ? [] : prev));
+  }, []);
+
   // Instant replay: a buffer of the AI moves made since your last turn, plus the
   // playback state. Frames live in a ref (they hold peg snapshots and don't need
   // to trigger renders); `replayReady` mirrors the count so the button can show.
@@ -603,6 +637,7 @@ export default function PegsAndJokers() {
     arrivalTimersRef.current.forEach(clearTimeout);
     arrivalTimersRef.current = [];
     clearAnnouncements();
+    clearSplitVisual();
     replayCancelRef.current = true;
     aiProcessingRef.current = false;
     setAnimatingPeg(null);
@@ -713,6 +748,7 @@ export default function PegsAndJokers() {
     arrivalTimersRef.current.forEach(clearTimeout);
     arrivalTimersRef.current = [];
     clearAnnouncements();
+    clearSplitVisual();
     setBumpFx(null);
     if (bumpFxRef.current) {
       clearInterval(bumpFxRef.current);
@@ -734,7 +770,7 @@ export default function PegsAndJokers() {
     setEndInfo(null);
     setEndOverlayDismissed(false);
     setShowFirstPlayerModal(false);
-  }, [resetReplay, ownsSeat, clearAnnouncements]);
+  }, [resetReplay, ownsSeat, clearAnnouncements, clearSplitVisual]);
 
   const handleGoFirst = useCallback(() => {
     unlockAudio();
@@ -793,6 +829,7 @@ export default function PegsAndJokers() {
       bumpFxRef.current = null;
     }
     if (bumpHoldRef.current) { clearTimeout(bumpHoldRef.current); bumpHoldRef.current = null; }
+    clearSplitVisual();
     setIsSpinning(false);
     setSpinningPlayer(0);
     setWinner(null);
@@ -801,7 +838,7 @@ export default function PegsAndJokers() {
 
     // Show the modal to choose first player
     setShowFirstPlayerModal(true);
-  }, [resetReplay]);
+  }, [resetReplay, clearSplitVisual]);
 
   // Restore an in-progress game from a saved snapshot. Resets transient UI
   // state (selections, joker/discard modes) since those aren't persisted.
@@ -840,6 +877,7 @@ export default function PegsAndJokers() {
     arrivalTimersRef.current.forEach(clearTimeout);
     arrivalTimersRef.current = [];
     clearAnnouncements();
+    clearSplitVisual();
 
     // Restore per-game stat tallies so a resumed game still records correctly.
     // jokersPlayed/bumpsDelivered/timesBumped are per-seat arrays on the wire;
@@ -876,7 +914,7 @@ export default function PegsAndJokers() {
     setPendingResume(null);
     setShowResumeModal(false);
     setShowFirstPlayerModal(false);
-  }, [resetReplay, ownsSeat, clearAnnouncements]);
+  }, [resetReplay, ownsSeat, clearAnnouncements, clearSplitVisual]);
 
   // Blank the board: no hands, pegs at start, nothing pending.
   //
@@ -902,6 +940,7 @@ export default function PegsAndJokers() {
     arrivalTimersRef.current.forEach(clearTimeout);
     arrivalTimersRef.current = [];
     clearAnnouncements();
+    clearSplitVisual();
     aiProcessingRef.current = false;
 
     setDeck([]);
@@ -947,7 +986,7 @@ export default function PegsAndJokers() {
     replayPrevPlayerRef.current = parkOn;
     prevPlayerRef.current = parkOn;
     pendingAutoReplayRef.current = false;
-  }, [resetReplay, clearAnnouncements]);
+  }, [resetReplay, clearAnnouncements, clearSplitVisual]);
 
   // --- Remote play: sessions, listeners, create/join, switching ---------------
   //
@@ -1625,6 +1664,7 @@ export default function PegsAndJokers() {
     // screen from that silent run would hang over the replay describing a move
     // the player is about to watch happen.
     clearAnnouncements();
+    clearSplitVisual();
     setIsReplaying(true);
     setSelectedCard(null);
     setSelectedPeg(null);
@@ -1648,6 +1688,21 @@ export default function PegsAndJokers() {
         setPegs(replayRestoreRef.current);
         replayRestoreRef.current = null;
       }
+    };
+
+    // Move on to the next segment, with a beat in between. A split is the only
+    // move with more than one segment, and its two pegs run into each other as
+    // one unreadable motion without a gap — see `splitBeatMs`. The board is
+    // already showing the first peg where it landed (the segment committed
+    // `toPegs` before this), so the pause is spent looking at a finished half.
+    const nextSegment = (segments, idx, done) => {
+      const beat = splitBeatMs(animationSpeed);
+      if (idx >= segments.length || beat <= 0) { animateSegments(segments, idx, done); return; }
+      replayFrameTimerRef.current = setTimeout(() => {
+        replayFrameTimerRef.current = null;
+        if (replayCancelRef.current) return;
+        animateSegments(segments, idx, done);
+      }, beat);
     };
 
     // Animate one segment (a single peg gliding), then advance to the next.
@@ -1683,7 +1738,7 @@ export default function PegsAndJokers() {
           replaySegTimerRef.current = null;
           setAnimatingPeg(null);
           setPegs(seg.toPegs);
-          animateSegments(segments, idx + 1, done);
+          nextSegment(segments, idx + 1, done);
         } else {
           sfx.step(seg.owner, step, path.length);
           setAnimatingPeg(prev => prev ? { ...prev, currentStep: step } : null);
@@ -1716,7 +1771,7 @@ export default function PegsAndJokers() {
     };
 
     playFrame(0);
-  }, [isReplaying, pegs, pacing.stepMs, pegAnchor, clearAnnouncements]);
+  }, [isReplaying, pegs, pacing.stepMs, animationSpeed, pegAnchor, clearAnnouncements, clearSplitVisual]);
 
   // Abort an in-flight replay and snap the board back to the live state.
   const stopReplay = useCallback(() => {
@@ -1763,6 +1818,7 @@ export default function PegsAndJokers() {
       if (replaySegTimerRef.current) clearInterval(replaySegTimerRef.current);
       if (replayFrameTimerRef.current) clearTimeout(replayFrameTimerRef.current);
       if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
+      if (splitBeatRef.current) clearTimeout(splitBeatRef.current);
       if (bumpFxRef.current) clearInterval(bumpFxRef.current);
       if (bumpHoldRef.current) clearTimeout(bumpHoldRef.current);
       arrivals.current.forEach(clearTimeout);
@@ -2472,6 +2528,11 @@ export default function PegsAndJokers() {
         );
         sfx.peg();
 
+        // The board catches up with the whole move here, so the pin holding the
+        // first half of a split where it landed can let go in the same batch —
+        // the peg is drawn from `newPegs` on the very next paint, in the same
+        // place, so nothing flickers.
+        clearSplitVisual();
         setPegs(newPegs);
 
         const newHands = hands.map(h => [...h]);
@@ -2621,10 +2682,14 @@ export default function PegsAndJokers() {
         // a split; none at all for a joker), so they also give the overlay the
         // move's length — see `lifeMs` on showNowPlaying.
         if (!silent) {
+          // Every segment's travel, plus the beat *between* them — a split's
+          // card would otherwise reach the discard pile while its second peg
+          // was still on its way, and a card that lands early is the same
+          // wrong-by-a-move problem as one that never lands at all.
           const travelMs = replaySegments.reduce(
             (ms, s) => ms + landingDelayFor(s.owner, s.pegIndex, s.card, s.amount, s.fromPegs),
             0,
-          );
+          ) + Math.max(0, replaySegments.length - 1) * splitBeatMs(animationSpeed);
           showNowPlaying({
             player: aiPlayer, card: bestMove.card, description: moveDescription,
             // A joker's card is the move: it holds centre-board for its own
@@ -2649,16 +2714,47 @@ export default function PegsAndJokers() {
             completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, displacements);
           });
         } else if (bestMove.type === 'split7' || bestMove.type === 'split9') {
-          // Two-part animation for a split. Effects play once, at the end: the
-          // board isn't committed until both halves have animated, so a bump
-          // played after the first half would fly the peg away and then have it
-          // reappear on the space it started from when the FX ended.
+          // Two-part animation for a split — one card, two different pegs, and
+          // the move people most often lose the thread of. Three things make it
+          // readable, and all three are here rather than in the animation
+          // itself, because the board state stays on the *pre-move* position
+          // until both halves have landed:
+          //
+          //  1. The first peg is pinned where it landed (`landedPegs`) for the
+          //     rest of the move. Without it the peg snapped back to the space
+          //     it had just left the instant its glide ended — the board is the
+          //     only thing drawing it once the animation layer lets go, and the
+          //     board still has it at its origin.
+          //  2. A beat between the halves (`splitBeatMs`), so the first peg is
+          //     seen to *stop* before the second one sets off. Back to back the
+          //     two halves read as one continuous motion by two unrelated pegs.
+          //  3. Effects still play once, at the end: the board isn't committed
+          //     until both halves have animated, so a bump played after the
+          //     first half would fly the peg away and then have it reappear on
+          //     the space it started from when the FX ended.
           animateMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
             // After first animation, animate second peg (may be the partner's)
             const afterFirstPegs = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
-            animateMove(secondOwner, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
-              completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, displacements);
-            });
+            setLandedPegs([{
+              player: owner,
+              pegIndex: bestMove.pegIndex,
+              at: pegAnchor(afterFirstPegs[owner]?.[bestMove.pegIndex], bestMove.pegIndex),
+              from: pegAnchor(pegs[owner]?.[bestMove.pegIndex], bestMove.pegIndex),
+              // What this half was worth, so it stays over the peg while the
+              // other half counts out the rest of the card.
+              count: calculateMovePath(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs).length,
+            }]);
+            const playSecondHalf = () => {
+              animateMove(secondOwner, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
+                completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, displacements);
+              });
+            };
+            const beat = splitBeatMs(animationSpeed);
+            if (beat <= 0) { playSecondHalf(); return; }
+            splitBeatRef.current = setTimeout(() => {
+              splitBeatRef.current = null;
+              playSecondHalf();
+            }, beat);
           });
         } else if (bestMove.type === 'joker') {
           // Joker — no glide to run (its path is empty by construction); the
@@ -2681,7 +2777,7 @@ export default function PegsAndJokers() {
       if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, announce, showNowPlaying, landingDelayFor, holdBoard]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, announce, showNowPlaying, landingDelayFor, holdBoard, animationSpeed, pegAnchor, clearSplitVisual]);
 
   // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
@@ -3249,6 +3345,13 @@ export default function PegsAndJokers() {
   // too, sitting on the space the board says it has already left.
   const isPegBumping = (player, pegIndex) =>
     bumpFx != null && bumpFx.items.some(it => it.player === player && it.pegIndex === pegIndex);
+
+  // And the same rule again for a peg that has finished travelling but whose
+  // move has not committed yet — the first half of a split (see `landedPegs`).
+  // The board would draw it back on the space it left; the overlay draws it
+  // where it actually is.
+  const isPegLanded = (player, pegIndex) =>
+    landedPegs.some(it => it.player === player && it.pegIndex === pegIndex);
 
   // The card being played, dealt large over the middle of the board and then
   // dropped onto its owner's discard pile — the one moment at a real table
@@ -4229,7 +4332,8 @@ export default function PegsAndJokers() {
                     // gliding through a move — its start slot renders empty, so
                     // there is only ever one of it on the board.
                     const isFlyingBack = isPegBumping(player, i);
-                    const hasPeg = pegs[player][i]?.location === 'start' && !isFlyingBack && !isPegAnimating(player, i);
+                    const hasPeg = pegs[player][i]?.location === 'start' && !isFlyingBack
+                      && !isPegAnimating(player, i) && !isPegLanded(player, i);
                     const isClickable = isMyTurn && player === controlledOwner && hasPeg && !jokerMode;
                     const isSelected = player === controlledOwner && (i === selectedPeg || i === jokerSourcePeg) && pegs[player][i]?.location === 'start';
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(i);
@@ -4267,7 +4371,12 @@ export default function PegsAndJokers() {
                     // its state before the cosmetic playback runs, so without
                     // this the peg would be sitting in its home slot while a
                     // copy of it is still counting its way there.
-                    const hasPeg = pegIndex !== -1 && !isPegAnimating(player, pegIndex);
+                    // …and empty for a peg the split pin has taken over, which
+                    // matters for a home slot too: a split half can move a peg
+                    // *within* the home corridor, so the stale board would draw
+                    // it in the slot it left while the pin draws it in the one
+                    // it reached.
+                    const hasPeg = pegIndex !== -1 && !isPegAnimating(player, pegIndex) && !isPegLanded(player, pegIndex);
                     const isClickable = isMyTurn && player === controlledOwner && hasPeg && i < 4 && !jokerMode;
                     const isSelected = player === controlledOwner && pegIndex === selectedPeg && hasPeg;
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(pegIndex);
@@ -4304,6 +4413,7 @@ export default function PegsAndJokers() {
                   // flying — is drawn separately, below.
                   if (isPegAnimating(player, pegIndex)) return null;
                   if (isPegBumping(player, pegIndex)) return null;
+                  if (isPegLanded(player, pegIndex)) return null;
 
                   let pos;
                   if (peg.location === 'track') {
@@ -4438,6 +4548,68 @@ export default function PegsAndJokers() {
                       style={waiting ? undefined : { filter: shadow }}
                       className={isJokerPeg ? 'joker-peg' : undefined}
                     />
+                  </g>
+                );
+              })}
+
+              {/* Pegs that have finished their half of a split and are waiting
+                  for the rest of the move to commit. Drawn where they landed,
+                  keeping their ghost and their count, so the first half of a
+                  split stays on screen — and stays legible — while the second
+                  one plays. Dimmed a little: it has had its turn, and the eye
+                  should now be on the peg that is still moving. Drawn before
+                  the gliding peg so a peg that somehow overlaps it goes on top. */}
+              {landedPegs.map((item) => {
+                const color = PLAYER_COLORS[item.player];
+                const anchorXY = (anchor) => {
+                  if (!anchor) return null;
+                  if (anchor.type === 'track') return getTrackPosition(anchor.position);
+                  if (anchor.type === 'home') return getHomePosition(item.player, anchor.position);
+                  if (anchor.type === 'start') return getStartAreaPosition(item.player, anchor.position);
+                  return null;
+                };
+                const pos = anchorXY(item.at);
+                if (!pos) return null;
+                const ghost = anchorXY(item.from);
+                // Match whatever the board would have drawn there: a track peg
+                // is bigger than a peg sitting in a start or home slot.
+                const r = item.at.type === 'track' ? 7 : 5;
+                return (
+                  <g key={`landed-${item.player}-${item.pegIndex}`} opacity={0.9}>
+                    {ghost && (
+                      <circle
+                        cx={ghost.x}
+                        cy={ghost.y}
+                        r={7}
+                        fill="none"
+                        stroke={color}
+                        strokeWidth={1.5}
+                        strokeDasharray="3 2"
+                        opacity={0.35}
+                      />
+                    )}
+                    <circle cx={pos.x} cy={pos.y} r={r + 5} fill={color} opacity={0.15} />
+                    <circle cx={pos.x} cy={pos.y} r={r} fill={color} stroke="white" strokeWidth={2} />
+                    {/* The spaces this half was worth, left over the peg while
+                        the other half counts out the rest — 4 here and 3 there
+                        is what makes a split visibly add up to the seven on the
+                        card. */}
+                    {item.count > 0 && (
+                      <>
+                        <circle cx={pos.x} cy={pos.y - 15} r={8} fill="#111827" opacity={0.6} />
+                        <text
+                          x={pos.x}
+                          y={pos.y - 12}
+                          textAnchor="middle"
+                          fill="white"
+                          fontSize="11"
+                          fontWeight="bold"
+                          opacity={0.8}
+                        >
+                          {item.count}
+                        </text>
+                      </>
+                    )}
                   </g>
                 );
               })}

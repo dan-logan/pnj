@@ -14,6 +14,7 @@ import {
   saveSpeed,
   stageBumpFlights,
   specialPlayHoldMs,
+  splitBeatMs,
   BUMP_FLY_STEPS,
   BUMP_FLY_STAGGER,
   BUMP_FLY_TICK_MS,
@@ -192,6 +193,34 @@ describe('the pause after a special play', () => {
 
   it('is long enough to be a pause rather than a hitch', () => {
     expect(SPECIAL_PAUSE_MS).toBe(2000);
+  });
+});
+
+describe('the beat between the halves of a split', () => {
+  it('is always longer than a single space of travel', () => {
+    // The gap has to read as a break, not as one more step in the count.
+    for (const speed of SPEED_ORDER.filter(animationsOn)) {
+      expect(splitBeatMs(speed)).toBeGreaterThanOrEqual(stepMsFor(speed));
+    }
+  });
+
+  it('is at least as long as the settle beat after a whole move', () => {
+    for (const speed of SPEED_ORDER.filter(animationsOn)) {
+      expect(splitBeatMs(speed)).toBeGreaterThanOrEqual(settleMsFor(speed));
+    }
+  });
+
+  it('shortens as the pace quickens', () => {
+    expect(splitBeatMs('slow')).toBeGreaterThan(splitBeatMs('normal'));
+    expect(splitBeatMs('normal')).toBeGreaterThan(splitBeatMs('fast'));
+  });
+
+  it('is nothing with animations off — there is no travel to separate', () => {
+    expect(splitBeatMs('off')).toBe(0);
+  });
+
+  it('falls back to the default pace for a speed it does not know', () => {
+    expect(splitBeatMs('sideways')).toBe(splitBeatMs(DEFAULT_SPEED));
   });
 });
 
