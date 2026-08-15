@@ -116,9 +116,29 @@ const REPLAY_MIN_STEP_MS = 280; // per-step floor while a peg animates during re
 const REPLAY_LEADIN_MS = 320;   // beat on the "before" board so the start registers
 const REPLAY_FRAME_PAUSE_MS = 600; // pause after each move before the next one
 
-// How many entries the move log keeps. Enough to cover a full round of four
-// seats plus your own last move, short enough to stay readable at a glance.
-const MOVE_LOG_SIZE = 6;
+// Discard piles sit in the corners around the centre draw pile, indexed by
+// *visual side* so they follow the board rotation. Module-level because the
+// played-card overlay flies its card to the same slot the pile is drawn in —
+// two copies of these numbers would drift.
+const DISCARD_SLOTS = [
+  { x: 130, y: 140 },  // top side - top-left of center
+  { x: 220, y: 140 },  // right side - top-right of center
+  { x: 220, y: 240 },  // bottom side (yours) - bottom-right of center
+  { x: 130, y: 240 },  // left side - bottom-left of center
+];
+const DISCARD_CARD_W = 22;
+const DISCARD_CARD_H = 30;
+
+// The played-card overlay: a big card centred over the middle of the board,
+// with its caption in the clear space above it. The card does cross the discard
+// piles, which is the point — that is where it is going. `cy` is duplicated as
+// the `transform-origin` of `.pnj-card-play` in index.css (CSS can't read it
+// from here), so the two move together.
+const PLAYED_CARD = { w: 44, h: 60, cx: 200, cy: 140 };
+// How long the card takes to pop up, hold and drop onto the pile. Scaled to the
+// move it belongs to (see `lifeMs`), between these two.
+const PLAYED_CARD_MIN_MS = 550;
+const PLAYED_CARD_MAX_MS = 1500;
 
 // The ?g= invite link for a game. Needed both when a game is created and when
 // its host reopens it while still waiting for a partner to join.
@@ -247,13 +267,28 @@ export default function PegsAndJokers() {
   // the class of stale-timer bug the status rewrite got rid of.
   const arrivalTimersRef = useRef([]);
 
-  // The mover, the card they played and what it did, shown large while the
-  // move animates. The board's own per-seat labels are 8px SVG text — legible
-  // if you already know where to look, useless otherwise.
-  const [nowPlaying, setNowPlaying] = useState(null); // { player, card, description }
-  // The last few moves, newest first: { id, player, description, card }.
-  const [moveLog, setMoveLog] = useState([]);
-  const moveLogSeqRef = useRef(0);
+  // The mover, the card they played and what it did, drawn *over the board*
+  // while the move animates (see the played-card overlay in the render). It
+  // used to be a bordered box in the page flow above the board, which on a
+  // phone pushed the whole screen down every time an opponent moved and pulled
+  // it back up a second later — the jump was more distracting than the
+  // information was useful. An overlay costs no layout at all.
+  const [nowPlaying, setNowPlaying] = useState(null); // { id, player, card, description, lifeMs }
+  const nowPlayingSeqRef = useRef(0);
+
+  // Every move gets its own id so the overlay's entrance/fly-to-the-pile
+  // animation replays for each one — two identical moves in a row would
+  // otherwise reuse the same DOM node and animate only once.
+  //
+  // `lifeMs` is how long this move will be on screen (travel + settle). The
+  // card's flight to the discard pile is scaled to fit inside it: the overlay
+  // is unmounted the moment the move ends, so a fixed flight would leave a
+  // one-space move's card hanging in mid-air halfway to the pile, and a card
+  // that vanishes instead of landing is worse than one that never moved.
+  const showNowPlaying = useCallback((meta) => {
+    nowPlayingSeqRef.current += 1;
+    setNowPlaying({ ...meta, id: nowPlayingSeqRef.current });
+  }, []);
 
   // Load the saved pace once on mount rather than in a useState initialiser, so
   // the module stays safe to import where there is no localStorage.
@@ -264,16 +299,6 @@ export default function PegsAndJokers() {
   const setAnimationSpeed = useCallback((speed) => {
     setAnimationSpeedState(speed);
     saveSpeed(speed);
-  }, []);
-
-  // Push a completed move onto the visible log. Called from every site that
-  // ends a turn — yours, your partner's, an AI's, and a stuck discard — so the
-  // log is the one place that answers "what just happened?".
-  const logMove = useCallback((player, description, card = null) => {
-    if (!description) return;
-    moveLogSeqRef.current += 1;
-    const entry = { id: moveLogSeqRef.current, player, description, card };
-    setMoveLog(prev => [entry, ...prev].slice(0, MOVE_LOG_SIZE));
   }, []);
 
   // Sound / haptics
@@ -609,7 +634,6 @@ export default function PegsAndJokers() {
     setNotice(null);
     setWinner(null);
     setLastMoves([null, null, null, null]);
-    setMoveLog([]);
     setNowPlaying(null);
     aiProcessingRef.current = false;
     setAnimatingPeg(null);
@@ -739,10 +763,6 @@ export default function PegsAndJokers() {
     setAnimatingPeg(null);
     setVisualBusy(false);
     setNowPlaying(null);
-    // The move log is a live commentary, not game state: it isn't saved, and
-    // resuming (or switching games) starts it empty rather than showing the
-    // previous game's moves.
-    setMoveLog([]);
     setBumpFx(null);
     if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
     if (bumpHoldRef.current) { clearTimeout(bumpHoldRef.current); bumpHoldRef.current = null; }
@@ -832,7 +852,6 @@ export default function PegsAndJokers() {
     setAnimatingPeg(null);
     setVisualBusy(false);
     setNowPlaying(null);
-    setMoveLog([]);
     setBumpFx(null);
     setIsSpinning(false);
     setSpinningPlayer(0);
@@ -1380,7 +1399,7 @@ export default function PegsAndJokers() {
     if (animationRef.current) { clearInterval(animationRef.current); animationRef.current = null; }
     if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
     setVisualBusy(true);
-    if (meta) setNowPlaying(meta);
+    if (meta) showNowPlaying({ ...meta, lifeMs: (path.length - 1) * pacing.stepMs + pacing.settleMs });
     animateMove(player, pegIndex, card, amount, fromPegs, () => {
       // Hold the "now playing" banner through the settle beat, so the card that
       // was played is still on screen when the peg stops.
@@ -1390,7 +1409,7 @@ export default function PegsAndJokers() {
         setVisualBusy(false);
       }, pacing.settleMs);
     });
-  }, [animationsEnabled, animateMove, pacing.settleMs]);
+  }, [animationsEnabled, animateMove, pacing.stepMs, pacing.settleMs, showNowPlaying]);
 
   // Fly every peg a move displaced, from the space it was on to wherever the
   // bump sent it. `items` is [{ player, pegIndex, from, to, kind, onImpact }]
@@ -1885,7 +1904,6 @@ export default function PegsAndJokers() {
       segments: [{ owner, pegIndex, card, amount: splitAmount, fromPegs: pegs, toPegs: newPegs }],
     };
 
-    logMove(actor, frame.description, card);
     turnsRef.current += 1; // §4.4: once per seat that actually moves
 
     const w = checkWinner(newPegs, gameMode);
@@ -1938,7 +1956,7 @@ export default function PegsAndJokers() {
     setNotice(null);
 
     return true;
-  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat, endGame, commitTurn, landingDelayFor, playMoveVisual, logMove]);
+  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat, endGame, commitTurn, landingDelayFor, playMoveVisual]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
     const actor = mySeat;
@@ -1993,7 +2011,6 @@ export default function PegsAndJokers() {
       segments: [{ owner, pegIndex, card: splitCard, amount, fromPegs: pegs, toPegs: newPegs }],
     };
 
-    logMove(actor, frame.description, splitCard);
     turnsRef.current += 1; // §4.4: once per seat that actually moves
 
     const w = checkWinner(newPegs, gameMode);
@@ -2043,7 +2060,7 @@ export default function PegsAndJokers() {
     setNotice(null);
 
     return true;
-  }, [splitCard, splitPegIndex, splitOwner, splitUndo, pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat, endGame, commitTurn, landingDelayFor, playMoveVisual, logMove]);
+  }, [splitCard, splitPegIndex, splitOwner, splitUndo, pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat, endGame, commitTurn, landingDelayFor, playMoveVisual]);
 
   // Undo a half-finished split: restore the board (and anything the first half
   // bumped) to the snapshot taken before it, and return the turn to the point
@@ -2129,7 +2146,6 @@ export default function PegsAndJokers() {
     }
 
     if (autoStarted) triggerMoveEffects(pegs, newPegs, player);
-    logMove(player, discardFrame.description, discarded);
 
     setPegs(newPegs);
     setHands(newHands);
@@ -2164,7 +2180,7 @@ export default function PegsAndJokers() {
       setCurrentPlayer(nextPlayer);
       aiProcessingRef.current = false; // Allow the next AI seat to process
     }
-  }, [hands, deck, discardPiles, stuckCounts, pegs, lastMoves, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, commitTurn, logMove]);
+  }, [hands, deck, discardPiles, stuckCounts, pegs, lastMoves, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, commitTurn]);
 
   // AI logic - drives the AI seats this client is responsible for.
   //
@@ -2216,7 +2232,6 @@ export default function PegsAndJokers() {
         // gliding, so the chimes and the bump are already in time with the board.
         triggerMoveEffects(pegs, newPegs, aiPlayer, moverPeg);
         sfx.peg();
-        logMove(aiPlayer, moveDescription, card);
 
         setPegs(newPegs);
 
@@ -2355,10 +2370,20 @@ export default function PegsAndJokers() {
           if (!silent) announce([ANNOUNCEMENTS.joker]);
         }
 
-        // Say who is moving and what they played, large, for as long as the
-        // move takes. Cleared by the settle beat in completeAIMove.
+        // Say who is moving and what they played, over the board, for as long
+        // as the move takes. Cleared by the settle beat in completeAIMove.
+        // The segments are exactly what is about to be animated (both halves of
+        // a split; none at all for a joker), so they also give the overlay the
+        // move's length — see `lifeMs` on showNowPlaying.
         if (!silent) {
-          setNowPlaying({ player: aiPlayer, card: bestMove.card, description: moveDescription });
+          const travelMs = replaySegments.reduce(
+            (ms, s) => ms + landingDelayFor(s.owner, s.pegIndex, s.card, s.amount, s.fromPegs),
+            0,
+          );
+          showNowPlaying({
+            player: aiPlayer, card: bestMove.card, description: moveDescription,
+            lifeMs: travelMs + pacing.settleMs,
+          });
         }
 
         // If animations are disabled, or this is a silent catch-up simulation
@@ -2407,7 +2432,7 @@ export default function PegsAndJokers() {
       if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, logMove, announce]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, announce, showNowPlaying, landingDelayFor]);
 
   // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
@@ -2751,7 +2776,6 @@ export default function PegsAndJokers() {
       segments: [],
     };
 
-    logMove(actor, jokerDescription, card);
     turnsRef.current += 1; // §4.4: once per seat that actually moves
 
     const w = checkWinner(newPegs, gameMode);
@@ -2941,23 +2965,115 @@ export default function PegsAndJokers() {
   const isPegBumping = (player, pegIndex) =>
     bumpFx != null && bumpFx.items.some(it => it.player === player && it.pegIndex === pegIndex);
 
-  // A small face-up card, for saying which card a move was played with. The
-  // board only ever showed the move's *effect* ("Moved 7 spaces"); at a real
-  // table you watch the card go down, and knowing an opponent just spent their
-  // King is half of following the game.
-  const renderCardChip = (card, big = false) => {
-    if (!card) return null;
-    const isRed = card.suit === '♥' || card.suit === '♦';
-    const isJoker = card.rank === 'JOKER';
+  // The card being played, dealt large over the middle of the board and then
+  // dropped onto its owner's discard pile — the one moment at a real table
+  // where you can see what someone actually spent, and knowing an opponent has
+  // just burned their King is half of following the game.
+  //
+  // This is an *overlay*, and that is the whole point of it. It used to be a
+  // bordered "Blue played 7♠" box in the page flow above the board, joined by a
+  // "Recent moves" list: on a phone the box appeared and vanished with every
+  // single move, shoving the board down the screen and yanking it back up a
+  // second later, and the list ate the space the board needed. For anyone not
+  // already fluent in the game, a board that jumps around is worse than no
+  // commentary at all. Drawn over the board, it costs no layout: nothing moves.
+  //
+  // Same viewBox as the board (like the taunt overlay), so it scales with it
+  // and the discard-pile target follows the board rotation for free.
+  const renderPlayedCard = () => {
+    if (!nowPlaying || isReplaying || winner !== null) return null;
+    const { id, player, card, description, lifeMs } = nowPlaying;
+    const colour = PLAYER_COLORS[player];
+    const isRed = card && (card.suit === '♥' || card.suit === '♦');
+    const isJoker = card && card.rank === 'JOKER';
+    const ink = isRed ? '#DC2626' : '#1F2937';
+
+    // Where the card is headed. Read from the same slot table the piles
+    // themselves are drawn from, so the two can't drift apart.
+    const slot = DISCARD_SLOTS[visualSideFor(player, mySeat)];
+    const dx = slot.x + DISCARD_CARD_W / 2 - PLAYED_CARD.cx;
+    const dy = slot.y + DISCARD_CARD_H / 2 - PLAYED_CARD.cy;
+
+    // Land the card by the time the move ends, but never dawdle over the middle
+    // of the board for more than a beat and a half — a peg crossing half the
+    // board at the slow pace takes several seconds, and "briefly" is the point.
+    const flightMs = Math.min(PLAYED_CARD_MAX_MS, Math.max(PLAYED_CARD_MIN_MS, lifeMs || 0));
+
+    const left = PLAYED_CARD.cx - PLAYED_CARD.w / 2;
+    const top = PLAYED_CARD.cy - PLAYED_CARD.h / 2;
+
+    // Who moved and what the move did, on one line *above* the card. It sits in
+    // a solid pill rather than as bare text: the middle of the board is where
+    // the draw and discard piles live, and text laid straight over them reads
+    // as tangled rather than as a caption. Above, because the caption holds for
+    // the whole move while the card leaves after a beat — so the thing that
+    // lingers is the one in clear space, and the thing that covers the piles is
+    // the card that is about to land on them.
+    //
+    // SVG can't size a box to its own text, so the width is estimated from the
+    // string — generous padding, and a smaller face for the long one ("Split:
+    // Space 20 to Space 25, Space 30 to Space 33") so it can't run off the edge.
+    const who = ownsSeat(player) ? 'You' : PLAYER_NAMES[player];
+    const caption = description ? `${who} — ${description}` : who;
+    const capSize = caption.length > 34 ? 10 : 12;
+    const capW = Math.min(346, caption.length * capSize * 0.6 + 26);
+    const capH = capSize + 12;
+    const capTop = top - 10 - capH;
+
     return (
-      <span
-        className={`inline-flex items-center justify-center rounded border border-gray-300 bg-white font-bold align-middle ${
-          big ? 'px-2 py-1 text-lg min-w-[2.5rem]' : 'px-1.5 py-0.5 text-sm min-w-[2rem]'
-        }`}
-        style={{ color: isRed ? '#DC2626' : '#1F2937' }}
+      <svg
+        viewBox="0 0 400 400"
+        className="pointer-events-none absolute inset-0 w-full h-full z-10"
+        aria-hidden="true"
       >
-        {isJoker ? '🃏' : `${card.rank}${card.suit}`}
-      </span>
+        {/* The caption holds for as long as the peg is travelling — only the
+            card leaves for the pile. */}
+        <g key={`caption-${id}`} className="pnj-card-caption">
+          <rect
+            x={200 - capW / 2} y={capTop} width={capW} height={capH}
+            rx={capH / 2} fill="#0B1120" opacity="0.94"
+            stroke={colour} strokeWidth="1.5"
+          />
+          <text
+            x="200" y={capTop + capH / 2 + capSize * 0.35} textAnchor="middle"
+            fontSize={capSize}
+          >
+            <tspan fill={colour} fontWeight="bold">{who}</tspan>
+            {description && <tspan fill="#E5E7EB">{` — ${description}`}</tspan>}
+          </text>
+        </g>
+
+        {/* The card itself: pops in, holds, then shrinks away onto the pile. */}
+        {card && (
+          <g
+            key={`card-${id}`}
+            className="pnj-card-play"
+            style={{
+              '--pnj-card-dx': `${dx}px`,
+              '--pnj-card-dy': `${dy}px`,
+              animationDuration: `${flightMs}ms`,
+              filter: 'drop-shadow(0 3px 5px rgba(0,0,0,0.65))',
+            }}
+          >
+            <rect
+              x={left} y={top} width={PLAYED_CARD.w} height={PLAYED_CARD.h}
+              rx="4" fill="white" stroke={colour} strokeWidth="3"
+            />
+            {isJoker ? (
+              <text x={PLAYED_CARD.cx} y={top + 40} textAnchor="middle" fontSize="26">🃏</text>
+            ) : (
+              <>
+                <text x={PLAYED_CARD.cx} y={top + 30} textAnchor="middle" fill={ink} fontSize="22" fontWeight="bold">
+                  {card.rank}
+                </text>
+                <text x={PLAYED_CARD.cx} y={top + 52} textAnchor="middle" fill={ink} fontSize="18">
+                  {card.suit}
+                </text>
+              </>
+            )}
+          </g>
+        )}
+      </svg>
     );
   };
 
@@ -3707,36 +3823,6 @@ export default function PegsAndJokers() {
           )}
         </div>
 
-        {/* Who is moving, with the card they played, held on screen for the
-            whole move and the settle beat after it. The board's own per-seat
-            labels are 8px SVG text on the rim — fine as a reference, useless as
-            an announcement. */}
-        {nowPlaying && !isReplaying && winner === null && (
-          <div
-            className="mb-4 p-3 rounded flex items-center gap-3 border-2"
-            style={{
-              borderColor: PLAYER_COLORS[nowPlaying.player],
-              backgroundColor: `${PLAYER_COLORS[nowPlaying.player]}22`,
-            }}
-          >
-            <span
-              className="w-5 h-5 rounded-full flex-shrink-0"
-              style={{ backgroundColor: PLAYER_COLORS[nowPlaying.player] }}
-              aria-hidden="true"
-            />
-            <div className="min-w-0 flex-1">
-              <div className="font-bold text-base sm:text-lg">
-                <span style={{ color: PLAYER_COLORS[nowPlaying.player] }}>
-                  {ownsSeat(nowPlaying.player) ? 'You' : PLAYER_NAMES[nowPlaying.player]}
-                </span>
-                {' played '}
-                {renderCardChip(nowPlaying.card, true)}
-              </div>
-              <div className="text-sm text-gray-200 truncate">{nowPlaying.description}</div>
-            </div>
-          </div>
-        )}
-
         {/* Undo a mis-tapped split: only available between the two halves of a
             split, before the second peg commits the move */}
         {splitUndo && splitRemaining !== 0 && isMyTurn && winner === null && !isReplaying && (
@@ -3797,45 +3883,6 @@ export default function PegsAndJokers() {
             >
               Stop
             </button>
-          </div>
-        )}
-
-        {/* Move log — the running commentary. Every seat's last few moves in
-            readable type, newest first, colour-coded and carrying the card that
-            was played. This replaces squinting at the 8px labels on the board
-            rim, which are still there but were never a serious answer to "what
-            did Blue just do?". Three entries on a phone, six from `sm` up, so
-            it never pushes the board off a small screen.
-
-            `aria-live="polite"` makes it a live region: a screen reader
-            announces each new move as it lands. */}
-        {moveLog.length > 0 && !isReplaying && (
-          <div className="mb-4 p-3 rounded bg-gray-800" aria-live="polite">
-            <div className="text-sm font-semibold text-gray-400 mb-1">Recent moves</div>
-            <ul className="space-y-1">
-              {moveLog.map((entry, i) => (
-                <li
-                  key={entry.id}
-                  className={`flex items-center gap-2 text-sm sm:text-base ${
-                    i >= 3 ? 'hidden sm:flex' : 'flex'
-                  } ${i === 0 ? '' : 'opacity-70'}`}
-                >
-                  <span
-                    className="w-3 h-3 rounded-full flex-shrink-0"
-                    style={{ backgroundColor: PLAYER_COLORS[entry.player] }}
-                    aria-hidden="true"
-                  />
-                  <span
-                    className="font-semibold flex-shrink-0"
-                    style={{ color: PLAYER_COLORS[entry.player] }}
-                  >
-                    {ownsSeat(entry.player) ? 'You' : PLAYER_NAMES[entry.player]}
-                  </span>
-                  {renderCardChip(entry.card)}
-                  <span className="text-gray-200 truncate">{entry.description}</span>
-                </li>
-              ))}
-            </ul>
           </div>
         )}
 
@@ -4152,15 +4199,7 @@ export default function PegsAndJokers() {
 
               {/* Per-player discard piles with stuck counters */}
               {[0, 1, 2, 3].map(player => {
-                // Discard piles sit in the corners around the centre draw pile,
-                // indexed by *visual side* so they follow the board rotation.
-                const positions = [
-                  { x: 130, y: 140 },  // top side - top-left of center
-                  { x: 220, y: 140 },  // right side - top-right of center
-                  { x: 220, y: 240 },  // bottom side (yours) - bottom-right of center
-                  { x: 130, y: 240 }   // left side - bottom-left of center
-                ];
-                const pos = positions[visualSideFor(player, mySeat)];
+                const pos = DISCARD_SLOTS[visualSideFor(player, mySeat)];
                 const lastCard = discardPiles[player]?.[discardPiles[player].length - 1];
                 const stuckCount = stuckCounts[player];
 
@@ -4169,7 +4208,7 @@ export default function PegsAndJokers() {
                     {/* Player's last played card (face up) */}
                     {lastCard ? (
                       <g>
-                        <rect x={pos.x} y={pos.y} width="22" height="30" rx="2" fill="white" stroke={PLAYER_COLORS[player]} strokeWidth="1.5" />
+                        <rect x={pos.x} y={pos.y} width={DISCARD_CARD_W} height={DISCARD_CARD_H} rx="2" fill="white" stroke={PLAYER_COLORS[player]} strokeWidth="1.5" />
                         <text
                           x={pos.x + 11}
                           y={pos.y + 14}
@@ -4191,7 +4230,7 @@ export default function PegsAndJokers() {
                         </text>
                       </g>
                     ) : (
-                      <rect x={pos.x} y={pos.y} width="22" height="30" rx="2" fill="none" stroke={PLAYER_COLORS[player]} strokeWidth="1" strokeDasharray="3" opacity="0.5" />
+                      <rect x={pos.x} y={pos.y} width={DISCARD_CARD_W} height={DISCARD_CARD_H} rx="2" fill="none" stroke={PLAYER_COLORS[player]} strokeWidth="1" strokeDasharray="3" opacity="0.5" />
                     )}
 
                     {/* Stuck counter (face down cards) - shows when player has discarded while stuck */}
@@ -4244,6 +4283,27 @@ export default function PegsAndJokers() {
               })()}
 
             </svg>
+
+            {/* The card being played, over the board and then onto the pile.
+                Rendered *before* the banners so a "Double Play!" is drawn on
+                top of it rather than under it — a joker's banner and its card
+                appear at the same instant. */}
+            {renderPlayedCard()}
+
+            {/* The overlay is drawn, so it says nothing out loud. The move log
+                it replaced was the live region that read each move; this keeps
+                that for a screen reader without occupying a pixel of layout.
+                (`sr-only` is absolutely positioned, so it can't push the board
+                around the way the old box did.) */}
+            <div className="sr-only" aria-live="polite">
+              {nowPlaying && !isReplaying && winner === null
+                ? `${ownsSeat(nowPlaying.player) ? 'You' : PLAYER_NAMES[nowPlaying.player]} played ${
+                    nowPlaying.card
+                      ? (nowPlaying.card.rank === 'JOKER' ? 'a Joker' : `${nowPlaying.card.rank} ${nowPlaying.card.suit}`)
+                      : 'a card'
+                  }. ${nowPlaying.description || ''}`
+                : ''}
+            </div>
 
             {/* "Joker!" / "Partner Bump!" / "Double Play!" — the three things
                 that happen with nothing to watch, said large over the middle of
