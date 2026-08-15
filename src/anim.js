@@ -105,6 +105,25 @@ export function stageBumpFlights(count, leadCount = 0) {
 // `specialPlayHoldMs`, which is the whole thing a caller has to wait out.
 export const SPECIAL_PAUSE_MS = 2000;
 
+// The beat *between* the two halves of a split — the one card in the game that
+// moves two different pegs off one play.
+//
+// A split used to run its halves back to back with nothing in between, and the
+// eye read the result as one continuous motion by two pegs that had nothing to
+// do with each other. Stopping between them is most of what makes a split
+// legible: the first peg travels, stops, and is *seen* to have stopped, and
+// only then does the second one set off.
+//
+// Never shorter than one space of travel, so the gap is always longer than the
+// pauses inside each half's counting — a beat the same length as a step reads
+// as one more step rather than as a break. Zero with animations off: there is
+// no travel there to separate.
+export function splitBeatMs(speed) {
+  const { stepMs, settleMs } = settingsFor(speed);
+  if (stepMs <= 0) return 0;
+  return Math.max(settleMs, stepMs);
+}
+
 // The joker's moment. Its card is dealt face-up over the middle of the board
 // and left there, throbbing, before it drops onto the pile and the peg sets off
 // — the one card in the deck that rearranges the board without anything
