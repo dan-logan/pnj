@@ -319,6 +319,48 @@ describe('findFriendlyBumps', () => {
       { player: 2, pegIndex: 0, fromPosition: 35, toPosition: getHomeEntrance(2) },
     ]);
   });
+
+  // The phantom "Partner Bump!" — the banner appearing over an empty space when
+  // a split simply parked a peg on its own home entrance. The entrance is the
+  // last track space before the home corridor and so an entirely ordinary place
+  // to land; in a diff, a peg that walked there is indistinguishable from one
+  // shoved there. The AI commits both halves of a split and diffs them in one
+  // go (PegsAndJokers.jsx), so naming only the first peg made the second half's
+  // perfectly normal arrival read as a friendly bump.
+  it('excludes every peg the card moved, not just the first (split)', () => {
+    const entrance0 = getHomeEntrance(0); // 3
+    const pegs = pegState([[0, 0, onTrack(10)], [0, 1, onTrack(entrance0 - 3)]]);
+
+    // A 7 split: 4 with one peg, then 3 with the other — landing it exactly on
+    // its own entrance, with nothing else on the board to bump.
+    const afterFirst = applyMove(0, 0, card('7'), 4, pegs, P0).newPegs;
+    const afterBoth = applyMove(0, 1, card('7'), 3, afterFirst, P0).newPegs;
+    expect(afterBoth[0][1].position).toBe(entrance0);
+
+    // Naming both movers (what the AI split now passes) — nothing was bumped.
+    expect(findFriendlyBumps(pegs, afterBoth, [
+      { player: 0, pegIndex: 0 },
+      { player: 0, pegIndex: 1 },
+    ])).toEqual([]);
+
+    // Half-at-a-time (what the human split sites pass) agrees.
+    expect(findFriendlyBumps(pegs, afterFirst, { player: 0, pegIndex: 0 })).toEqual([]);
+    expect(findFriendlyBumps(afterFirst, afterBoth, { player: 0, pegIndex: 1 })).toEqual([]);
+  });
+
+  it('still reports a real bump alongside a listed mover', () => {
+    // Second half of a split lands on the partner, shoving it to its entrance.
+    const pegs = pegState([[0, 0, onTrack(10)], [0, 1, onTrack(30)], [2, 0, onTrack(35)]]);
+    const afterFirst = applyMove(0, 0, card('7'), 2, pegs, P0).newPegs;
+    const afterBoth = applyMove(0, 1, card('7'), 5, afterFirst, P0).newPegs;
+
+    expect(findFriendlyBumps(pegs, afterBoth, [
+      { player: 0, pegIndex: 0 },
+      { player: 0, pegIndex: 1 },
+    ])).toEqual([
+      { player: 2, pegIndex: 0, fromPosition: 35, toPosition: getHomeEntrance(2) },
+    ]);
+  });
 });
 
 describe('joker onto a partner sitting on its own home entrance (Topher/Sara bug)', () => {

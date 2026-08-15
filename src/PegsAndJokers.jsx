@@ -1664,8 +1664,12 @@ export default function PegsAndJokers() {
     };
   }, []);
 
-  // `mover` is the acting player (for stats); `moverPeg` is the peg that moved
-  // (so a friendly partner bump doesn't flag the mover itself).
+  // `mover` is the acting player (for stats); `moverPegs` is every peg the card
+  // itself moved (so a friendly partner bump doesn't flag a mover as its own
+  // victim). It must name *all* of them — an unnamed peg that lands on its own
+  // home entrance is indistinguishable, in a diff, from one that was shoved
+  // there, and gets announced as a "Partner Bump!" onto an empty space. A split
+  // moves two, and the AI commits both halves before calling this.
   //
   // `landingDelayMs` exists because the two kinds of caller sit on opposite
   // sides of the animation. An AI move calls this *after* its peg has finished
@@ -1677,10 +1681,10 @@ export default function PegsAndJokers() {
   // it — badly wrong at the slow pace this whole change exists to support. So
   // it defers *every* consequence of the move (arrival chimes, the bump sound
   // and the bumped peg's fly-back) to the moment the mover actually lands.
-  const triggerMoveEffects = useCallback((oldPegs, updatedPegs, mover, moverPeg = null, landingDelayMs = 0) => {
+  const triggerMoveEffects = useCallback((oldPegs, updatedPegs, mover, moverPegs = null, landingDelayMs = 0) => {
     const bumps = findBumps(oldPegs, updatedPegs);
     const friendly = gameMode === GAME_MODES.PARTNERS
-      ? findFriendlyBumps(oldPegs, updatedPegs, moverPeg)
+      ? findFriendlyBumps(oldPegs, updatedPegs, moverPegs)
       : [];
 
     // The events every player at a real table hears, whoever made the move:
@@ -2222,7 +2226,7 @@ export default function PegsAndJokers() {
       const aiHand = hands[aiPlayer];
 
       // Helper function to complete AI move
-      const completeAIMove = (newPegs, card, moveDescription, moverPeg = null) => {
+      const completeAIMove = (newPegs, card, moveDescription, moverPegs = null) => {
         // Record last move description for AI
         const updatedLastMoves = [...lastMoves];
         updatedLastMoves[aiPlayer] = moveDescription;
@@ -2230,7 +2234,7 @@ export default function PegsAndJokers() {
 
         // No landing delay: an AI move calls this *after* its peg has finished
         // gliding, so the chimes and the bump are already in time with the board.
-        triggerMoveEffects(pegs, newPegs, aiPlayer, moverPeg);
+        triggerMoveEffects(pegs, newPegs, aiPlayer, moverPegs);
         sfx.peg();
 
         setPegs(newPegs);
@@ -2314,7 +2318,18 @@ export default function PegsAndJokers() {
         // The second half of a split may play on the partner (a handoff split
         // that brought the AI's last peg home); default to the same owner.
         const secondOwner = bestMove.secondOwner ?? owner;
-        const moverPeg = { player: owner, pegIndex: bestMove.pegIndex };
+        // Every peg this card moves of its own accord. An AI split commits both
+        // halves in one go and so hands `triggerMoveEffects` a diff spanning
+        // both — so both pegs have to be named here, or the second half reads as
+        // an unexplained peg movement. When it happens to land on its owner's
+        // home entrance (an ordinary, common destination — it is the space right
+        // before the home corridor) that unexplained movement was reported as a
+        // friendly bump, raising "Partner Bump!" and flying the peg in green
+        // over a space no partner was ever on.
+        const moverPegs = [{ player: owner, pegIndex: bestMove.pegIndex }];
+        if (bestMove.type === 'split7' || bestMove.type === 'split9') {
+          moverPegs.push({ player: secondOwner, pegIndex: bestMove.secondPeg });
+        }
         // Generate move description based on move type
         const getMoveDescription = () => {
           const oldPeg = pegs[owner][bestMove.pegIndex];
@@ -2390,7 +2405,7 @@ export default function PegsAndJokers() {
         // (Package 5 — remote, running ahead of the auto-replay), complete
         // immediately with no per-peg animation.
         if (!animationsEnabled || silent) {
-          if (completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg)) return;
+          if (completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPegs)) return;
           return;
         }
 
@@ -2398,7 +2413,7 @@ export default function PegsAndJokers() {
         if (bestMove.type === 'simple' || bestMove.type === 'start') {
           // Single move animation
           animateMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, () => {
-            completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg);
+            completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPegs);
           });
         } else if (bestMove.type === 'split7' || bestMove.type === 'split9') {
           // Two-part animation for a split. Effects play once, at the end: the
@@ -2409,12 +2424,12 @@ export default function PegsAndJokers() {
             // After first animation, animate second peg (may be the partner's)
             const afterFirstPegs = applyMove(owner, bestMove.pegIndex, bestMove.card, bestMove.amount, pegs, { actor: aiPlayer, mode: gameMode }).newPegs;
             animateMove(secondOwner, bestMove.secondPeg, bestMove.card, bestMove.remaining, afterFirstPegs, () => {
-              completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg);
+              completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPegs);
             });
           });
         } else if (bestMove.type === 'joker') {
           // Joker - just complete (animation path is empty for jokers)
-          completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPeg);
+          completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, moverPegs);
         }
         return;
       }

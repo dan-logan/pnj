@@ -706,15 +706,27 @@ export function findBumps(oldPegs, newPegs) {
   return bumps;
 }
 
-// Diff two peg states for friendly partner bumps: a peg (other than the mover)
-// that was shoved forward on the track to its own home-entrance space. Returns
-// [{ player, pegIndex, fromPosition, toPosition }]. Used to animate the friendly
-// bump distinctly from a knock-back-to-start.
-export function findFriendlyBumps(oldPegs, newPegs, mover = null) {
+// Diff two peg states for friendly partner bumps: a peg (other than the ones the
+// card itself moved) that was shoved forward on the track to its own
+// home-entrance space. Returns [{ player, pegIndex, fromPosition, toPosition }].
+// Used to animate the friendly bump distinctly from a knock-back-to-start.
+//
+// `movers` is every peg the card deliberately moved, and must list *all* of
+// them: this is a diff, so a peg that moved for any other reason than being
+// bumped is indistinguishable from one that was. The home entrance is a space
+// pegs legitimately land on all the time — it is the last space before the home
+// corridor — so leaving a mover out of the list turns an ordinary move into a
+// phantom "Partner Bump!" on an empty space. That is exactly what a split used
+// to do: two pegs move, but only the first was named (see the AI split in
+// PegsAndJokers.jsx, which diffs both halves at once). Accepts a single
+// `{ player, pegIndex }` or an array of them.
+export function findFriendlyBumps(oldPegs, newPegs, movers = null) {
+  const moved = movers == null ? [] : (Array.isArray(movers) ? movers : [movers]);
+  const isMover = (p, i) => moved.some(m => m && m.player === p && m.pegIndex === i);
   const bumps = [];
   for (let p = 0; p < NUM_PLAYERS; p++) {
     for (let i = 0; i < PEGS_PER_PLAYER; i++) {
-      if (mover && mover.player === p && mover.pegIndex === i) continue;
+      if (isMover(p, i)) continue;
       const before = oldPegs[p][i];
       const after = newPegs[p][i];
       if (before.location === 'track' && after.location === 'track' &&
