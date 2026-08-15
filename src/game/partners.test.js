@@ -11,7 +11,6 @@ import {
   checkWinner,
   getValidDestinations,
   getMovablePegs,
-  findFriendlyBumps,
   splitCompleter
 } from './engine.js';
 import { getPossibleMoves, findBestAIMove } from './ai.js';
@@ -310,55 +309,103 @@ describe('partner-aware AI', () => {
   });
 });
 
-describe('findFriendlyBumps', () => {
-  it('reports a partner shoved forward to its entrance, excluding the mover', () => {
+// The engine reports what it displaced; nothing about a friendly bump is
+// recovered by diffing the board afterwards. Two cases are the reason, and both
+// used to be wrong when this was a diff (`findFriendlyBumps`, now gone):
+//
+//   * an ordinary move that parks a peg on its own home entrance — the last
+//     track space before the home corridor, so a completely routine landing —
+//     was indistinguishable from a peg shoved there, and raised a phantom
+//     "Partner Bump!" over an empty space whenever the diff wasn't told that
+//     peg had moved (a split moves two, and only one was ever named);
+//   * the entrance swap, where the peg displaced is the *mover* itself, which
+//     any diff necessarily excludes as "the peg that meant to move" — so the
+//     fanciest partner bump in the game announced nothing at all.
+describe('applyMove displacements', () => {
+  it('reports a partner shoved forward to its entrance, and who shoved it', () => {
     const pegs = pegState([[0, 0, onTrack(30)], [2, 0, onTrack(35)]]);
-    const { newPegs } = applyMove(0, 0, card('5'), null, pegs, P0);
-    const bumps = findFriendlyBumps(pegs, newPegs, { player: 0, pegIndex: 0 });
-    expect(bumps).toEqual([
-      { player: 2, pegIndex: 0, fromPosition: 35, toPosition: getHomeEntrance(2) },
+    const { displacements } = applyMove(0, 0, card('5'), null, pegs, P0);
+    expect(displacements).toEqual([
+      {
+        player: 2, pegIndex: 0, fromPosition: 35, toPosition: getHomeEntrance(2),
+        friendly: true, byPlayer: 0, byPegIndex: 0,
+      },
     ]);
   });
 
-  // The phantom "Partner Bump!" — the banner appearing over an empty space when
-  // a split simply parked a peg on its own home entrance. The entrance is the
-  // last track space before the home corridor and so an entirely ordinary place
-  // to land; in a diff, a peg that walked there is indistinguishable from one
-  // shoved there. The AI commits both halves of a split and diffs them in one
-  // go (PegsAndJokers.jsx), so naming only the first peg made the second half's
-  // perfectly normal arrival read as a friendly bump.
-  it('excludes every peg the card moved, not just the first (split)', () => {
+  it('reports nothing when a split simply parks a peg on its own entrance', () => {
     const entrance0 = getHomeEntrance(0); // 3
     const pegs = pegState([[0, 0, onTrack(10)], [0, 1, onTrack(entrance0 - 3)]]);
 
     // A 7 split: 4 with one peg, then 3 with the other — landing it exactly on
     // its own entrance, with nothing else on the board to bump.
-    const afterFirst = applyMove(0, 0, card('7'), 4, pegs, P0).newPegs;
-    const afterBoth = applyMove(0, 1, card('7'), 3, afterFirst, P0).newPegs;
-    expect(afterBoth[0][1].position).toBe(entrance0);
+    const first = applyMove(0, 0, card('7'), 4, pegs, P0);
+    const second = applyMove(0, 1, card('7'), 3, first.newPegs, P0);
 
-    // Naming both movers (what the AI split now passes) — nothing was bumped.
-    expect(findFriendlyBumps(pegs, afterBoth, [
-      { player: 0, pegIndex: 0 },
-      { player: 0, pegIndex: 1 },
-    ])).toEqual([]);
-
-    // Half-at-a-time (what the human split sites pass) agrees.
-    expect(findFriendlyBumps(pegs, afterFirst, { player: 0, pegIndex: 0 })).toEqual([]);
-    expect(findFriendlyBumps(afterFirst, afterBoth, { player: 0, pegIndex: 1 })).toEqual([]);
+    expect(second.newPegs[0][1].position).toBe(entrance0);
+    expect(first.displacements).toEqual([]);
+    expect(second.displacements).toEqual([]);
   });
 
-  it('still reports a real bump alongside a listed mover', () => {
-    // Second half of a split lands on the partner, shoving it to its entrance.
-    const pegs = pegState([[0, 0, onTrack(10)], [0, 1, onTrack(30)], [2, 0, onTrack(35)]]);
-    const afterFirst = applyMove(0, 0, card('7'), 2, pegs, P0).newPegs;
-    const afterBoth = applyMove(0, 1, card('7'), 5, afterFirst, P0).newPegs;
+  it('reports the swap: the mover is the peg displaced, by the partner it landed on', () => {
+    const entrance0 = getHomeEntrance(0); // 3
+    const entrance2 = getHomeEntrance(2); // 39
+    // Yellow at 34 plays a 5 onto Pink, which is parked on its own entrance.
+    const pegs = pegState([[0, 0, onTrack(34)], [2, 0, onTrack(entrance2)]]);
+    const { newPegs, displacements } = applyMove(0, 0, card('5'), null, pegs, P0);
 
-    expect(findFriendlyBumps(pegs, afterBoth, [
-      { player: 0, pegIndex: 0 },
-      { player: 0, pegIndex: 1 },
-    ])).toEqual([
-      { player: 2, pegIndex: 0, fromPosition: 35, toPosition: getHomeEntrance(2) },
+    // Pink keeps its entrance; Yellow is shoved on to its own.
+    expect(newPegs[2][0].position).toBe(entrance2);
+    expect(newPegs[0][0].position).toBe(entrance0);
+    expect(displacements).toEqual([
+      {
+        player: 0, pegIndex: 0, fromPosition: entrance2, toPosition: entrance0,
+        friendly: true, byPlayer: 2, byPegIndex: 0,
+      },
+    ]);
+  });
+
+  it('reports a cascade in causal order: friendly shove first, then who it knocked off', () => {
+    const entrance2 = getHomeEntrance(2); // 39
+    // Blue (opponent) is squatting on Pink's entrance; Yellow bumps Pink onto it.
+    const pegs = pegState([
+      [0, 0, onTrack(30)], [2, 0, onTrack(35)], [1, 0, onTrack(entrance2)],
+    ]);
+    const { displacements } = applyMove(0, 0, card('5'), null, pegs, P0);
+
+    expect(displacements).toEqual([
+      {
+        player: 2, pegIndex: 0, fromPosition: 35, toPosition: entrance2,
+        friendly: true, byPlayer: 0, byPegIndex: 0,
+      },
+      {
+        player: 1, pegIndex: 0, fromPosition: entrance2, toPosition: null,
+        friendly: false, byPlayer: 2, byPegIndex: 0,
+      },
+    ]);
+  });
+
+  it('reports an ordinary opponent bump as a send-to-start', () => {
+    const pegs = pegState([[0, 0, onTrack(30)], [1, 0, onTrack(35)]]);
+    const { displacements } = applyMove(0, 0, card('5'), null, pegs, P0);
+    expect(displacements).toEqual([
+      {
+        player: 1, pegIndex: 0, fromPosition: 35, toPosition: null,
+        friendly: false, byPlayer: 0, byPegIndex: 0,
+      },
+    ]);
+  });
+
+  it('reports the joker swap the same way as the track swap', () => {
+    const entrance0 = getHomeEntrance(0);
+    const entrance2 = getHomeEntrance(2);
+    const pegs = pegState([[0, 0, onTrack(50)], [2, 0, onTrack(entrance2)]]);
+    const { displacements } = applyJoker(0, 0, 2, 0, pegs, P0);
+    expect(displacements).toEqual([
+      {
+        player: 0, pegIndex: 0, fromPosition: entrance2, toPosition: entrance0,
+        friendly: true, byPlayer: 2, byPegIndex: 0,
+      },
     ]);
   });
 });

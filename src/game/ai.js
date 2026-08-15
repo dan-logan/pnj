@@ -58,6 +58,10 @@ function getVulnerabilityPenalty(position, pegState, owner, mode) {
 //     (secondOwner is the owner of the completing peg — the partner when a
 //      handoff split finishes the AI's last peg home; otherwise === owner)
 //   { type: 'joker', owner, card, pegIndex, targetPlayer, targetPeg, newPegs, improvement, bonus }
+// Every shape also carries `displacements`: the pegs the move shoves off their
+// spaces, straight from the engine (both halves' worth for a split). The UI
+// needs it to sound and announce bumps, and it cannot be recovered from
+// `newPegs` alone — see resolveDisplacement in engine.js.
 export function getPossibleMoves(actor, hand, pegs, options = {}) {
   const { mode = GAME_MODES.CLASSIC } = options;
   const owner = getControlledOwner(actor, mode, pegs);
@@ -78,7 +82,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
       // For non-split cards
       if (!cardInfo.canSplit && !cardInfo.mustSplit && !cardInfo.isJoker) {
         if (isValidMove(owner, pegIndex, card, pegs, null, moveOpts)) {
-          const { newPegs } = applyMove(owner, pegIndex, card, null, pegs, moveOpts);
+          const { newPegs, displacements } = applyMove(owner, pegIndex, card, null, pegs, moveOpts);
           const improvement = distBefore - getReferenceDistance(newPegs, actor, mode);
 
           // Calculate vulnerability penalty for landing position
@@ -94,6 +98,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
             pegIndex,
             amount: null,
             newPegs,
+            displacements,
             improvement,
             // Bonus for moving pegs already in home deeper, minus vulnerability
             bonus: (peg.location === 'home' ? 10 : 0) - vulnPenalty
@@ -105,7 +110,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
       if (cardInfo.canSplit) {
         // Try full 7 first
         if (isValidMove(owner, pegIndex, card, pegs, 7, moveOpts)) {
-          const { newPegs } = applyMove(owner, pegIndex, card, 7, pegs, moveOpts);
+          const { newPegs, displacements } = applyMove(owner, pegIndex, card, 7, pegs, moveOpts);
           const improvement = distBefore - getReferenceDistance(newPegs, actor, mode);
           const movedPeg = newPegs[owner][pegIndex];
           const vulnPenalty = movedPeg.location === 'track'
@@ -118,6 +123,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
             pegIndex,
             amount: 7,
             newPegs,
+            displacements,
             improvement,
             bonus: (peg.location === 'home' ? 10 : 0) - vulnPenalty
           });
@@ -126,7 +132,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
         // Try splits
         for (let split = 1; split <= 6; split++) {
           if (isValidMove(owner, pegIndex, card, pegs, split, moveOpts)) {
-            const { newPegs: afterFirst } = applyMove(owner, pegIndex, card, split, pegs, moveOpts);
+            const { newPegs: afterFirst, displacements: firstDisp } = applyMove(owner, pegIndex, card, split, pegs, moveOpts);
             const remaining = 7 - split;
             // Normally the same owner finishes the split, but a first half that
             // brings the AI's last peg home hands the remainder to its partner —
@@ -137,7 +143,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
             for (let secondPeg = 0; secondPeg < PEGS_PER_PLAYER; secondPeg++) {
               if (completer === owner && secondPeg === pegIndex) continue;
               if (isValidMove(completer, secondPeg, card, afterFirst, remaining, moveOpts)) {
-                const { newPegs: finalPegs } = applyMove(completer, secondPeg, card, remaining, afterFirst, moveOpts);
+                const { newPegs: finalPegs, displacements: secondDisp } = applyMove(completer, secondPeg, card, remaining, afterFirst, moveOpts);
                 const improvement = distBefore - getReferenceDistance(finalPegs, actor, mode);
 
                 // Calculate vulnerability for both moved pegs
@@ -156,6 +162,8 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
                   secondOwner: completer,
                   remaining,
                   newPegs: finalPegs,
+                  // Both halves', in the order they happened.
+                  displacements: [...firstDisp, ...secondDisp],
                   improvement,
                   bonus: (pegs[owner][pegIndex].location === 'home' ? 10 : 0) +
                          (afterFirst[completer][secondPeg].location === 'home' ? 10 : 0) -
@@ -174,7 +182,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
 
           // Try this peg forward
           if (isValidMove(owner, pegIndex, card, pegs, forward, moveOpts)) {
-            const { newPegs: afterFirst } = applyMove(owner, pegIndex, card, forward, pegs, moveOpts);
+            const { newPegs: afterFirst, displacements: firstDisp } = applyMove(owner, pegIndex, card, forward, pegs, moveOpts);
             // A forward half that brings the AI's last peg home hands the
             // backward half to its partner (same handoff boundary as the 7).
             const completer = splitCompleter(owner, afterFirst, moveOpts);
@@ -183,7 +191,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
             for (let secondPeg = 0; secondPeg < PEGS_PER_PLAYER; secondPeg++) {
               if (completer === owner && secondPeg === pegIndex) continue;
               if (isValidMove(completer, secondPeg, card, afterFirst, backward, moveOpts)) {
-                const { newPegs: finalPegs } = applyMove(completer, secondPeg, card, backward, afterFirst, moveOpts);
+                const { newPegs: finalPegs, displacements: secondDisp } = applyMove(completer, secondPeg, card, backward, afterFirst, moveOpts);
                 const improvement = distBefore - getReferenceDistance(finalPegs, actor, mode);
 
                 // Calculate vulnerability for both moved pegs
@@ -202,6 +210,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
                   secondOwner: completer,
                   remaining: backward,
                   newPegs: finalPegs,
+                  displacements: [...firstDisp, ...secondDisp],
                   improvement,
                   bonus: (pegs[owner][pegIndex].location === 'home' ? 10 : 0) - vuln1 - vuln2
                 });
@@ -214,7 +223,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
       // For starting cards (A, J, Q, K) - try to get pegs out of start
       if (cardInfo.canStart && peg.location === 'start') {
         if (isValidMove(owner, pegIndex, card, pegs, null, moveOpts)) {
-          const { newPegs } = applyMove(owner, pegIndex, card, null, pegs, moveOpts);
+          const { newPegs, displacements } = applyMove(owner, pegIndex, card, null, pegs, moveOpts);
           const improvement = distBefore - getReferenceDistance(newPegs, actor, mode);
           const startPos = getStartPosition(owner);
           const vulnPenalty = getVulnerabilityPenalty(startPos, newPegs, owner, mode);
@@ -225,6 +234,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
             pegIndex,
             amount: null,
             newPegs,
+            displacements,
             improvement,
             bonus: -5 - vulnPenalty // Slight penalty vs advancing existing pegs, plus vulnerability
           });
@@ -240,7 +250,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
             const opponentPeg = pegs[targetPlayer][targetPeg];
             if (opponentPeg.location !== 'track') continue;
 
-            const { newPegs, bumped } = applyJoker(owner, pegIndex, targetPlayer, targetPeg, pegs, moveOpts);
+            const { newPegs, bumped, displacements } = applyJoker(owner, pegIndex, targetPlayer, targetPeg, pegs, moveOpts);
             if (!bumped) continue; // illegal (e.g. friendly bump with a blocked entrance)
 
             const improvement = distBefore - getReferenceDistance(newPegs, actor, mode);
@@ -275,6 +285,7 @@ export function getPossibleMoves(actor, hand, pegs, options = {}) {
               targetPlayer,
               targetPeg,
               newPegs,
+              displacements,
               improvement,
               bonus: jokerBonus
             });
