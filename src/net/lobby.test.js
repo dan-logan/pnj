@@ -7,6 +7,7 @@ import {
   sortLobbyRows,
   countWaitingOnMe,
   openActionFor,
+  bootTargetFor,
   relativeTime,
 } from './lobby.js';
 import { STATUS, HOST_SEAT, GUEST_SEAT } from './protocol.js';
@@ -177,5 +178,68 @@ describe('openActionFor', () => {
 
   it('waits rather than dealing when metadata is missing entirely', () => {
     expect(openActionFor({ meta: null, hasState: false, seat: HOST_SEAT })).toBe('await_deal');
+  });
+});
+
+describe('bootTargetFor', () => {
+  const games = [
+    { id: 'g1', seat: HOST_SEAT, archived: false },
+    { id: 'g2', seat: GUEST_SEAT, archived: false },
+  ];
+
+  it('reopens the game that was on screen', () => {
+    expect(bootTargetFor({ multiplayer: true, activeId: 'g2', games, hasSave: true }))
+      .toEqual({ kind: 'remote', id: 'g2', seat: GUEST_SEAT });
+  });
+
+  // The regression this exists for: a player with ONE remote game going was
+  // thrown into it by every reload of their solo board.
+  it('stays on solo when no remote game was open, however many exist', () => {
+    expect(bootTargetFor({ multiplayer: true, activeId: null, games: [games[0]], hasSave: true }))
+      .toEqual({ kind: 'resume' });
+    expect(bootTargetFor({ multiplayer: true, activeId: null, games, hasSave: true }))
+      .toEqual({ kind: 'resume' });
+  });
+
+  // The other half of the same report: the reload right after a solo game ends,
+  // when the save has (deliberately) been cleared and the solo side looks like
+  // nothing at all. That is still solo, not "whatever remote game you have".
+  it('starts a fresh solo game rather than a remote one when the save is gone', () => {
+    expect(bootTargetFor({ multiplayer: true, activeId: null, games, hasSave: false }))
+      .toEqual({ kind: 'solo' });
+  });
+
+  it('falls back to solo when activeId names a game this device no longer lists', () => {
+    expect(bootTargetFor({ multiplayer: true, activeId: 'gone', games, hasSave: true }))
+      .toEqual({ kind: 'resume' });
+    expect(bootTargetFor({ multiplayer: true, activeId: 'gone', games, hasSave: false }))
+      .toEqual({ kind: 'solo' });
+  });
+
+  it('falls back to solo when the active game has been archived', () => {
+    const archived = [{ id: 'g1', seat: HOST_SEAT, archived: true }];
+    expect(bootTargetFor({ multiplayer: true, activeId: 'g1', games: archived, hasSave: false }))
+      .toEqual({ kind: 'solo' });
+  });
+
+  it('lets an invite link outrank everything', () => {
+    expect(bootTargetFor({ multiplayer: true, joinId: 'g9', activeId: 'g1', games, hasSave: true }))
+      .toEqual({ kind: 'join', id: 'g9' });
+  });
+
+  it('ignores remote state entirely without multiplayer configured', () => {
+    expect(bootTargetFor({ multiplayer: false, joinId: 'g9', activeId: 'g1', games, hasSave: true }))
+      .toEqual({ kind: 'resume' });
+    expect(bootTargetFor({ multiplayer: false, activeId: 'g1', games, hasSave: false }))
+      .toEqual({ kind: 'solo' });
+  });
+
+  it('defaults a game with no recorded seat to the host seat', () => {
+    expect(bootTargetFor({ multiplayer: true, activeId: 'g3', games: [{ id: 'g3' }] }))
+      .toEqual({ kind: 'remote', id: 'g3', seat: HOST_SEAT });
+  });
+
+  it('answers solo for an empty device', () => {
+    expect(bootTargetFor()).toEqual({ kind: 'solo' });
   });
 });

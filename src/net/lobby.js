@@ -127,3 +127,38 @@ export function openActionFor({ meta, hasState, seat }) {
   }
   return 'await_deal';
 }
+
+// What a fresh load should open. A reload is not a decision — it must land you
+// back on the game you were already looking at, and switching games must stay
+// something you do deliberately, from the lobby.
+//
+//   { kind: 'join',   id }        — an invite link (?g=) outranks everything.
+//   { kind: 'remote', id, seat }  — the game this device last had on screen.
+//   { kind: 'resume' }            — no remote game was open; offer the solo save.
+//   { kind: 'solo' }              — nothing to restore; a fresh solo game.
+//
+// `activeId` (localSession) is the whole answer to "which game was on screen":
+// it is written when a remote game is opened and cleared to null the moment you
+// switch to solo or start a new solo game. The routing used to ignore it and
+// instead auto-open the device's sole remote game, so a player with one remote
+// game going was thrown into it by every reload of their solo board — including
+// the reload right after a solo game ended, when the (deliberately cleared) save
+// made the solo side look like nothing at all.
+//
+// Anything less than a clear answer means solo: an activeId pointing at a game
+// this device no longer lists, or has archived, is not evidence of what was on
+// screen. Never guess a remote game from the mere existence of one.
+export function bootTargetFor({
+  joinId = null,
+  multiplayer = false,
+  activeId = null,
+  games = [],
+  hasSave = false,
+} = {}) {
+  if (multiplayer && joinId) return { kind: 'join', id: joinId };
+  if (multiplayer && activeId) {
+    const game = games.find((g) => g.id === activeId && !g.archived);
+    if (game) return { kind: 'remote', id: game.id, seat: game.seat ?? HOST_SEAT };
+  }
+  return hasSave ? { kind: 'resume' } : { kind: 'solo' };
+}
