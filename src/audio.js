@@ -123,6 +123,35 @@ export const sfx = {
     tone({ freq: 190, start: 0.1, endFreq: 60, duration: 0.35, type: 'square', volume: 0.1 });
     vibrate([120, 60, 90]);
   },
+  // The knocked-back peg complaining about it, played when it lands back in
+  // its start area — the audible half of the "@$#*!" bubble. Deliberately not
+  // a musical sound: four short, low, detuned grumbles at irregular pitches,
+  // pitched from the *victim's* seat tone so you can hear whose peg is sulking.
+  grumble(player = 0) {
+    const base = toneFor(player) * 0.3;
+    const mutters = [1, 0.86, 1.08, 0.78];
+    mutters.forEach((mult, i) => {
+      tone({
+        freq: base * mult,
+        endFreq: base * mult * 0.82,
+        start: i * 0.11,
+        duration: 0.09,
+        type: 'sawtooth',
+        volume: 0.07,
+      });
+    });
+    vibrate([30, 40, 30, 40, 30]);
+  },
+  // Two pegs displaced by one card: a short rising fanfare, because a cascade
+  // is the flashiest thing that happens on this board and it used to go by
+  // completely unremarked.
+  fanfare() {
+    [523.25, 659.25, 784.0].forEach((freq, i) =>
+      tone({ freq, start: i * 0.07, duration: 0.12, type: 'triangle', volume: 0.13 })
+    );
+    tone({ freq: 1046.5, start: 0.21, duration: 0.26, type: 'triangle', volume: 0.15 });
+    vibrate([50, 40, 90]);
+  },
   // A partner bump in partner mode: it sends your teammate to their home
   // entrance, so it should sound like the good thing it is.
   friendlyBump(player = 0) {

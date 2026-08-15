@@ -19,13 +19,18 @@ export const SPEED_ORDER = ['slow', 'normal', 'fast', 'off'];
 
 // stepMs   — one space of peg travel (the "click" of counting it out)
 // thinkMs  — how long an AI seat pauses before it plays, so you can see whose
-//            turn it is before the board changes
+//            turn it is before the board changes. At `slow` this is a full two
+//            seconds: the "Blue is thinking…" banner and the seat's colour have
+//            to be *read*, not glimpsed, and a player who has just looked up
+//            from their hand needs the pause to find the board again before
+//            anything on it moves. It reads as an opponent deliberating rather
+//            than as lag precisely because it is that long.
 // settleMs — the beat *after* a move lands, so three AI turns in a row read as
 //            three separate events rather than one blur
 export const SPEED_SETTINGS = {
-  slow:   { stepMs: 320, thinkMs: 900, settleMs: 450, label: 'Slow',   icon: '🐢' },
-  normal: { stepMs: 150, thinkMs: 800, settleMs: 200, label: 'Normal', icon: '▶️' },
-  fast:   { stepMs: 70,  thinkMs: 400, settleMs: 0,   label: 'Fast',   icon: '⏩' },
+  slow:   { stepMs: 320, thinkMs: 2000, settleMs: 450, label: 'Slow',   icon: '🐢' },
+  normal: { stepMs: 150, thinkMs: 1200, settleMs: 200, label: 'Normal', icon: '▶️' },
+  fast:   { stepMs: 70,  thinkMs: 400,  settleMs: 0,   label: 'Fast',   icon: '⏩' },
   // `off` still needs a thinking delay: with no animation at all, the only
   // thing separating one AI turn from the next is that pause.
   off:    { stepMs: 0,   thinkMs: 300, settleMs: 0,   label: 'Off',    icon: '⏸️' },
@@ -33,6 +38,36 @@ export const SPEED_SETTINGS = {
 
 export function isSpeed(value) {
   return Object.prototype.hasOwnProperty.call(SPEED_SETTINGS, value);
+}
+
+// The bumped-peg fly-back, which is its own little animation: a peg knocked
+// off the track arcs to wherever the bump sent it over `BUMP_FLY_STEPS` ticks.
+// It is not tied to the speed setting — it is impact feedback, not travel you
+// are meant to count, and it only runs at all when animations are on.
+//
+// One card can displace more than one peg (a partner bump onto an entrance an
+// opponent is sitting on sends the partner forward *and* the opponent home),
+// and all of them fly from the same interval. They are staggered rather than
+// simultaneous: a cascade is causal — this peg moved *because* that one did —
+// and two pegs setting off together in different directions loses that, which
+// is precisely the "which one was I supposed to be watching?" problem the
+// Double Play! banner exists for. The stagger is deliberately shorter than a
+// flight, so the chain overlaps and reads as one event rather than a queue.
+export const BUMP_FLY_STEPS = 14;
+export const BUMP_FLY_TICK_MS = 40;
+export const BUMP_FLY_STAGGER = 6;
+
+// Tick offsets for `count` pegs flying off one move, and the tick at which the
+// last of them lands (when the whole effect can be torn down). With one peg
+// this is exactly the single-peg animation it replaced: starts at 0, ends at
+// BUMP_FLY_STEPS.
+export function stageBumpFlights(count) {
+  const startTicks = [];
+  for (let i = 0; i < count; i++) startTicks.push(i * BUMP_FLY_STAGGER);
+  return {
+    startTicks,
+    totalTicks: count > 0 ? startTicks[count - 1] + BUMP_FLY_STEPS : 0,
+  };
 }
 
 export function settingsFor(speed) {
