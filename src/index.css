@@ -79,3 +79,45 @@
   transform-box: view-box;
   transform-origin: 200px 140px;
 }
+
+/* The joker gets its own, longer entrance. Every other card is information —
+   this one is an event: it rearranges the board with nothing travelling, so
+   unless the card itself makes a scene, the only thing a player sees is that
+   the pegs are suddenly somewhere else.
+
+   So it lands crooked, throbs three times over the middle of the board (with
+   the cackle from audio.js over the top of it), and only then drops onto the
+   pile — which is the cue for the peg to set off. The drop starts at 75%, and
+   that fraction is JOKER_CARD_HOLD_MS / JOKER_CARD_MS in anim.js: the peg
+   flight is scheduled off those, so the two have to be changed together. */
+@keyframes pnj-card-joker {
+  0%   { opacity: 0; transform: translate(0, 0) scale(0.5) rotate(-14deg); }
+  7%   { opacity: 1; transform: translate(0, 0) scale(1.22) rotate(6deg); }
+  13%  { opacity: 1; transform: translate(0, 0) scale(1.02) rotate(0deg); }
+  25%  { opacity: 1; transform: translate(0, 0) scale(1.16) rotate(-4deg); }
+  37%  { opacity: 1; transform: translate(0, 0) scale(1.02) rotate(0deg); }
+  49%  { opacity: 1; transform: translate(0, 0) scale(1.16) rotate(4deg); }
+  61%  { opacity: 1; transform: translate(0, 0) scale(1.02) rotate(0deg); }
+  70%  { opacity: 1; transform: translate(0, 0) scale(1.16) rotate(-4deg); }
+  75%  { opacity: 1; transform: translate(0, 0) scale(1.02) rotate(0deg); }
+  100% { opacity: 0; transform: translate(var(--pnj-card-dx, 0), var(--pnj-card-dy, 0)) scale(0.34) rotate(0deg); }
+}
+
+.pnj-card-joker {
+  animation: pnj-card-joker 2400ms cubic-bezier(0.2, 0.7, 0.3, 1) forwards;
+  transform-box: view-box;
+  transform-origin: 200px 140px;
+}
+
+/* The peg a joker is about to move (and then moves): pulsing hard from the
+   moment the card appears, so that by the time it leaves the ground you already
+   know which peg you are watching. Faster than `peg-glow`, which marks the
+   pegs you *could* play — this one is already happening. */
+@keyframes pnj-joker-peg {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
+.joker-peg {
+  animation: pnj-joker-peg 520ms ease-in-out infinite;
+}

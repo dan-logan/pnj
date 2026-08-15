@@ -142,6 +142,44 @@ export const sfx = {
     });
     vibrate([30, 40, 30, 40, 30]);
   },
+  // The peg that did the bumping, snickering about it — the audible half of the
+  // "Hee hee!" bubble, and the counterpart to `grumble`. Pitched from the
+  // *bumper's* seat tone (the grumble is pitched from the victim's), so a bump
+  // is now two voices: whose peg went flying, and whose peg sent it.
+  // Two quick rising blips: it should read as a snigger, not as a fanfare.
+  snicker(player = 0) {
+    const base = toneFor(player) * 1.4;
+    [0, 0.1].forEach((start) => {
+      tone({ freq: base, endFreq: base * 1.18, start, duration: 0.07, type: 'triangle', volume: 0.09 });
+    });
+    vibrate([20, 50, 20]);
+  },
+  // The joker, cackling while its card sits throbbing over the middle of the
+  // board. Not pitched to a seat: the joker belongs to nobody, and the whole
+  // point of the sound is that it is the one card that can undo anyone's game.
+  // A descending, detuned, deliberately theatrical laugh.
+  evilLaugh() {
+    const notes = [1, 0.94, 0.84, 0.79, 0.7];
+    notes.forEach((mult, i) => {
+      tone({
+        freq: 330 * mult,
+        endFreq: 330 * mult * 0.9,
+        start: i * 0.13,
+        duration: 0.12,
+        type: 'sawtooth',
+        volume: 0.11,
+      });
+      // A second voice a fifth below, so the cackle has some weight under it.
+      tone({
+        freq: 165 * mult,
+        start: i * 0.13,
+        duration: 0.12,
+        type: 'square',
+        volume: 0.06,
+      });
+    });
+    vibrate([40, 60, 40, 60, 40, 60, 90]);
+  },
   // Two pegs displaced by one card: a short rising fanfare, because a cascade
   // is the flashiest thing that happens on this board and it used to go by
   // completely unremarked.

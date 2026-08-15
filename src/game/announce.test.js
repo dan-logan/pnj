@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  announcementsFor, ANNOUNCEMENTS, TAUNT_TEXT, ANNOUNCE_MS, TAUNT_MS,
-  THANKS_TEXT, WELCOME_TEXT, REPLY_MS,
+  announcementsFor, isSpecialPlay, ANNOUNCEMENTS, TAUNT_TEXT, ANNOUNCE_MS, TAUNT_MS,
+  THANKS_TEXT, WELCOME_TEXT, GLOAT_TEXT, REPLY_MS,
 } from './announce.js';
 
 const kinds = (result) => result.map(a => a.kind);
@@ -62,6 +62,39 @@ describe('announcementsFor', () => {
   });
 });
 
+describe('isSpecialPlay', () => {
+  it('is false for an ordinary move, which is what keeps the game brisk', () => {
+    expect(isSpecialPlay({})).toBe(false);
+    expect(isSpecialPlay({ bumps: [], friendly: [], isJoker: false })).toBe(false);
+  });
+
+  it('counts a plain knock-back, which raises no banner but is still an event', () => {
+    // The one place this is deliberately wider than announcementsFor: a peg has
+    // just been sent the length of the board back to start, and that earns the
+    // slowed fly-back and the pause even though nothing is captioned.
+    expect(announcementsFor({ bumps: [bump(1)] })).toEqual([]);
+    expect(isSpecialPlay({ bumps: [bump(1)] })).toBe(true);
+  });
+
+  it('counts a joker and a partner bump', () => {
+    expect(isSpecialPlay({ isJoker: true })).toBe(true);
+    expect(isSpecialPlay({ friendly: [friendlyBump(2)] })).toBe(true);
+  });
+
+  it('is true for anything that earns a banner', () => {
+    const cases = [
+      { isJoker: true },
+      { friendly: [friendlyBump(2)] },
+      { bumps: [bump(1)], friendly: [friendlyBump(2)] },
+      { bumps: [bump(1), bump(3)] },
+    ];
+    for (const c of cases) {
+      expect(announcementsFor(c).length).toBeGreaterThan(0);
+      expect(isSpecialPlay(c)).toBe(true);
+    }
+  });
+});
+
 describe('the partner-bump exchange', () => {
   it('is a call and an answer', () => {
     expect(THANKS_TEXT).toBe('Thanks!');
@@ -73,5 +106,15 @@ describe('the partner-bump exchange', () => {
   it('replies well before the first bubble expires', () => {
     expect(REPLY_MS).toBeGreaterThan(0);
     expect(REPLY_MS).toBeLessThan(TAUNT_MS / 2);
+  });
+});
+
+describe('the knock-back exchange', () => {
+  // Same shape as the partner exchange: the victim swears, the culprit gloats a
+  // beat later, and both are on screen together.
+  it('gives the bumping peg the last word', () => {
+    expect(TAUNT_TEXT).toBe('@$#*!');
+    expect(GLOAT_TEXT).toBe('Hee hee!');
+    expect(REPLY_MS).toBeLessThan(TAUNT_MS);
   });
 });

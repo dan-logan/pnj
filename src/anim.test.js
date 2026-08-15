@@ -13,8 +13,14 @@ import {
   loadSpeed,
   saveSpeed,
   stageBumpFlights,
+  specialPlayHoldMs,
   BUMP_FLY_STEPS,
   BUMP_FLY_STAGGER,
+  BUMP_FLY_TICK_MS,
+  BUMP_FLY_MS,
+  SPECIAL_PAUSE_MS,
+  JOKER_CARD_MS,
+  JOKER_CARD_HOLD_MS,
 } from './anim.js';
 
 const fakeStorage = (initial = {}) => {
@@ -134,5 +140,71 @@ describe('bump fly-back staging', () => {
 
   it('has nothing to stage for no bumps', () => {
     expect(stageBumpFlights(0)).toEqual({ startTicks: [], totalTicks: 0 });
+  });
+
+  it('is slow enough to follow a peg with your eyes', () => {
+    // The whole reason a bump is hard to read is that the peg used to cross the
+    // board in half a second. Anything under a second is back to a flick.
+    expect(BUMP_FLY_MS).toBe(BUMP_FLY_STEPS * BUMP_FLY_TICK_MS);
+    expect(BUMP_FLY_MS).toBeGreaterThanOrEqual(1000);
+  });
+
+  it('finishes the lead flight before the rest set off', () => {
+    // The joker: its own peg has to arrive on the space before the peg standing
+    // there can be knocked off it. Sequential, not overlapping — the one chain
+    // where the overlap would show two pegs on the same space mid-flight.
+    const { startTicks, totalTicks } = stageBumpFlights(2, 1);
+    expect(startTicks).toEqual([0, BUMP_FLY_STEPS]);
+    expect(totalTicks).toBe(BUMP_FLY_STEPS * 2);
+  });
+
+  it('still cascades the followers behind a lead flight', () => {
+    // A joker onto a partner's entrance an opponent is sitting on: the joker's
+    // peg, then the partner, then the opponent it displaces in turn.
+    const { startTicks } = stageBumpFlights(3, 1);
+    expect(startTicks).toEqual([0, BUMP_FLY_STEPS, BUMP_FLY_STEPS + BUMP_FLY_STAGGER]);
+  });
+
+  it('leaves the staging of every other move exactly as it was', () => {
+    expect(stageBumpFlights(2, 0)).toEqual(stageBumpFlights(2));
+    expect(stageBumpFlights(1, 1).startTicks).toEqual([0]);
+  });
+});
+
+describe('the pause after a special play', () => {
+  it('is nothing at all for an ordinary move', () => {
+    expect(specialPlayHoldMs({ special: false, totalTicks: 40 })).toBe(0);
+    expect(specialPlayHoldMs({})).toBe(0);
+  });
+
+  it('waits out the flights and then gives the player a full beat', () => {
+    const { totalTicks } = stageBumpFlights(1);
+    expect(specialPlayHoldMs({ special: true, totalTicks }))
+      .toBe(BUMP_FLY_MS + SPECIAL_PAUSE_MS);
+  });
+
+  it('grows with a cascade, so the pause is always after the last peg lands', () => {
+    const one = specialPlayHoldMs({ special: true, totalTicks: stageBumpFlights(1).totalTicks });
+    const two = specialPlayHoldMs({ special: true, totalTicks: stageBumpFlights(2).totalTicks });
+    expect(two).toBeGreaterThan(one);
+    expect(two - one).toBe(BUMP_FLY_STAGGER * BUMP_FLY_TICK_MS);
+  });
+
+  it('is long enough to be a pause rather than a hitch', () => {
+    expect(SPECIAL_PAUSE_MS).toBe(2000);
+  });
+});
+
+describe('the joker card', () => {
+  it('holds centre-board long enough to be read, then drops', () => {
+    expect(JOKER_CARD_HOLD_MS).toBeGreaterThanOrEqual(1500);
+    expect(JOKER_CARD_HOLD_MS).toBeLessThan(JOKER_CARD_MS);
+  });
+
+  it('drops at the fraction the CSS keyframes use', () => {
+    // `pnj-card-joker` in index.css starts the drop at 75%, and the peg's
+    // flight is scheduled off JOKER_CARD_HOLD_MS — if these drift, the peg
+    // leaves the ground while the card is still throbbing over it.
+    expect(JOKER_CARD_HOLD_MS / JOKER_CARD_MS).toBeCloseTo(0.75, 5);
   });
 });
