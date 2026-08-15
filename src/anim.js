@@ -19,13 +19,18 @@ export const SPEED_ORDER = ['slow', 'normal', 'fast', 'off'];
 
 // stepMs   — one space of peg travel (the "click" of counting it out)
 // thinkMs  — how long an AI seat pauses before it plays, so you can see whose
-//            turn it is before the board changes
+//            turn it is before the board changes. At `slow` this is a full two
+//            seconds: the "Blue is thinking…" banner and the seat's colour have
+//            to be *read*, not glimpsed, and a player who has just looked up
+//            from their hand needs the pause to find the board again before
+//            anything on it moves. It reads as an opponent deliberating rather
+//            than as lag precisely because it is that long.
 // settleMs — the beat *after* a move lands, so three AI turns in a row read as
 //            three separate events rather than one blur
 export const SPEED_SETTINGS = {
-  slow:   { stepMs: 320, thinkMs: 900, settleMs: 450, label: 'Slow',   icon: '🐢' },
-  normal: { stepMs: 150, thinkMs: 800, settleMs: 200, label: 'Normal', icon: '▶️' },
-  fast:   { stepMs: 70,  thinkMs: 400, settleMs: 0,   label: 'Fast',   icon: '⏩' },
+  slow:   { stepMs: 320, thinkMs: 2000, settleMs: 450, label: 'Slow',   icon: '🐢' },
+  normal: { stepMs: 150, thinkMs: 1200, settleMs: 200, label: 'Normal', icon: '▶️' },
+  fast:   { stepMs: 70,  thinkMs: 400,  settleMs: 0,   label: 'Fast',   icon: '⏩' },
   // `off` still needs a thinking delay: with no animation at all, the only
   // thing separating one AI turn from the next is that pause.
   off:    { stepMs: 0,   thinkMs: 300, settleMs: 0,   label: 'Off',    icon: '⏸️' },

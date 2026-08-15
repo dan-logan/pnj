@@ -90,6 +90,13 @@ import { sfx, isMuted, setMuted, unlockAudio } from './audio.js';
 import { syncAppBadge } from './badge.js';
 import { diffPegEvents } from './game/events.js';
 import {
+  announcementsFor,
+  ANNOUNCEMENTS,
+  ANNOUNCE_MS,
+  TAUNT_MS,
+  TAUNT_TEXT,
+} from './game/announce.js';
+import {
   DEFAULT_SPEED,
   settingsFor,
   animationsOn,
@@ -311,6 +318,87 @@ export default function PegsAndJokers() {
   const bumpFxRef = useRef(null);      // the fly-back interval
   const bumpHoldRef = useRef(null);    // the pre-impact hold timeout
 
+  // The three things a move can shout about (game/announce.js): "Joker!",
+  // "Partner Bump!", "Double Play!". A list rather than one slot, because a
+  // single card can legitimately trigger all three and the alternative —
+  // last-one-wins — would drop exactly the flashiest move in the game down to
+  // one message. They stack, newest at the bottom, each expiring on its own
+  // timer.
+  const [announcements, setAnnouncements] = useState([]); // [{ id, kind, text, color }]
+  const announceSeqRef = useRef(0);
+  const announceTimersRef = useRef([]);
+
+  // The "@$#*!" bubble over a peg that has just been knocked back to start:
+  // { id, player, pegIndex }. Positioned at render time from
+  // getStartAreaPosition, so it follows the board rotation for free.
+  const [bumpTaunt, setBumpTaunt] = useState(null);
+  const tauntTimerRef = useRef(null);
+
+  // Show a batch of announcements, optionally deferred to the moment the
+  // mover's peg actually lands — the same `landingDelayMs` discipline the
+  // arrival chimes and the bump fly-back already use. A human move commits its
+  // state before its cosmetic glide runs, so an undeferred "Double Play!" would
+  // flash while the peg that caused it was still two-thirds of the way across
+  // the board.
+  const announce = useCallback((items, delayMs = 0) => {
+    if (!items || items.length === 0) return;
+    const show = () => {
+      const entries = items.map((item) => {
+        announceSeqRef.current += 1;
+        return { ...item, id: announceSeqRef.current };
+      });
+      setAnnouncements(prev => [...prev, ...entries]);
+      // The fanfare belongs to the banner, not to the move, so it is fired
+      // from the same place the banner appears — the `onImpact` discipline
+      // again: one timer, so sound and picture can't drift apart.
+      if (entries.some(e => e.kind === ANNOUNCEMENTS.doublePlay.kind)) sfx.fanfare();
+      const ids = new Set(entries.map(e => e.id));
+      const expiry = setTimeout(() => {
+        announceTimersRef.current = announceTimersRef.current.filter(t => t !== expiry);
+        setAnnouncements(prev => prev.filter(a => !ids.has(a.id)));
+      }, ANNOUNCE_MS);
+      announceTimersRef.current.push(expiry);
+    };
+    if (delayMs > 0) {
+      const timer = setTimeout(() => {
+        announceTimersRef.current = announceTimersRef.current.filter(t => t !== timer);
+        show();
+      }, delayMs);
+      announceTimersRef.current.push(timer);
+    } else {
+      show();
+    }
+  }, []);
+
+  // The knocked-back peg's cartoon curse, shown once it has actually landed
+  // back in its start area (runBumpFx calls this at the end of the fly-back, so
+  // the bubble appears over the peg where it comes to rest, not where it was
+  // hit). One at a time: a second bump replaces the first rather than littering
+  // the board.
+  const showBumpTaunt = useCallback((player, pegIndex) => {
+    if (tauntTimerRef.current) { clearTimeout(tauntTimerRef.current); tauntTimerRef.current = null; }
+    announceSeqRef.current += 1;
+    setBumpTaunt({ id: announceSeqRef.current, player, pegIndex });
+    sfx.grumble(player);
+    tauntTimerRef.current = setTimeout(() => {
+      tauntTimerRef.current = null;
+      setBumpTaunt(null);
+    }, TAUNT_MS);
+  }, []);
+
+  // Every overlay is a timer, and a timer that outlives its game is the same
+  // class of bug as the status-line timers that used to print "Blue is
+  // thinking…" under a win banner. So this is called from every place that
+  // cancels the animation and bump timers: endGame, a new game, a board clear,
+  // adopting a save, and unmount.
+  const clearAnnouncements = useCallback(() => {
+    announceTimersRef.current.forEach(clearTimeout);
+    announceTimersRef.current = [];
+    if (tauntTimerRef.current) { clearTimeout(tauntTimerRef.current); tauntTimerRef.current = null; }
+    setAnnouncements([]);
+    setBumpTaunt(null);
+  }, []);
+
   // Instant replay: a buffer of the AI moves made since your last turn, plus the
   // playback state. Frames live in a ref (they hold peg snapshots and don't need
   // to trigger renders); `replayReady` mirrors the count so the button can show.
@@ -406,6 +494,7 @@ export default function PegsAndJokers() {
     if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
     arrivalTimersRef.current.forEach(clearTimeout);
     arrivalTimersRef.current = [];
+    clearAnnouncements();
     replayCancelRef.current = true;
     aiProcessingRef.current = false;
     setAnimatingPeg(null);
@@ -464,7 +553,7 @@ export default function PegsAndJokers() {
     setStats(updated);
     setEndInfo({ winner: winnerIdx, winningSeat, description, ...tallies });
     setEndOverlayDismissed(false);
-  }, []);
+  }, [clearAnnouncements]);
 
   // In partner mode, once your own pegs are all home you play your hand on your
   // partner's pegs; otherwise you always control your own seat's pegs. This is
@@ -516,6 +605,7 @@ export default function PegsAndJokers() {
     if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
     arrivalTimersRef.current.forEach(clearTimeout);
     arrivalTimersRef.current = [];
+    clearAnnouncements();
     setBumpFx(null);
     if (bumpFxRef.current) {
       clearInterval(bumpFxRef.current);
@@ -537,7 +627,7 @@ export default function PegsAndJokers() {
     setEndInfo(null);
     setEndOverlayDismissed(false);
     setShowFirstPlayerModal(false);
-  }, [resetReplay, ownsSeat]);
+  }, [resetReplay, ownsSeat, clearAnnouncements]);
 
   const handleGoFirst = useCallback(() => {
     unlockAudio();
@@ -640,6 +730,7 @@ export default function PegsAndJokers() {
     setBumpFx(null);
     if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
     if (bumpHoldRef.current) { clearTimeout(bumpHoldRef.current); bumpHoldRef.current = null; }
+    clearAnnouncements();
 
     // Restore per-game stat tallies so a resumed game still records correctly.
     // jokersPlayed/bumpsDelivered/timesBumped are per-seat arrays on the wire;
@@ -676,7 +767,7 @@ export default function PegsAndJokers() {
     setPendingResume(null);
     setShowResumeModal(false);
     setShowFirstPlayerModal(false);
-  }, [resetReplay, ownsSeat]);
+  }, [resetReplay, ownsSeat, clearAnnouncements]);
 
   // Blank the board: no hands, pegs at start, nothing pending.
   //
@@ -701,6 +792,7 @@ export default function PegsAndJokers() {
     if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
     arrivalTimersRef.current.forEach(clearTimeout);
     arrivalTimersRef.current = [];
+    clearAnnouncements();
     aiProcessingRef.current = false;
 
     setDeck([]);
@@ -747,7 +839,7 @@ export default function PegsAndJokers() {
     replayPrevPlayerRef.current = parkOn;
     prevPlayerRef.current = parkOn;
     pendingAutoReplayRef.current = false;
-  }, [resetReplay]);
+  }, [resetReplay, clearAnnouncements]);
 
   // --- Remote play: sessions, listeners, create/join, switching ---------------
   //
@@ -1295,6 +1387,12 @@ export default function PegsAndJokers() {
   // occupies, and nothing happens to it until the mover has counted its way onto
   // it. `onImpact` (the sound and haptic) fires from the same timer as the
   // fly-back, so what you hear and what you see can't drift apart.
+  //
+  // A knock-back additionally ends with the peg's "@$#*!" bubble and its
+  // muttering, fired when the flight *finishes* rather than at impact: the
+  // complaint belongs over the peg where it lands, in the start area it has
+  // just been sent back to, and firing it at impact would put the bubble on a
+  // peg that is still in mid-air.
   const runBumpFx = useCallback((player, pegIndex, from, to, kind, holdMs = 0, onImpact = null) => {
     if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
     if (bumpHoldRef.current) { clearTimeout(bumpHoldRef.current); bumpHoldRef.current = null; }
@@ -1310,6 +1408,7 @@ export default function PegsAndJokers() {
           clearInterval(bumpFxRef.current);
           bumpFxRef.current = null;
           setBumpFx(null);
+          if (kind === 'start') showBumpTaunt(player, pegIndex);
         } else {
           setBumpFx(prev => (prev ? { ...prev, progress: step / steps } : null));
         }
@@ -1325,7 +1424,7 @@ export default function PegsAndJokers() {
     } else {
       fly();
     }
-  }, []);
+  }, [showBumpTaunt]);
 
   // When you finish your turn and control passes to the AI, start recording a
   // fresh round so the replay buffer only ever holds the moves made since your
@@ -1351,6 +1450,11 @@ export default function PegsAndJokers() {
 
     replayCancelRef.current = false;
     replayRestoreRef.current = pegs; // true current board (== last frame's pegsAfter)
+    // Banners belong to the live board. A remote adopt simulates the AI seats
+    // silently and only *then* plays the round back, so anything still on
+    // screen from that silent run would hang over the replay describing a move
+    // the player is about to watch happen.
+    clearAnnouncements();
     setIsReplaying(true);
     setSelectedCard(null);
     setSelectedPeg(null);
@@ -1442,7 +1546,7 @@ export default function PegsAndJokers() {
     };
 
     playFrame(0);
-  }, [isReplaying, pegs, pacing.stepMs, pegAnchor]);
+  }, [isReplaying, pegs, pacing.stepMs, pegAnchor, clearAnnouncements]);
 
   // Abort an in-flight replay and snap the board back to the live state.
   const stopReplay = useCallback(() => {
@@ -1483,14 +1587,18 @@ export default function PegsAndJokers() {
   // Clean up replay and pacing timers if the component unmounts mid-playback.
   useEffect(() => {
     const arrivals = arrivalTimersRef;
+    const announceTimers = announceTimersRef;
     return () => {
       if (replaySegTimerRef.current) clearInterval(replaySegTimerRef.current);
       if (replayFrameTimerRef.current) clearTimeout(replayFrameTimerRef.current);
       if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
       if (bumpFxRef.current) clearInterval(bumpFxRef.current);
       if (bumpHoldRef.current) clearTimeout(bumpHoldRef.current);
+      if (tauntTimerRef.current) clearTimeout(tauntTimerRef.current);
       arrivals.current.forEach(clearTimeout);
       arrivals.current = [];
+      announceTimers.current.forEach(clearTimeout);
+      announceTimers.current = [];
     };
   }, []);
 
@@ -1570,10 +1678,19 @@ export default function PegsAndJokers() {
       }
     };
 
+    // "Partner Bump!" and "Double Play!", on the same landing delay as the
+    // sound: both describe something the board is about to do, and a banner
+    // that appears while the peg causing it is still travelling reads as a
+    // banner about the *previous* move.
+    announce(announcementsFor({ bumps, friendly }), landingDelayMs);
+
     // With animations off there is no travel to be out of step with, so the
-    // impact is now.
+    // impact is now. The "@$#*!" bubble still shows: it is feedback, not
+    // travel, and this is precisely the setting where a peg vanishes from the
+    // track and reappears in a start area with nothing in between.
     if (!animationsEnabled) {
       playBumpFeedback();
+      if (bumps.length > 0) showBumpTaunt(bumps[0].player, bumps[0].pegIndex);
       return;
     }
 
@@ -1589,7 +1706,7 @@ export default function PegsAndJokers() {
       runBumpFx(fb.player, fb.pegIndex, getTrackPosition(fb.fromPosition),
         getTrackPosition(fb.toPosition), 'friendly', landingDelayMs, playBumpFeedback);
     }
-  }, [animationsEnabled, gameMode, runBumpFx, ownsSeat]);
+  }, [animationsEnabled, gameMode, runBumpFx, ownsSeat, announce, showBumpTaunt]);
 
   // `owner` is whose peg moves (your partner once you are all home); you always
   // act as your own seat, so the hand, discards and turn are yours.
@@ -2177,7 +2294,14 @@ export default function PegsAndJokers() {
           segments: replaySegments,
         });
 
-        if (bestMove.type === 'joker') jokersPlayedRef.current[aiPlayer] += 1;
+        if (bestMove.type === 'joker') {
+          jokersPlayedRef.current[aiPlayer] += 1;
+          // Same as the human joker site: nothing travels, so the only way to
+          // know a joker was played is to be told. Skipped for a silent
+          // catch-up simulation, exactly like `nowPlaying` below — that run
+          // isn't being watched; the auto-replay afterwards is.
+          if (!silent) announce([ANNOUNCEMENTS.joker]);
+        }
 
         // Say who is moving and what they played, large, for as long as the
         // move takes. Cleared by the settle beat in completeAIMove.
@@ -2231,7 +2355,7 @@ export default function PegsAndJokers() {
       if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, logMove]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, logMove, announce]);
 
   // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
@@ -2527,6 +2651,11 @@ export default function PegsAndJokers() {
     setLastMoves(updatedLastMoves);
 
     jokersPlayedRef.current[actor] += 1;
+    // A joker is the one card with nothing to watch — its animation path is
+    // empty by construction, so the board simply rearranges itself. Say so.
+    // (`triggerMoveEffects` adds "Partner Bump!" / "Double Play!" if this joker
+    // was also one of those; there is no landing delay to defer to here.)
+    announce([ANNOUNCEMENTS.joker]);
     triggerMoveEffects(pegs, newPegs, actor, { player: owner, pegIndex: jokerSourcePeg });
 
     setPegs(newPegs);
@@ -3657,7 +3786,7 @@ export default function PegsAndJokers() {
 
         <div className="flex flex-col lg:flex-row gap-4 items-center lg:items-start">
           {/* Game Board */}
-          <div className="flex-shrink-0 w-full max-w-[400px]">
+          <div className="flex-shrink-0 w-full max-w-[400px] relative">
             <svg viewBox="0 0 400 400" className="w-full h-auto bg-gray-800 rounded">
               {/* Track spaces - all same grey color */}
               {Array.from({ length: TRACK_LENGTH }).map((_, i) => {
@@ -4051,7 +4180,70 @@ export default function PegsAndJokers() {
                   </>
                 );
               })()}
+
+              {/* The knocked-back peg having its say. Drawn last so it sits on
+                  top of everything, and positioned from getStartAreaPosition so
+                  it follows the board rotation for free — it lands over the
+                  slot the peg was sent back to, whichever edge that seat is
+                  drawn on. */}
+              {bumpTaunt && (() => {
+                const pos = getStartAreaPosition(bumpTaunt.player, bumpTaunt.pegIndex);
+                const cx = pos.x;
+                const cy = pos.y - 20; // bubble body sits above the peg
+                return (
+                  // Keyed on the taunt id so a second bump restarts the
+                  // animation instead of re-using the finished one.
+                  <g key={bumpTaunt.id} className="taunt-bubble" aria-hidden="true">
+                    <path
+                      d={`M ${cx - 3} ${cy + 8} L ${cx + 4} ${cy + 8} L ${cx} ${cy + 15} Z`}
+                      fill="#FFFFFF"
+                      stroke={PLAYER_COLORS[bumpTaunt.player]}
+                      strokeWidth={1.5}
+                    />
+                    <rect
+                      x={cx - 24} y={cy - 10} width={48} height={19} rx={9}
+                      fill="#FFFFFF"
+                      stroke={PLAYER_COLORS[bumpTaunt.player]}
+                      strokeWidth={1.5}
+                    />
+                    <text
+                      x={cx} y={cy + 4}
+                      textAnchor="middle"
+                      fill="#111827"
+                      fontSize="13"
+                      fontWeight="bold"
+                      style={{ fontFamily: 'monospace' }}
+                    >
+                      {TAUNT_TEXT}
+                    </text>
+                  </g>
+                );
+              })()}
             </svg>
+
+            {/* "Joker!" / "Partner Bump!" / "Double Play!" — the three things
+                that happen with nothing to watch, said large over the middle of
+                the board. `aria-live` region is always mounted so a screen
+                reader announces each one as it is inserted; pointer-events-none
+                so a banner can never swallow a tap on the board underneath it. */}
+            <div
+              className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 z-10"
+              aria-live="polite"
+            >
+              {!isReplaying && announcements.map((a) => (
+                <div
+                  key={a.id}
+                  className="announce-pop px-4 py-2 rounded-xl border-2 bg-gray-900/85 font-extrabold text-2xl sm:text-3xl tracking-wide"
+                  style={{
+                    color: a.color,
+                    borderColor: a.color,
+                    textShadow: '0 2px 8px rgba(0,0,0,0.9)',
+                  }}
+                >
+                  {a.text}
+                </div>
+              ))}
+            </div>
           </div>
 
           {/* Hand and Controls */}

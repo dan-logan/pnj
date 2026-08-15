@@ -33,6 +33,12 @@ describe('animation speeds', () => {
     expect(stepMsFor('slow')).toBeGreaterThan(stepMsFor('normal'));
     expect(stepMsFor('normal')).toBeGreaterThan(stepMsFor('fast'));
     expect(stepMsFor('fast')).toBeGreaterThan(0);
+    // The thinking pause follows the same ladder — an opponent that plays the
+    // instant its turn arrives is the single hardest thing to follow, so the
+    // slow pace gives you two full seconds to find the board first.
+    expect(thinkMsFor('slow')).toBeGreaterThanOrEqual(2000);
+    expect(thinkMsFor('slow')).toBeGreaterThan(thinkMsFor('normal'));
+    expect(thinkMsFor('normal')).toBeGreaterThan(thinkMsFor('fast'));
   });
 
   it('gives `off` a zero step but keeps a thinking pause', () => {
