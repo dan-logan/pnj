@@ -71,6 +71,7 @@ import {
 import { STATUS, HOST_SEAT, GUEST_SEAT } from './net/protocol.js';
 import {
   loadLocalGames,
+  emptyLocalGames,
   hasLocalGames,
   upsertLocalGame,
   archiveLocalGame,
@@ -78,6 +79,7 @@ import {
   setActiveId,
 } from './net/localSession.js';
 import {
+  bootTargetFor,
   buildRemoteRows,
   countWaitingOnMe,
   openActionFor,
@@ -1175,6 +1177,12 @@ export default function PegsAndJokers() {
     // to have no state yet. Whatever comes back below replaces this.
     clearBoard(seat);
     try {
+      // Sign in *before* the fetch. Every other caller reaches here already
+      // signed in (the lobby listener, joining, hosting), but the mount routing
+      // does not — and an unauthenticated read is denied by the rules, which
+      // would land a reload in the lobby with "could not open that game"
+      // instead of on the board it was told to restore. signIn is idempotent.
+      setMyUid(await signIn());
       const snap = await fetchGame(id);
       setOpenMeta(snap.meta);
       openMetaRef.current = snap.meta;
@@ -1328,10 +1336,12 @@ export default function PegsAndJokers() {
     initGame();
   }, [detachGameListeners, setActiveSession, clearBoard, initGame]);
 
-  // On mount, route to the right starting screen (§3.4). The lobby subsumes the
-  // resume prompt, but ONLY for a device that actually has remote games — a
-  // solo-only player, even with the env vars set, gets today's exact flow and is
-  // never signed in.
+  // On mount, route back to whatever was on screen (§3.4) — `bootTargetFor` is
+  // the whole decision and is pure, because a reload must never *change* games.
+  // The one input that matters is the stored `activeId`; a device that merely
+  // *has* a remote game is not a device that was looking at one. A solo-only
+  // player, even with the env vars set, gets today's exact flow and is never
+  // signed in.
   useEffect(() => {
     if (bootstrappedRef.current) return;
     bootstrappedRef.current = true;
@@ -1339,29 +1349,30 @@ export default function PegsAndJokers() {
       ? new URLSearchParams(window.location.search).get('g')
       : null;
     const saved = loadGame();
+    const local = multiplayerConfigured ? loadLocalGames() : emptyLocalGames();
+    const target = bootTargetFor({
+      joinId,
+      multiplayer: multiplayerConfigured,
+      activeId: local.activeId,
+      games: local.games,
+      hasSave: Boolean(saved),
+    });
 
-    if (multiplayerConfigured && joinId) {
+    if (target.kind === 'join') {
       if (saved) setPendingResume(saved);
-      beginJoin(joinId, { byId: true });
+      beginJoin(target.id, { byId: true });
       return;
     }
-    if (multiplayerConfigured && hasLocalGames()) {
-      const active = loadLocalGames().games.filter((g) => !g.archived);
-      if (active.length === 1) {
-        // Restore the single-game case to where you were.
-        openRemoteGame(active[0].id, active[0].seat);
-      } else {
-        if (saved) setPendingResume(saved);
-        setShowLobby(true);
-      }
+    if (target.kind === 'remote') {
+      openRemoteGame(target.id, target.seat);
       return;
     }
-    if (saved) {
+    if (target.kind === 'resume') {
       setPendingResume(saved);
       setShowResumeModal(true);
-    } else {
-      initGame();
+      return;
     }
+    initGame();
   }, [initGame, multiplayerConfigured, beginJoin, openRemoteGame]);
 
   // The lobby/badge listener. One subscription covers every game you are in and
