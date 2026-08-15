@@ -1,7 +1,8 @@
 // What visibly *happened* across one move, for the benefit of someone who is
 // listening rather than staring at the board.
 //
-// The engine already reports bumps (`findBumps` / `findFriendlyBumps`), but the
+// The engine already reports bumps (`findBumps`, and `displacements` from the
+// move appliers), but the
 // other two things a player at a real table hears — a peg coming out of start,
 // and a peg reaching home — were never derived anywhere; the UI just played one
 // generic chime from whichever call site happened to know. Deriving them from

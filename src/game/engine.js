@@ -105,14 +105,40 @@ export function findPegAtPosition(position, playerPegs) {
 // if it is occupied by one of that owner's own pegs, the friendly bump has
 // nowhere to go and the move is illegal — just like landing on your own peg.
 //
-// `reservedPos` is the track space the mover itself will occupy. `mover`
-// (`{ player, pegIndex }` or null) identifies that moving peg so the "peg on its
-// own entrance" swap below can relocate it.
-function resolveDisplacement(newPegs, ownerP, idx, actor, mode, reservedPos, mover = null, depth = 0) {
+// `reservedPos` is the track space the mover itself will occupy. `ctx` carries:
+//   mover — `{ player, pegIndex }` of the moving peg, so the "peg on its own
+//           entrance" swap below can relocate it; null where no swap is possible.
+//   depth — cascade recursion guard.
+//   log   — array to append DISPLACEMENTS to (see below); null to record nothing.
+//   cause — `{ player, pegIndex }` of the peg whose arrival forced this one to
+//           move, recorded on each displacement.
+//   from  — override for the displaced peg's "from" position, for a peg that has
+//           already been detached from the board by the caller.
+//
+// A displacement is `{ player, pegIndex, fromPosition, toPosition, friendly,
+// byPlayer, byPegIndex }`, with `toPosition: null` for a send-to-start. This is
+// the engine *telling* the caller what it did, which matters because the two
+// interesting cases can't be recovered by diffing the board afterwards: a peg
+// landing on its own home entrance looks identical whether it walked there or
+// was shoved, and the swap below displaces the *mover*, which every caller
+// necessarily excludes from a diff as "the peg that meant to move".
+function resolveDisplacement(newPegs, ownerP, idx, actor, mode, reservedPos, ctx = {}) {
+  const { mover = null, depth = 0, log = null, cause = null, from = null } = ctx;
   if (depth > 12) return false; // guard against a pathological cascade cycle
+  const fromPosition = from ?? newPegs[ownerP][idx].position;
+  const record = (toPosition, friendly) => {
+    if (!log) return;
+    log.push({
+      player: ownerP, pegIndex: idx, fromPosition, toPosition, friendly,
+      byPlayer: cause ? cause.player : null,
+      byPegIndex: cause ? cause.pegIndex : null,
+    });
+  };
+
   const friendly = mode === GAME_MODES.PARTNERS && sameTeam(ownerP, actor);
   if (!friendly) {
     newPegs[ownerP][idx] = { location: 'start', index: idx };
+    record(null, false);
     return true;
   }
   const target = getHomeEntrance(ownerP);
@@ -124,15 +150,31 @@ function resolveDisplacement(newPegs, ownerP, idx, actor, mode, reservedPos, mov
     // of the mover to its own home entrance (cascading from there). Without a
     // mover to relocate (e.g. the joker path, which we don't support here) the
     // bump has nowhere to resolve and is illegal.
+    //
+    // Note who displaces whom: this peg stays put and the *mover* is the one
+    // shoved, so the mover is the displacement and this peg is its cause. The
+    // mover has already been detached from the board by our caller, so its
+    // "from" is the space it was travelling to — `reservedPos`, the space it
+    // reached before being sent onward.
     if (!mover) return false;
-    return resolveDisplacement(newPegs, mover.player, mover.pegIndex, actor, mode, reservedPos, null, depth + 1);
+    return resolveDisplacement(newPegs, mover.player, mover.pegIndex, actor, mode, reservedPos, {
+      mover: null, depth: depth + 1, log, from: reservedPos,
+      cause: { player: ownerP, pegIndex: idx },
+    });
   }
+  // Recorded before the cascade so the log reads in causal order: the friendly
+  // shove first, then whoever it in turn knocked off the entrance. A failed
+  // cascade rejects the whole move, and every caller drops the log along with
+  // the board, so a half-written log is never observed.
+  record(target, true);
   // Detach the peg first so a cascade lookup can't treat it as blocking itself.
   newPegs[ownerP][idx] = { location: 'start', index: idx };
   const occ = findPegAtPosition(target, newPegs);
   if (occ) {
     if (occ.player === ownerP) return false; // this owner's own peg holds the entrance
-    if (!resolveDisplacement(newPegs, occ.player, occ.pegIndex, actor, mode, reservedPos, mover, depth + 1)) {
+    if (!resolveDisplacement(newPegs, occ.player, occ.pegIndex, actor, mode, reservedPos, {
+      mover, depth: depth + 1, log, cause: { player: ownerP, pegIndex: idx },
+    })) {
       return false;
     }
   }
@@ -147,7 +189,7 @@ function canBumpPegAt(position, actor, mode, currentPegs, reservedPos, mover = n
   const occ = findPegAtPosition(position, currentPegs);
   if (!occ) return true;
   const clone = currentPegs.map(p => p.map(pg => ({ ...pg })));
-  return resolveDisplacement(clone, occ.player, occ.pegIndex, actor, mode, reservedPos, mover);
+  return resolveDisplacement(clone, occ.player, occ.pegIndex, actor, mode, reservedPos, { mover });
 }
 
 // True when the joker has at least one legally bumpable target: any peg on the
@@ -183,13 +225,16 @@ function hasLegalJokerTarget(owner, actor, mode, currentPegs) {
 // Apply a joker: the owner's peg jumps to `targetPlayer`/`targetPegIndex`'s
 // track space and that peg is bumped (friendly-bumped to its home entrance for a
 // teammate, back to start otherwise). Shared by the UI and AI so the partner rule
-// stays in one place. Returns { newPegs, bumped, bumpedPlayer }.
+// stays in one place. Returns { newPegs, bumped, bumpedPlayer, displacements }.
 export function applyJoker(owner, pegIndex, targetPlayer, targetPegIndex, currentPegs, options = {}) {
   const { actor = owner, mode = GAME_MODES.CLASSIC } = options;
   const newPegs = currentPegs.map(p => p.map(pg => ({ ...pg })));
   const target = newPegs[targetPlayer][targetPegIndex];
-  if (target.location !== 'track') return { newPegs: currentPegs, bumped: false, bumpedPlayer: null };
+  if (target.location !== 'track') {
+    return { newPegs: currentPegs, bumped: false, bumpedPlayer: null, displacements: [] };
+  }
   const targetPos = target.position;
+  const log = [];
 
   // Jokering a teammate that's sitting on its own home entrance is the same
   // "a peg can't block itself" swap as a track move landing there: the teammate
@@ -204,15 +249,17 @@ export function applyJoker(owner, pegIndex, targetPlayer, targetPegIndex, curren
   // perform the entrance swap above (which needs a peg to shove onward).
   const mover = newPegs[owner][pegIndex];
   newPegs[owner][pegIndex] = { location: 'start', index: pegIndex };
-  const ok = resolveDisplacement(newPegs, targetPlayer, targetPegIndex, actor, mode, targetPos, { player: owner, pegIndex });
-  if (!ok) return { newPegs: currentPegs, bumped: false, bumpedPlayer: null };
+  const ok = resolveDisplacement(newPegs, targetPlayer, targetPegIndex, actor, mode, targetPos, {
+    mover: { player: owner, pegIndex }, log, cause: { player: owner, pegIndex },
+  });
+  if (!ok) return { newPegs: currentPegs, bumped: false, bumpedPlayer: null, displacements: [] };
   if (swap) {
     // The teammate kept its entrance and resolveDisplacement friendly-bumped the
     // mover on to its own home entrance; don't re-place it at targetPos.
-    return { newPegs, bumped: true, bumpedPlayer: targetPlayer };
+    return { newPegs, bumped: true, bumpedPlayer: targetPlayer, displacements: log };
   }
   newPegs[owner][pegIndex] = { ...mover, location: 'track', position: targetPos };
-  return { newPegs, bumped: true, bumpedPlayer: targetPlayer };
+  return { newPegs, bumped: true, bumpedPlayer: targetPlayer, displacements: log };
 }
 
 export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = null, options = {}) {
@@ -421,21 +468,25 @@ export function hasAnyValidMove(player, hand, currentPegs, options = {}) {
   return false;
 }
 
-// Apply a move to the peg state. Returns { newPegs, bumpedOpponent } without
-// mutating the input. Assumes the move has already been validated.
-// `options.actor`/`options.mode` drive the partner friendly-bump rule; both
-// default to classic behavior (actor === owner, no friendly bumps).
+// Apply a move to the peg state. Returns { newPegs, bumpedOpponent,
+// displacements } without mutating the input. Assumes the move has already been
+// validated. `options.actor`/`options.mode` drive the partner friendly-bump
+// rule; both default to classic behavior (actor === owner, no friendly bumps).
+// `displacements` is every peg this move shoved off a space and where it went
+// — see resolveDisplacement for the shape and for why it is reported rather
+// than left to be diffed out of the board afterwards.
 export function applyMove(player, pegIndex, card, amount, currentPegs, options = {}) {
   const { actor = player, mode = GAME_MODES.CLASSIC } = options;
   const newPegs = currentPegs.map(p => p.map(peg => ({ ...peg })));
   const peg = newPegs[player][pegIndex];
   const cardInfo = CARD_VALUES[card.rank];
+  const log = [];
 
   // Handle movement within home corridor
   if (peg.location === 'home') {
     const moveAmount = amount !== null ? amount : cardInfo.value;
     peg.homePosition = peg.homePosition + moveAmount;
-    return { newPegs, bumpedOpponent: false };
+    return { newPegs, bumpedOpponent: false, displacements: [] };
   }
 
   if (peg.location === 'start' && cardInfo.canStart) {
@@ -444,7 +495,7 @@ export function applyMove(player, pegIndex, card, amount, currentPegs, options =
 
     // Safety check: can't start if own peg is at come-out spot
     if (pegAtStart && pegAtStart.player === player) {
-      return { newPegs, bumpedOpponent: false };
+      return { newPegs, bumpedOpponent: false, displacements: [] };
     }
 
     // Bump the occupying peg if present (opponent → start, teammate → friendly).
@@ -453,13 +504,18 @@ export function applyMove(player, pegIndex, card, amount, currentPegs, options =
       // If the friendly bump is illegal (a partner whose entrance is blocked by
       // its own peg), the come-out is illegal too — leave the state untouched.
       // isValidMove already guards this, so this is defensive.
-      if (!resolveDisplacement(newPegs, pegAtStart.player, pegAtStart.pegIndex, actor, mode, startPos)) {
-        return { newPegs: currentPegs, bumpedOpponent: false };
+      //
+      // No `mover` here: the swap needs the friendly-bump target to be the space
+      // the mover is taking, and a come-out space is never a home entrance
+      // (18p+8 never equals 18q+3), so that case cannot arise.
+      if (!resolveDisplacement(newPegs, pegAtStart.player, pegAtStart.pegIndex, actor, mode, startPos,
+        { log, cause: { player, pegIndex } })) {
+        return { newPegs: currentPegs, bumpedOpponent: false, displacements: [] };
       }
     }
     peg.location = 'track';
     peg.position = startPos;
-    return { newPegs, bumpedOpponent };
+    return { newPegs, bumpedOpponent, displacements: log };
   }
 
   if (cardInfo.isJoker) {
@@ -470,12 +526,12 @@ export function applyMove(player, pegIndex, card, amount, currentPegs, options =
         const otherPeg = newPegs[p][i];
         if (otherPeg.location === 'track' &&
             canBumpPegAt(otherPeg.position, actor, mode, newPegs, otherPeg.position, { player, pegIndex })) {
-          const { newPegs: afterJoker, bumped } = applyJoker(player, pegIndex, p, i, newPegs, { actor, mode });
-          return { newPegs: afterJoker, bumpedOpponent: bumped };
+          const { newPegs: afterJoker, bumped, displacements } = applyJoker(player, pegIndex, p, i, newPegs, { actor, mode });
+          return { newPegs: afterJoker, bumpedOpponent: bumped, displacements };
         }
       }
     }
-    return { newPegs, bumpedOpponent: false };
+    return { newPegs, bumpedOpponent: false, displacements: [] };
   }
 
   const homeEntrance = getHomeEntrance(player);
@@ -539,7 +595,7 @@ export function applyMove(player, pegIndex, card, amount, currentPegs, options =
   if (shouldEnterHome) {
     peg.location = 'home';
     peg.homePosition = homeSteps;
-    return { newPegs, bumpedOpponent: false };
+    return { newPegs, bumpedOpponent: false, displacements: [] };
   }
 
   // Continue on track
@@ -557,19 +613,21 @@ export function applyMove(player, pegIndex, card, amount, currentPegs, options =
       && getHomeEntrance(pegAtNewPos.player) === newPos;
     // Detach the mover during the cascade so it can't block a friendly bump.
     newPegs[player][pegIndex] = { location: 'start', index: pegIndex };
-    resolveDisplacement(newPegs, pegAtNewPos.player, pegAtNewPos.pegIndex, actor, mode, newPos, { player, pegIndex });
+    resolveDisplacement(newPegs, pegAtNewPos.player, pegAtNewPos.pegIndex, actor, mode, newPos, {
+      mover: { player, pegIndex }, log, cause: { player, pegIndex },
+    });
     if (swap) {
       // Landed on a partner sitting on its own home entrance: the partner keeps
       // that space and the mover was friendly-bumped on to its own home entrance
       // by resolveDisplacement, so don't re-place the mover at newPos.
-      return { newPegs, bumpedOpponent: true };
+      return { newPegs, bumpedOpponent: true, displacements: log };
     }
     // Otherwise land the mover on the vacated space.
     newPegs[player][pegIndex] = peg;
   }
 
   peg.position = newPos;
-  return { newPegs, bumpedOpponent: !!pegAtNewPos };
+  return { newPegs, bumpedOpponent: !!pegAtNewPos, displacements: log };
 }
 
 // Move a peg out of the start area onto its come-out space, applying the partner
@@ -588,19 +646,26 @@ export function applyComeOut(player, pegIndex, currentPegs, options = {}) {
   const startPos = getStartPosition(player);
   const occ = findPegAtPosition(startPos, newPegs);
   if (occ && occ.player === player) {
-    return { newPegs: currentPegs, ok: false, bumpedOpponent: false };
+    return { newPegs: currentPegs, ok: false, bumpedOpponent: false, displacements: [] };
   }
   let bumpedOpponent = false;
+  let log = [];
   if (occ) {
     bumpedOpponent = mode !== GAME_MODES.PARTNERS || !sameTeam(occ.player, actor);
-    if (!resolveDisplacement(newPegs, occ.player, occ.pegIndex, actor, mode, startPos)) {
+    const cause = { player, pegIndex };
+    if (!resolveDisplacement(newPegs, occ.player, occ.pegIndex, actor, mode, startPos, { log, cause })) {
       // Partner's entrance is blocked; fall back to a plain send-to-start so the
-      // stuck player can still break free.
+      // stuck player can still break free. The log is rewritten to match, since
+      // it describes what happened, not what was attempted.
       newPegs[occ.player][occ.pegIndex] = { location: 'start', index: occ.pegIndex };
+      log = [{
+        player: occ.player, pegIndex: occ.pegIndex, fromPosition: startPos,
+        toPosition: null, friendly: false, byPlayer: player, byPegIndex: pegIndex,
+      }];
     }
   }
   newPegs[player][pegIndex] = { location: 'track', position: startPos, index: pegIndex };
-  return { newPegs, ok: true, bumpedOpponent };
+  return { newPegs, ok: true, bumpedOpponent, displacements: log };
 }
 
 // Who owns the peg that completes a 7/9 split. Normally the same player who
@@ -706,25 +771,15 @@ export function findBumps(oldPegs, newPegs) {
   return bumps;
 }
 
-// Diff two peg states for friendly partner bumps: a peg (other than the mover)
-// that was shoved forward on the track to its own home-entrance space. Returns
-// [{ player, pegIndex, fromPosition, toPosition }]. Used to animate the friendly
-// bump distinctly from a knock-back-to-start.
-export function findFriendlyBumps(oldPegs, newPegs, mover = null) {
-  const bumps = [];
-  for (let p = 0; p < NUM_PLAYERS; p++) {
-    for (let i = 0; i < PEGS_PER_PLAYER; i++) {
-      if (mover && mover.player === p && mover.pegIndex === i) continue;
-      const before = oldPegs[p][i];
-      const after = newPegs[p][i];
-      if (before.location === 'track' && after.location === 'track' &&
-          before.position !== after.position && after.position === getHomeEntrance(p)) {
-        bumps.push({ player: p, pegIndex: i, fromPosition: before.position, toPosition: after.position });
-      }
-    }
-  }
-  return bumps;
-}
+// Friendly partner bumps are NOT diffed out of the board — `applyMove` /
+// `applyJoker` / `applyComeOut` report them directly as `displacements` (see
+// resolveDisplacement). A diff cannot tell them apart from ordinary play: a peg
+// landing on its own home entrance looks the same whether it walked there under
+// its own card or was shoved there, and the entrance is the last space before
+// the home corridor, so pegs land on it constantly. `findFriendlyBumps` used to
+// guess by excluding "the mover" and got both cases wrong — a split (two movers,
+// one named) invented a Partner Bump on an empty space, and the entrance swap
+// (where the *mover* is the peg displaced) silently reported none at all.
 
 // Winner detection. In classic mode returns the first player with all pegs home.
 // In partner mode returns the winning team index (0 or 1) once both partners have

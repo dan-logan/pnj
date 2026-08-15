@@ -19,6 +19,22 @@
 // silence, which is why people kept asking "wait, what just moved?".
 export const TAUNT_TEXT = '@$#*!';
 
+// A partner bump is the one bump that is a *favour*, so the two pegs involved
+// say so to each other: the peg that got the free ride to its own home entrance
+// thanks the one that shoved it there, which answers back a beat later. Which
+// peg says which is not always the obvious way round — in the entrance swap it
+// is the *mover* that gets carried to its entrance by the partner it landed on,
+// so the mover is the one saying thanks. The engine names both parties on each
+// displacement (`byPlayer`/`byPegIndex`), so neither the exchange nor its
+// direction has to be guessed from the board.
+export const THANKS_TEXT = 'Thanks!';
+export const WELCOME_TEXT = "You're welcome!";
+
+// The reply's beat. Short enough that both bubbles are on screen together for
+// most of their life (they last TAUNT_MS each), long enough to read as an
+// answer rather than as two pegs talking over each other.
+export const REPLY_MS = 650;
+
 // How long an overlay stays up. Long enough to read twice at the slow pace the
 // rest of the pacing table is built around, short enough that it is gone before
 // the next seat plays (the shortest gap between two moves is `fast`'s think
@@ -36,9 +52,10 @@ export const ANNOUNCEMENTS = {
   doublePlay: { kind: 'doublePlay', text: 'Double Play!', color: '#F59E0B' },
 };
 
-// `bumps` / `friendly` are the engine's own diffs (findBumps /
-// findFriendlyBumps); `isJoker` is the one thing they can't tell you, since a
-// joker's effect on the board is indistinguishable from any other bump.
+// `bumps` is the engine's knock-back diff (findBumps) and `friendly` is the
+// friendly half of a move's `displacements`; `isJoker` is the one thing neither
+// can tell you, since a joker's effect on the board is indistinguishable from
+// any other bump.
 //
 // Returned in display order, and a move can legitimately produce all three:
 // a joker onto a partner sitting where an opponent wants to be is a joker, a

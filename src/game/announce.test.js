@@ -1,13 +1,19 @@
 import { describe, it, expect } from 'vitest';
-import { announcementsFor, ANNOUNCEMENTS, TAUNT_TEXT, ANNOUNCE_MS, TAUNT_MS } from './announce.js';
+import {
+  announcementsFor, ANNOUNCEMENTS, TAUNT_TEXT, ANNOUNCE_MS, TAUNT_MS,
+  THANKS_TEXT, WELCOME_TEXT, REPLY_MS,
+} from './announce.js';
 
 const kinds = (result) => result.map(a => a.kind);
 
-// Shapes matching what findBumps / findFriendlyBumps actually return; only the
-// counts matter here, but using the real shape keeps the test honest about
-// where the input comes from.
+// Shapes matching what findBumps and the engine's own `displacements` actually
+// return; only the counts matter here, but using the real shape keeps the test
+// honest about where the input comes from.
 const bump = (player, pegIndex = 0) => ({ player, pegIndex, fromPosition: 10 });
-const friendlyBump = (player, pegIndex = 0) => ({ player, pegIndex, fromPosition: 10, toPosition: 3 });
+const friendlyBump = (player, pegIndex = 0) => ({
+  player, pegIndex, fromPosition: 10, toPosition: 3,
+  friendly: true, byPlayer: 0, byPegIndex: 0,
+});
 
 describe('announcementsFor', () => {
   it('says nothing about an ordinary move', () => {
@@ -53,5 +59,19 @@ describe('announcementsFor', () => {
     expect(ANNOUNCE_MS).toBeGreaterThanOrEqual(1000);
     expect(TAUNT_MS).toBeGreaterThanOrEqual(1000);
     expect(TAUNT_TEXT).toBe('@$#*!');
+  });
+});
+
+describe('the partner-bump exchange', () => {
+  it('is a call and an answer', () => {
+    expect(THANKS_TEXT).toBe('Thanks!');
+    expect(WELCOME_TEXT).toBe("You're welcome!");
+  });
+
+  // The reply is a beat, not a second bubble after the first has gone: both
+  // pegs have to be on screen together for the exchange to read as one.
+  it('replies well before the first bubble expires', () => {
+    expect(REPLY_MS).toBeGreaterThan(0);
+    expect(REPLY_MS).toBeLessThan(TAUNT_MS / 2);
   });
 });
