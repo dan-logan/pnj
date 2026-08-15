@@ -30,6 +30,13 @@ export const TAUNT_TEXT = '@$#*!';
 export const THANKS_TEXT = 'Thanks!';
 export const WELCOME_TEXT = "You're welcome!";
 
+// The other half of a knock-back. The victim has always had the last word
+// ("@$#*!") while the peg that did it stood there innocently, which reads as
+// something that happened *to* a peg rather than something a peg *did*. The
+// culprit gets to gloat, a beat after the complaint, so the two read as an
+// exchange between two pegs rather than one peg sulking on its own.
+export const GLOAT_TEXT = 'Hee hee!';
+
 // The reply's beat. Short enough that both bubbles are on screen together for
 // most of their life (they last TAUNT_MS each), long enough to read as an
 // answer rather than as two pegs talking over each other.
@@ -60,6 +67,18 @@ export const ANNOUNCEMENTS = {
 // Returned in display order, and a move can legitimately produce all three:
 // a joker onto a partner sitting where an opponent wants to be is a joker, a
 // partner bump and a cascade at once.
+// A play with more than one moving part — the ones that are hard to follow and
+// that therefore earn the extra emphasis: the joker's card and peg flight, the
+// slowed fly-back, and the pause afterwards (SPECIAL_PAUSE_MS in anim.js).
+//
+// Deliberately wider than `announcementsFor`: an ordinary knock-back raises no
+// banner (you can see the peg fly, so it needs no caption) but is absolutely a
+// play worth a beat to take in, since a peg has just been sent the length of
+// the board back to where it started.
+export function isSpecialPlay({ bumps = [], friendly = [], isJoker = false } = {}) {
+  return isJoker || bumps.length > 0 || friendly.length > 0;
+}
+
 export function announcementsFor({ bumps = [], friendly = [], isJoker = false } = {}) {
   const out = [];
   if (isJoker) out.push(ANNOUNCEMENTS.joker);

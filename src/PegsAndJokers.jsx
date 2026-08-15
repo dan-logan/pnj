@@ -90,12 +90,14 @@ import { syncAppBadge } from './badge.js';
 import { diffPegEvents } from './game/events.js';
 import {
   announcementsFor,
+  isSpecialPlay,
   ANNOUNCEMENTS,
   ANNOUNCE_MS,
   TAUNT_MS,
   TAUNT_TEXT,
   THANKS_TEXT,
   WELCOME_TEXT,
+  GLOAT_TEXT,
   REPLY_MS,
 } from './game/announce.js';
 import {
@@ -106,8 +108,11 @@ import {
   loadSpeed,
   saveSpeed,
   stageBumpFlights,
+  specialPlayHoldMs,
   BUMP_FLY_STEPS,
   BUMP_FLY_TICK_MS,
+  JOKER_CARD_MS,
+  JOKER_CARD_HOLD_MS,
 } from './anim.js';
 
 // Instant-replay pacing. Deliberately slower than the live step so a round of
@@ -447,6 +452,22 @@ export default function PegsAndJokers() {
       text: TAUNT_TEXT,
       spot: { area: 'start', pegIndex },
       onShow: () => sfx.grumble(player),
+    });
+  }, [showBubble]);
+
+  // The other half of a knock-back: the peg that did it, sniggering from
+  // wherever the move left it. A beat after the victim's "@$#*!", so the two
+  // read as an exchange — and skipped entirely when the culprit can't be placed
+  // on the board (a come-out bump by a peg still being drawn, say), since a
+  // bubble with nothing under it is worse than no bubble.
+  const showGloat = useCallback((bumper) => {
+    if (!bumper) return;
+    showBubble({
+      player: bumper.player,
+      text: GLOAT_TEXT,
+      spot: { area: 'track', position: bumper.position },
+      delayMs: REPLY_MS,
+      onShow: () => sfx.snicker(bumper.player),
     });
   }, [showBubble]);
 
@@ -810,6 +831,12 @@ export default function PegsAndJokers() {
     setBumpFx(null);
     if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
     if (bumpHoldRef.current) { clearTimeout(bumpHoldRef.current); bumpHoldRef.current = null; }
+    // The board hold outlives its move by seconds now (a joker's whole sequence
+    // runs on it), so a game switch has to cancel it like every other timer —
+    // otherwise it fires into the adopted game and blanks its played card.
+    if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
+    arrivalTimersRef.current.forEach(clearTimeout);
+    arrivalTimersRef.current = [];
     clearAnnouncements();
 
     // Restore per-game stat tallies so a resumed game still records correctly.
@@ -1425,6 +1452,34 @@ export default function PegsAndJokers() {
     return path.length > 1 ? (path.length - 1) * pacing.stepMs : 0;
   }, [animationsEnabled, pacing.stepMs]);
 
+  // Hold the board — nothing else may start moving — for `ms`, then let go and
+  // clear the played card. The one mechanism behind three different waits: the
+  // settle beat after a move, the extra two seconds a special play earns
+  // (SPECIAL_PAUSE_MS), and the joker's whole card-and-flight sequence, which
+  // has no peg travel of its own to hold anything.
+  //
+  // A `visualBusy` left true is a game that never takes another turn, so this
+  // reuses `settleTimerRef` rather than adding a fourth timer: every path that
+  // can strand it (endGame, new game, clearBoard, adopting a save, unmount)
+  // already clears that one.
+  const holdBoard = useCallback((ms) => {
+    if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
+    // A hold of nothing still has to *let go*: at the `fast` pace there is no
+    // settle beat at all, and returning early here would leave the board busy
+    // for ever — see the note above about a stranded `visualBusy`.
+    if (!(ms > 0)) {
+      setNowPlaying(null);
+      setVisualBusy(false);
+      return;
+    }
+    setVisualBusy(true);
+    settleTimerRef.current = setTimeout(() => {
+      settleTimerRef.current = null;
+      setNowPlaying(null);
+      setVisualBusy(false);
+    }, ms);
+  }, []);
+
   // Replay the move that was *just committed*, for the eye only. Human turns
   // apply their state synchronously (executeMove and friends validate, apply,
   // publish and hand off in one pass, and unpicking that would put the wire
@@ -1436,7 +1491,7 @@ export default function PegsAndJokers() {
   // `visualBusy` is what keeps it honest — the AI effect will not start a turn
   // while a cosmetic playback is running, so the opponents wait for your peg to
   // finish counting rather than moving over the top of it.
-  const playMoveVisual = useCallback((player, pegIndex, card, amount, fromPegs, meta = null) => {
+  const playMoveVisual = useCallback((player, pegIndex, card, amount, fromPegs, meta = null, extraHoldMs = 0) => {
     if (!animationsEnabled) return;
     const path = calculateMovePath(player, pegIndex, card, amount, fromPegs);
     if (!path.length) return;
@@ -1446,14 +1501,13 @@ export default function PegsAndJokers() {
     if (meta) showNowPlaying({ ...meta, lifeMs: (path.length - 1) * pacing.stepMs + pacing.settleMs });
     animateMove(player, pegIndex, card, amount, fromPegs, () => {
       // Hold the "now playing" banner through the settle beat, so the card that
-      // was played is still on screen when the peg stops.
-      settleTimerRef.current = setTimeout(() => {
-        settleTimerRef.current = null;
-        setNowPlaying(null);
-        setVisualBusy(false);
-      }, pacing.settleMs);
+      // was played is still on screen when the peg stops — and through
+      // `extraHoldMs` on top of that when the move was a special one, so the
+      // bumped peg finishes its flight and the player gets a moment with the
+      // result before an opponent starts moving.
+      holdBoard(pacing.settleMs + extraHoldMs);
     });
-  }, [animationsEnabled, animateMove, pacing.stepMs, pacing.settleMs, showNowPlaying]);
+  }, [animationsEnabled, animateMove, pacing.stepMs, pacing.settleMs, showNowPlaying, holdBoard]);
 
   // Fly every peg a move displaced, from the space it was on to wherever the
   // bump sent it. `items` is [{ player, pegIndex, from, to, kind, onImpact }]
@@ -1477,12 +1531,16 @@ export default function PegsAndJokers() {
   // *finishes*: what a peg has to say belongs over where it comes to rest, and
   // at impact it is still in mid-air. It carries the "@$#*!" of a knock-back and
   // the "Thanks!"/"You're welcome!" of a partner bump.
-  const runBumpFx = useCallback((items, holdMs = 0) => {
+  // `leadCount` items fly alone and are *finished* before the rest set off (see
+  // stageBumpFlights): the joker's own peg has to land on the space it is
+  // taking before the peg standing there can be knocked off it. Every other
+  // move passes 0 and gets the overlapping cascade it always had.
+  const runBumpFx = useCallback((items, holdMs = 0, leadCount = 0) => {
     if (!items || items.length === 0) return;
     if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
     if (bumpHoldRef.current) { clearTimeout(bumpHoldRef.current); bumpHoldRef.current = null; }
 
-    const { startTicks, totalTicks } = stageBumpFlights(items.length);
+    const { startTicks, totalTicks } = stageBumpFlights(items.length, leadCount);
     const staged = items.map((item, i) => ({ ...item, startTick: startTicks[i] }));
 
     // Everything that begins or ends on this tick. Split out so the last tick
@@ -1730,7 +1788,18 @@ export default function PegsAndJokers() {
   // it — badly wrong at the slow pace this whole change exists to support. So
   // it defers *every* consequence of the move (arrival chimes, the bump sound
   // and the bumped peg's fly-back) to the moment the mover actually lands.
-  const triggerMoveEffects = useCallback((oldPegs, updatedPegs, mover, displacements = [], landingDelayMs = 0) => {
+  //
+  // `joker` is `{ player, pegIndex }` for the peg a joker moves, and null for
+  // every other card. It has to be told, not diffed: a joker's peg simply
+  // appears on a space the other side of the board with no path between, which
+  // is exactly why the card needs its own flight here rather than the empty
+  // `calculateMovePath` every other part of the UI gets from it.
+  //
+  // Returns the extra hold the *board* needs after these effects start, before
+  // the next play may begin — 0 for an ordinary move, and for a special one
+  // (see isSpecialPlay) the flights plus SPECIAL_PAUSE_MS. Every caller owns a
+  // `visualBusy` hold already; this is what to add to it.
+  const triggerMoveEffects = useCallback((oldPegs, updatedPegs, mover, displacements = [], landingDelayMs = 0, { joker = null } = {}) => {
     const bumps = findBumps(oldPegs, updatedPegs);
     // No mode check needed: the engine only ever produces a friendly
     // displacement under the partner rule.
@@ -1764,7 +1833,7 @@ export default function PegsAndJokers() {
       }
     }
 
-    if (bumps.length === 0 && friendly.length === 0) return;
+    if (!joker && bumps.length === 0 && friendly.length === 0) return 0;
 
     // Tally bumps for stats, per seat — not gated on `ownsSeat`. That gate is
     // exactly the bug the per-seat restructure exists to fix: a bump an AI
@@ -1804,6 +1873,17 @@ export default function PegsAndJokers() {
       const peg = updatedPegs[player]?.[pegIndex];
       return peg && peg.location === 'track' ? { player, position: peg.position } : null;
     };
+    // Who knocked this peg back, so it can be answered from wherever the move
+    // left it. The engine names the culprit on every displacement it logs
+    // (`byPlayer`/`byPegIndex`), including the ordinary knock-backs the UI
+    // otherwise diffs — so the gloat needs no guessing, and a bump with no
+    // logged displacement (a legacy caller, an adopted board) simply gets none.
+    const bumperOf = (b) => {
+      const d = (displacements ?? []).find(
+        x => !x.friendly && x.player === b.player && x.pegIndex === b.pegIndex && x.byPlayer !== null
+      );
+      return d ? restingSpot(d.byPlayer, d.byPegIndex) : null;
+    };
     const fxItems = [
       ...friendly.map(fb => ({
         player: fb.player,
@@ -1824,9 +1904,52 @@ export default function PegsAndJokers() {
         to: getStartAreaPosition(b.player, b.pegIndex),
         kind: 'start',
         onImpact: () => (ownsSeat(b.player) ? sfx.bumpReceived() : sfx.bumpDelivered()),
-        onLand: () => showBumpTaunt(b.player, b.pegIndex),
+        // Both sides of it: the peg that was sent home swears, and the peg that
+        // sent it there snickers back a beat later.
+        onLand: () => { showBumpTaunt(b.player, b.pegIndex); showGloat(bumperOf(b)); },
       })),
     ];
+
+    // The joker's own peg, flying to the space it is taking. Every other card
+    // moves its peg along the track a space at a time; this one crosses the
+    // board in one jump with no path to draw, so without a flight of its own
+    // the only visible evidence a joker was played is that the board has
+    // silently changed shape. It leads the chain: it has to *land* before the
+    // peg standing there can be knocked off (hence `leadCount` below), which is
+    // also the order the rules describe it in.
+    //
+    // Skipped when the joker's peg is already flying as a displacement of its
+    // own — the partner entrance swap, where the mover is the peg that gets
+    // carried off. Drawing it twice is exactly the "two of the same peg" bug
+    // `isPegAnimating` exists to prevent.
+    const jokerAlreadyFlying = joker && fxItems.some(
+      it => it.player === joker.player && it.pegIndex === joker.pegIndex
+    );
+    const anchorOf = (pegState, player, pegIndex) => {
+      if (!pegState) return null;
+      if (pegState.location === 'track') return getTrackPosition(pegState.position);
+      if (pegState.location === 'start') return getStartAreaPosition(player, pegIndex);
+      if (pegState.location === 'home') return getHomePosition(player, pegState.homePosition);
+      return null;
+    };
+    if (joker && !jokerAlreadyFlying) {
+      const from = anchorOf(oldPegs[joker.player]?.[joker.pegIndex], joker.player, joker.pegIndex);
+      const to = anchorOf(updatedPegs[joker.player]?.[joker.pegIndex], joker.player, joker.pegIndex);
+      if (from && to) {
+        fxItems.unshift({
+          player: joker.player,
+          pegIndex: joker.pegIndex,
+          from,
+          to,
+          kind: 'joker',
+          // No sound of its own: the cackle is already playing over the card,
+          // and the peg's arrival is immediately followed by the bump it causes.
+          onImpact: null,
+          onLand: null,
+        });
+      }
+    }
+    const leadCount = fxItems[0]?.kind === 'joker' ? 1 : 0;
 
     // "Partner Bump!" and "Double Play!", on the same landing delay as the
     // sound: both describe something the board is about to do, and a banner
@@ -1834,20 +1957,33 @@ export default function PegsAndJokers() {
     // banner about the *previous* move.
     announce(announcementsFor({ bumps, friendly }), landingDelayMs);
 
+    // How long all this takes, and therefore how long the board is held before
+    // the next play may start. A special play gets the flights plus a full
+    // two seconds of nothing afterwards (anim.js): these are the moves with
+    // more than one moving part, and rolling straight from one into the next
+    // opponent's turn is how they get missed.
+    const { totalTicks } = stageBumpFlights(fxItems.length, leadCount);
+    const special = isSpecialPlay({ bumps, friendly, isJoker: joker != null });
+
     // With animations off there is no travel to be out of step with, so the
     // impact is now. The bubbles still show: they are feedback, not travel, and
     // this is precisely the setting where a peg vanishes from the track and
-    // reappears somewhere else with nothing in between.
+    // reappears somewhere else with nothing in between. Nothing is held either:
+    // a player who has turned animations off is asking for none of this.
     if (!animationsEnabled) {
-      for (const item of fxItems) { item.onImpact(); item.onLand(); }
-      return;
+      for (const item of fxItems) {
+        if (item.onImpact) item.onImpact();
+        if (item.onLand) item.onLand();
+      }
+      return 0;
     }
 
     // `runBumpFx` holds the pegs where they are for `landingDelayMs` and fires
     // each one's sound as its own flight starts, so the whole cascade happens
     // when the mover arrives, not before.
-    runBumpFx(fxItems, landingDelayMs);
-  }, [animationsEnabled, runBumpFx, ownsSeat, announce, showBumpTaunt, showPartnerThanks]);
+    runBumpFx(fxItems, landingDelayMs, leadCount);
+    return specialPlayHoldMs({ special, totalTicks });
+  }, [animationsEnabled, runBumpFx, ownsSeat, announce, showBumpTaunt, showGloat, showPartnerThanks]);
 
   // `owner` is whose peg moves (your partner once you are all home); you always
   // act as your own seat, so the hand, discards and turn are yours.
@@ -1922,11 +2058,14 @@ export default function PegsAndJokers() {
     // is delayed to match it, so the "peg is home" note and the knock-back both
     // land when the peg does.
     const travelMs = landingDelayFor(owner, pegIndex, card, splitAmount, pegs);
-    triggerMoveEffects(pegs, newPegs, actor, displacements, travelMs);
+    // A move that bumps something holds the board past its own settle beat —
+    // long enough for the bumped peg to finish flying, and then two seconds of
+    // stillness to take in what just happened.
+    const specialHoldMs = triggerMoveEffects(pegs, newPegs, actor, displacements, travelMs);
     sfx.cardPlay();
     playMoveVisual(owner, pegIndex, card, splitAmount, pegs, {
       player: actor, card, description: moveDescription,
-    });
+    }, specialHoldMs);
 
     const updatedLastMoves = [...lastMoves];
     updatedLastMoves[actor] = moveDescription;
@@ -2056,11 +2195,11 @@ export default function PegsAndJokers() {
     const splitDescription = `Split: ${lastMoves[actor]}, ${secondMoveDesc}`;
 
     const travelMs = landingDelayFor(owner, pegIndex, splitCard, amount, pegs);
-    triggerMoveEffects(pegs, newPegs, actor, displacements, travelMs);
+    const specialHoldMs = triggerMoveEffects(pegs, newPegs, actor, displacements, travelMs);
     sfx.cardPlay();
     playMoveVisual(owner, pegIndex, splitCard, amount, pegs, {
       player: actor, card: splitCard, description: secondMoveDesc,
-    });
+    }, specialHoldMs);
 
     const updatedLastMoves = [...lastMoves];
     updatedLastMoves[actor] = splitDescription;
@@ -2217,7 +2356,10 @@ export default function PegsAndJokers() {
       recordReplayFrame(discardFrame);
     }
 
-    if (autoStarted) triggerMoveEffects(pegs, newPegs, player, startDisplacements);
+    // A forced come-out can land on somebody, and a bump is a bump however it
+    // was caused: hold the board through the fly-back and the pause after it,
+    // the same as any other special play.
+    if (autoStarted) holdBoard(triggerMoveEffects(pegs, newPegs, player, startDisplacements));
 
     setPegs(newPegs);
     setHands(newHands);
@@ -2252,7 +2394,7 @@ export default function PegsAndJokers() {
       setCurrentPlayer(nextPlayer);
       aiProcessingRef.current = false; // Allow the next AI seat to process
     }
-  }, [hands, deck, discardPiles, stuckCounts, pegs, lastMoves, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, commitTurn]);
+  }, [hands, deck, discardPiles, stuckCounts, pegs, lastMoves, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, commitTurn, holdBoard]);
 
   // AI logic - drives the AI seats this client is responsible for.
   //
@@ -2293,16 +2435,30 @@ export default function PegsAndJokers() {
       aiTimerRef.current = null;
       const aiHand = hands[aiPlayer];
 
-      // Helper function to complete AI move
-      const completeAIMove = (newPegs, card, moveDescription, displacements = []) => {
+      // Helper function to complete AI move.
+      //
+      // `joker` is `{ player, pegIndex }` when the move was a joker, and null
+      // otherwise — the one move whose effects don't start when this is called:
+      // its card is thrown up over the board first and everything waits on it
+      // (see the human joker site for the sequence).
+      const completeAIMove = (newPegs, card, moveDescription, displacements = [], joker = null) => {
         // Record last move description for AI
         const updatedLastMoves = [...lastMoves];
         updatedLastMoves[aiPlayer] = moveDescription;
         setLastMoves(updatedLastMoves);
 
         // No landing delay: an AI move calls this *after* its peg has finished
-        // gliding, so the chimes and the bump are already in time with the board.
-        triggerMoveEffects(pegs, newPegs, aiPlayer, displacements);
+        // gliding, so the chimes and the bump are already in time with the
+        // board. A joker is the exception — nothing has travelled yet, and its
+        // card is still throbbing over the middle of the board.
+        // A silent catch-up simulation (remote) shows none of this and must not
+        // be slowed down by it — it is racing to get to the auto-replay, which
+        // is what the player actually watches.
+        const showJoker = joker != null && !silent;
+        const jokerDelay = showJoker && animationsEnabled ? JOKER_CARD_HOLD_MS : 0;
+        const specialHoldMs = triggerMoveEffects(
+          pegs, newPegs, aiPlayer, displacements, jokerDelay, { joker: showJoker ? joker : null },
+        );
         sfx.peg();
 
         setPegs(newPegs);
@@ -2360,13 +2516,12 @@ export default function PegsAndJokers() {
         // a moment before the next seat starts thinking, so a run of three AI
         // turns reads as three separate events instead of one blur. The next
         // turn is gated on `visualBusy`, so this is the whole mechanism.
-        if (!silent && pacing.settleMs > 0) {
-          setVisualBusy(true);
-          settleTimerRef.current = setTimeout(() => {
-            settleTimerRef.current = null;
-            setNowPlaying(null);
-            setVisualBusy(false);
-          }, pacing.settleMs);
+        //
+        // A special play adds its flights and its two seconds on top (and a
+        // joker its card, which hasn't even dropped yet): the opponent after a
+        // bump should be watching the same thing you are, not already moving.
+        if (!silent) {
+          holdBoard(pacing.settleMs + jokerDelay + specialHoldMs);
         } else {
           setNowPlaying(null);
         }
@@ -2435,13 +2590,18 @@ export default function PegsAndJokers() {
           segments: replaySegments,
         });
 
-        if (bestMove.type === 'joker') {
+        const jokerPeg = bestMove.type === 'joker' ? { player: owner, pegIndex: bestMove.pegIndex } : null;
+        if (jokerPeg) {
           jokersPlayedRef.current[aiPlayer] += 1;
           // Same as the human joker site: nothing travels, so the only way to
-          // know a joker was played is to be told. Skipped for a silent
-          // catch-up simulation, exactly like `nowPlaying` below — that run
-          // isn't being watched; the auto-replay afterwards is.
-          if (!silent) announce([ANNOUNCEMENTS.joker]);
+          // know a joker was played is to be told — the banner, the cackle, and
+          // the card left throbbing over the board before the peg sets off.
+          // Skipped for a silent catch-up simulation, exactly like `nowPlaying`
+          // below — that run isn't being watched; the auto-replay afterwards is.
+          if (!silent) {
+            announce([ANNOUNCEMENTS.joker]);
+            sfx.evilLaugh();
+          }
         }
 
         // Say who is moving and what they played, over the board, for as long
@@ -2456,7 +2616,10 @@ export default function PegsAndJokers() {
           );
           showNowPlaying({
             player: aiPlayer, card: bestMove.card, description: moveDescription,
-            lifeMs: travelMs + pacing.settleMs,
+            // A joker's card is the move: it holds centre-board for its own
+            // fixed span (and animates differently — see renderPlayedCard)
+            // rather than being scaled to travel it doesn't have.
+            lifeMs: jokerPeg ? JOKER_CARD_MS : travelMs + pacing.settleMs,
           });
         }
 
@@ -2464,7 +2627,7 @@ export default function PegsAndJokers() {
         // (Package 5 — remote, running ahead of the auto-replay), complete
         // immediately with no per-peg animation.
         if (!animationsEnabled || silent) {
-          if (completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, displacements)) return;
+          if (completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, displacements, jokerPeg)) return;
           return;
         }
 
@@ -2487,8 +2650,9 @@ export default function PegsAndJokers() {
             });
           });
         } else if (bestMove.type === 'joker') {
-          // Joker - just complete (animation path is empty for jokers)
-          completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, displacements);
+          // Joker — no glide to run (its path is empty by construction); the
+          // card, the peg's flight and the bump all sequence off completeAIMove.
+          completeAIMove(bestMove.newPegs, bestMove.card, moveDescription, displacements, jokerPeg);
         }
         return;
       }
@@ -2506,7 +2670,7 @@ export default function PegsAndJokers() {
       if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, announce, showNowPlaying, landingDelayFor]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, announce, showNowPlaying, landingDelayFor, holdBoard]);
 
   // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
@@ -2824,12 +2988,26 @@ export default function PegsAndJokers() {
     setLastMoves(updatedLastMoves);
 
     jokersPlayedRef.current[actor] += 1;
-    // A joker is the one card with nothing to watch — its animation path is
-    // empty by construction, so the board simply rearranges itself. Say so.
-    // (`triggerMoveEffects` adds "Partner Bump!" / "Double Play!" if this joker
-    // was also one of those; there is no landing delay to defer to here.)
+    // The joker's moment, and the one card that has to make its own. Its
+    // animation path is empty by construction — the peg simply appears the
+    // other side of the board — so instead: the card itself, dealt face-up over
+    // the middle of the board and left there throbbing with a cackle over it
+    // (JOKER_CARD_HOLD_MS), and only then the peg, pulsing, flying across to the
+    // space it is taking, and only then the peg it knocks off.
+    //
+    // Everything after the card is `triggerMoveEffects`' business: it is handed
+    // the joker's peg so it can lead the flight chain, and the card's hold as
+    // the delay before any of it starts.
     announce([ANNOUNCEMENTS.joker]);
-    triggerMoveEffects(pegs, newPegs, actor, displacements);
+    sfx.evilLaugh();
+    showNowPlaying({ player: actor, card, description: jokerDescription, lifeMs: JOKER_CARD_MS });
+    const jokerDelay = animationsEnabled ? JOKER_CARD_HOLD_MS : 0;
+    const specialHoldMs = triggerMoveEffects(pegs, newPegs, actor, displacements, jokerDelay, {
+      joker: { player: owner, pegIndex: jokerSourcePeg },
+    });
+    // Nothing else animates, so this hold *is* the joker's animation: the card,
+    // the flights, and then the pause before the next seat plays.
+    holdBoard(jokerDelay + specialHoldMs);
 
     setPegs(newPegs);
 
@@ -3093,7 +3271,15 @@ export default function PegsAndJokers() {
     // Land the card by the time the move ends, but never dawdle over the middle
     // of the board for more than a beat and a half — a peg crossing half the
     // board at the slow pace takes several seconds, and "briefly" is the point.
-    const flightMs = Math.min(PLAYED_CARD_MAX_MS, Math.max(PLAYED_CARD_MIN_MS, lifeMs || 0));
+    //
+    // The joker is the exception, and deliberately breaks both rules: its card
+    // is the only visible part of the move until the peg leaves the ground, so
+    // it holds centre-board for a fixed JOKER_CARD_MS, throbbing (a keyframe of
+    // its own, `pnj-card-joker`), and drops onto the pile exactly as the peg
+    // sets off — the flight is scheduled off the same constant.
+    const flightMs = isJoker
+      ? JOKER_CARD_MS
+      : Math.min(PLAYED_CARD_MAX_MS, Math.max(PLAYED_CARD_MIN_MS, lifeMs || 0));
 
     const left = PLAYED_CARD.cx - PLAYED_CARD.w / 2;
     const top = PLAYED_CARD.cy - PLAYED_CARD.h / 2;
@@ -3113,20 +3299,35 @@ export default function PegsAndJokers() {
         {card && (
           <g
             key={`card-${id}`}
-            className="pnj-card-play"
+            className={isJoker ? 'pnj-card-joker' : 'pnj-card-play'}
             style={{
               '--pnj-card-dx': `${dx}px`,
               '--pnj-card-dy': `${dy}px`,
               animationDuration: `${flightMs}ms`,
-              filter: 'drop-shadow(0 3px 5px rgba(0,0,0,0.65))',
+              filter: isJoker
+                ? 'drop-shadow(0 0 10px rgba(168, 85, 247, 0.95)) drop-shadow(0 3px 5px rgba(0,0,0,0.65))'
+                : 'drop-shadow(0 3px 5px rgba(0,0,0,0.65))',
             }}
           >
             <rect
               x={left} y={top} width={PLAYED_CARD.w} height={PLAYED_CARD.h}
-              rx="4" fill="white" stroke={colour} strokeWidth="3"
+              rx="4" fill="white"
+              stroke={isJoker ? ANNOUNCEMENTS.joker.color : colour}
+              strokeWidth={isJoker ? 4 : 3}
             />
             {isJoker ? (
-              <text x={PLAYED_CARD.cx} y={top + 40} textAnchor="middle" fontSize="26">🃏</text>
+              <>
+                {/* Bigger than the rank-and-suit of an ordinary card, and in
+                    the joker's own purple: at a glance across a table, the
+                    shape and colour are what say "this is the bad one". */}
+                <text x={PLAYED_CARD.cx} y={top + 38} textAnchor="middle" fontSize="30">🃏</text>
+                <text
+                  x={PLAYED_CARD.cx} y={top + 54} textAnchor="middle"
+                  fill={ANNOUNCEMENTS.joker.color} fontSize="10" fontWeight="bold"
+                >
+                  JOKER
+                </text>
+              </>
             ) : (
               <>
                 <text x={PLAYED_CARD.cx} y={top + 30} textAnchor="middle" fill={ink} fontSize="22" fontWeight="bold">
@@ -4192,24 +4393,41 @@ export default function PegsAndJokers() {
                 const t = 1 - Math.pow(1 - p, 3); // ease-out
                 const x = item.from.x + (item.to.x - item.from.x) * t;
                 const y = item.from.y + (item.to.y - item.from.y) * t;
-                // Friendly partner bumps fly forward (green); knock-backs fly to start (red).
-                const glow = item.kind === 'friendly' ? '#22C55E' : '#EF4444';
-                const shadow = item.kind === 'friendly'
-                  ? 'drop-shadow(0 0 4px rgba(34, 197, 94, 0.9))'
-                  : 'drop-shadow(0 0 4px rgba(239, 68, 68, 0.9))';
-                // Waiting its turn (or held before impact) — still an ordinary peg.
-                const waiting = bumpFx.holding || bumpFx.tick < item.startTick;
+                // The joker's own peg is the one item here that is *making* the
+                // move rather than suffering it, so it gets the card's purple
+                // and is lit from the moment the card lands — the whole point
+                // is to know which peg to watch before it moves. Friendly
+                // partner bumps fly forward (green); knock-backs fly to start
+                // (red), and neither is coloured until it is actually hit.
+                const isJokerPeg = item.kind === 'joker';
+                const glow = isJokerPeg
+                  ? ANNOUNCEMENTS.joker.color
+                  : (item.kind === 'friendly' ? '#22C55E' : '#EF4444');
+                const shadow = isJokerPeg
+                  ? 'drop-shadow(0 0 6px rgba(168, 85, 247, 0.95))'
+                  : (item.kind === 'friendly'
+                    ? 'drop-shadow(0 0 4px rgba(34, 197, 94, 0.9))'
+                    : 'drop-shadow(0 0 4px rgba(239, 68, 68, 0.9))');
+                // Waiting its turn (or held before impact) — still an ordinary
+                // peg, unless it is the joker's, which pulses on its own space
+                // for the whole time the card is throbbing over the board.
+                const waiting = !isJokerPeg && (bumpFx.holding || bumpFx.tick < item.startTick);
                 return (
-                  <circle
-                    key={`bumpfx-${item.player}-${item.pegIndex}`}
-                    cx={x}
-                    cy={y}
-                    r={7}
-                    fill={PLAYER_COLORS[item.player]}
-                    stroke={waiting ? '#1F2937' : glow}
-                    strokeWidth={waiting ? 1 : 2}
-                    style={waiting ? undefined : { filter: shadow }}
-                  />
+                  <g key={`bumpfx-${item.player}-${item.pegIndex}`}>
+                    {isJokerPeg && (
+                      <circle cx={x} cy={y} r={13} fill={glow} opacity={0.3} className="joker-peg" />
+                    )}
+                    <circle
+                      cx={x}
+                      cy={y}
+                      r={isJokerPeg ? 8 : 7}
+                      fill={PLAYER_COLORS[item.player]}
+                      stroke={waiting ? '#1F2937' : glow}
+                      strokeWidth={waiting ? 1 : (isJokerPeg ? 3 : 2)}
+                      style={waiting ? undefined : { filter: shadow }}
+                      className={isJokerPeg ? 'joker-peg' : undefined}
+                    />
+                  </g>
                 );
               })}
 
