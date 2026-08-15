@@ -50,3 +50,43 @@
   transform-box: fill-box;
   transform-origin: bottom center;
 }
+
+/* The card being played: dealt over the middle of the board, held long enough
+   to read, then shrunk away onto its owner's discard pile — which is where it
+   really goes, so the eye follows it there instead of the card simply
+   appearing in a corner. The destination is per-seat (and rotates with the
+   board), so it arrives as a custom property in *user units* — a CSS transform
+   on an SVG element is in the viewBox's own coordinates, which is what keeps
+   this correct at every screen size without measuring anything.
+
+   `transform-box: view-box` with the origin at the card's centre, so the
+   shrink pulls toward the card rather than the corner of the board — that
+   origin is PLAYED_CARD.cx/cy in PegsAndJokers.jsx, which CSS can't read, so
+   the two have to be changed together. */
+@keyframes pnj-card-play {
+  0%   { opacity: 0; transform: translate(0, 0) scale(0.6); }
+  10%  { opacity: 1; transform: translate(0, 0) scale(1.08); }
+  18%  { opacity: 1; transform: translate(0, 0) scale(1); }
+  62%  { opacity: 1; transform: translate(0, 0) scale(1); }
+  100% { opacity: 0; transform: translate(var(--pnj-card-dx, 0), var(--pnj-card-dy, 0)) scale(0.34); }
+}
+
+/* The duration is set inline, per move: it is scaled to how long that move is
+   actually on screen, so the card always reaches the pile instead of being
+   unmounted in mid-air. This value is only the fallback. */
+.pnj-card-play {
+  animation: pnj-card-play 900ms cubic-bezier(0.2, 0.7, 0.3, 1) forwards;
+  transform-box: view-box;
+  transform-origin: 200px 140px;
+}
+
+/* Who moved and what the move did. Unlike the card, this doesn't fly off: it
+   holds for as long as the peg is travelling, and goes when the move does. */
+@keyframes pnj-card-caption {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.pnj-card-caption {
+  animation: pnj-card-caption 220ms ease-out both;
+}
