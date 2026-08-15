@@ -40,6 +40,36 @@ export function isSpeed(value) {
   return Object.prototype.hasOwnProperty.call(SPEED_SETTINGS, value);
 }
 
+// The bumped-peg fly-back, which is its own little animation: a peg knocked
+// off the track arcs to wherever the bump sent it over `BUMP_FLY_STEPS` ticks.
+// It is not tied to the speed setting — it is impact feedback, not travel you
+// are meant to count, and it only runs at all when animations are on.
+//
+// One card can displace more than one peg (a partner bump onto an entrance an
+// opponent is sitting on sends the partner forward *and* the opponent home),
+// and all of them fly from the same interval. They are staggered rather than
+// simultaneous: a cascade is causal — this peg moved *because* that one did —
+// and two pegs setting off together in different directions loses that, which
+// is precisely the "which one was I supposed to be watching?" problem the
+// Double Play! banner exists for. The stagger is deliberately shorter than a
+// flight, so the chain overlaps and reads as one event rather than a queue.
+export const BUMP_FLY_STEPS = 14;
+export const BUMP_FLY_TICK_MS = 40;
+export const BUMP_FLY_STAGGER = 6;
+
+// Tick offsets for `count` pegs flying off one move, and the tick at which the
+// last of them lands (when the whole effect can be torn down). With one peg
+// this is exactly the single-peg animation it replaced: starts at 0, ends at
+// BUMP_FLY_STEPS.
+export function stageBumpFlights(count) {
+  const startTicks = [];
+  for (let i = 0; i < count; i++) startTicks.push(i * BUMP_FLY_STAGGER);
+  return {
+    startTicks,
+    totalTicks: count > 0 ? startTicks[count - 1] + BUMP_FLY_STEPS : 0,
+  };
+}
+
 export function settingsFor(speed) {
   return SPEED_SETTINGS[speed] ?? SPEED_SETTINGS[DEFAULT_SPEED];
 }

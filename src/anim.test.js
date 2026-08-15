@@ -12,6 +12,9 @@ import {
   nextSpeed,
   loadSpeed,
   saveSpeed,
+  stageBumpFlights,
+  BUMP_FLY_STEPS,
+  BUMP_FLY_STAGGER,
 } from './anim.js';
 
 const fakeStorage = (initial = {}) => {
@@ -102,5 +105,34 @@ describe('animation speeds', () => {
     };
     expect(loadSpeed(hostile)).toBe(DEFAULT_SPEED);
     expect(() => saveSpeed('fast', hostile)).not.toThrow();
+  });
+});
+
+describe('bump fly-back staging', () => {
+  it('is unchanged for the single-peg bump it replaced', () => {
+    const { startTicks, totalTicks } = stageBumpFlights(1);
+    expect(startTicks).toEqual([0]);
+    expect(totalTicks).toBe(BUMP_FLY_STEPS);
+  });
+
+  it('staggers a cascade so the second peg follows the first', () => {
+    const { startTicks, totalTicks } = stageBumpFlights(2);
+    expect(startTicks).toEqual([0, BUMP_FLY_STAGGER]);
+    // The effect must live until the *last* peg has landed — tearing down at
+    // BUMP_FLY_STEPS would strand the second peg in mid-air and pop it to its
+    // destination.
+    expect(totalTicks).toBe(BUMP_FLY_STAGGER + BUMP_FLY_STEPS);
+    expect(totalTicks).toBeGreaterThan(BUMP_FLY_STEPS);
+  });
+
+  it('overlaps the flights rather than queueing them', () => {
+    // A chain should read as one event. If the stagger were >= a full flight,
+    // the second peg would only set off once the first had stopped, which
+    // reads as two separate bumps.
+    expect(BUMP_FLY_STAGGER).toBeLessThan(BUMP_FLY_STEPS);
+  });
+
+  it('has nothing to stage for no bumps', () => {
+    expect(stageBumpFlights(0)).toEqual({ startTicks: [], totalTicks: 0 });
   });
 });
