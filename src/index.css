@@ -79,14 +79,3 @@
   transform-box: view-box;
   transform-origin: 200px 140px;
 }
-
-/* Who moved and what the move did. Unlike the card, this doesn't fly off: it
-   holds for as long as the peg is travelling, and goes when the move does. */
-@keyframes pnj-card-caption {
-  from { opacity: 0; }
-  to   { opacity: 1; }
-}
-
-.pnj-card-caption {
-  animation: pnj-card-caption 220ms ease-out both;
-}

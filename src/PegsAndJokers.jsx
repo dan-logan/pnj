@@ -40,7 +40,7 @@ import {
   getNemesis
 } from './game/stats.js';
 import { loadGame, saveGame, clearGame, serializeGame } from './game/persistence.js';
-import { PHASES, derivePhase, describeStatus, describeOutcome, attributeFrameDescription } from './game/status.js';
+import { PHASES, derivePhase, describeStatusParts, describeOutcome, attributeFrameDescription } from './game/status.js';
 import {
   SOLO_SEAT_OWNERS,
   HOST_SEAT_OWNERS,
@@ -2517,18 +2517,40 @@ export default function PegsAndJokers() {
     [winner, isReplaying, dealt, isMyTurn, currentPlayer, seatOwners]
   );
 
-  const statusLine = useMemo(
-    () => describeStatus({
+  // What the move on screen says, folded into the status line. The played card
+  // is still drawn over the board; the *words* live in the status box, which is
+  // where a player is already looking and which costs no layout to change.
+  const statusMove = useMemo(
+    () => (nowPlaying && !isReplaying && winner === null
+      ? {
+          player: nowPlaying.player,
+          card: nowPlaying.card,
+          description: nowPlaying.description,
+          mine: ownsSeat(nowPlaying.player),
+        }
+      : null),
+    [nowPlaying, isReplaying, winner, ownsSeat]
+  );
+
+  const statusParts = useMemo(
+    () => describeStatusParts({
       phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, mode: gameMode,
-      moving: animatingPeg != null,
+      moving: animatingPeg != null, move: statusMove, replay: replayInfo,
     }),
-    [phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, gameMode, animatingPeg]
+    [phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, gameMode, animatingPeg,
+     statusMove, replayInfo]
   );
 
   const outcome = useMemo(
     () => describeOutcome(winner, gameMode, mySeats),
     [winner, gameMode, mySeats]
   );
+
+  // When the 📺 header button does something: your turn has come round, the
+  // game is still running, and there are buffered opponent moves to watch.
+  // (The button itself is always mounted — see the header — so this only
+  // enables it, never adds or removes it.)
+  const replayAvailable = !isReplaying && replayReady > 0 && isMyTurn && winner === null;
 
   // --- Lobby derivations ------------------------------------------------------
   // The lobby rows and the waiting-on-you badge come from a single listener's
@@ -2982,7 +3004,7 @@ export default function PegsAndJokers() {
   // and the discard-pile target follows the board rotation for free.
   const renderPlayedCard = () => {
     if (!nowPlaying || isReplaying || winner !== null) return null;
-    const { id, player, card, description, lifeMs } = nowPlaying;
+    const { id, player, card, lifeMs } = nowPlaying;
     const colour = PLAYER_COLORS[player];
     const isRed = card && (card.suit === '♥' || card.suit === '♦');
     const isJoker = card && card.rank === 'JOKER';
@@ -3002,47 +3024,17 @@ export default function PegsAndJokers() {
     const left = PLAYED_CARD.cx - PLAYED_CARD.w / 2;
     const top = PLAYED_CARD.cy - PLAYED_CARD.h / 2;
 
-    // Who moved and what the move did, on one line *above* the card. It sits in
-    // a solid pill rather than as bare text: the middle of the board is where
-    // the draw and discard piles live, and text laid straight over them reads
-    // as tangled rather than as a caption. Above, because the caption holds for
-    // the whole move while the card leaves after a beat — so the thing that
-    // lingers is the one in clear space, and the thing that covers the piles is
-    // the card that is about to land on them.
-    //
-    // SVG can't size a box to its own text, so the width is estimated from the
-    // string — generous padding, and a smaller face for the long one ("Split:
-    // Space 20 to Space 25, Space 30 to Space 33") so it can't run off the edge.
-    const who = ownsSeat(player) ? 'You' : PLAYER_NAMES[player];
-    const caption = description ? `${who} — ${description}` : who;
-    const capSize = caption.length > 34 ? 10 : 12;
-    const capW = Math.min(346, caption.length * capSize * 0.6 + 26);
-    const capH = capSize + 12;
-    const capTop = top - 10 - capH;
-
+    // The words that used to sit in a pill above this card ("Blue — Space 20 to
+    // Space 25") are now the status line (see `statusMove` / `describeStatusParts`).
+    // The board shows the card; the status box says what it did. Two captions
+    // for one move, one of them floating over the piles in the middle of the
+    // board, was one too many.
     return (
       <svg
         viewBox="0 0 400 400"
         className="pointer-events-none absolute inset-0 w-full h-full z-10"
         aria-hidden="true"
       >
-        {/* The caption holds for as long as the peg is travelling — only the
-            card leaves for the pile. */}
-        <g key={`caption-${id}`} className="pnj-card-caption">
-          <rect
-            x={200 - capW / 2} y={capTop} width={capW} height={capH}
-            rx={capH / 2} fill="#0B1120" opacity="0.94"
-            stroke={colour} strokeWidth="1.5"
-          />
-          <text
-            x="200" y={capTop + capH / 2 + capSize * 0.35} textAnchor="middle"
-            fontSize={capSize}
-          >
-            <tspan fill={colour} fontWeight="bold">{who}</tspan>
-            {description && <tspan fill="#E5E7EB">{` — ${description}`}</tspan>}
-          </text>
-        </g>
-
         {/* The card itself: pops in, holds, then shrinks away onto the pile. */}
         {card && (
           <g
@@ -3770,6 +3762,46 @@ export default function PegsAndJokers() {
               <span className="hidden sm:inline"> Speed:</span>
               {` ${pacing.label}`}
             </button>
+            {/* Instant replay, as a toggle beside the pace control. It is
+                *always* mounted — disabled and dimmed when there is nothing to
+                watch — because as a button that came and went with each turn it
+                pushed the whole board down the screen every time it appeared.
+                While a replay runs it becomes the Stop button, so the playback
+                banner (which did the same thing again, for as long as the
+                replay lasted) is gone too; the progress reads in the status
+                line instead. */}
+            <button
+              onClick={isReplaying ? stopReplay : startReplay}
+              disabled={!isReplaying && !replayAvailable}
+              className={`relative px-2.5 sm:px-3 py-2 rounded text-sm whitespace-nowrap ${
+                isReplaying
+                  ? 'bg-purple-600 hover:bg-purple-700'
+                  : replayAvailable
+                    ? 'bg-purple-700 hover:bg-purple-600'
+                    : 'bg-gray-700 opacity-40 cursor-not-allowed'
+              }`}
+              aria-label={
+                isReplaying
+                  ? 'Stop the instant replay'
+                  : replayAvailable
+                    ? `Instant replay: watch the last ${replayReady} ${replayReady === 1 ? 'move' : 'moves'}`
+                    : 'Instant replay: nothing to replay yet'
+              }
+              title="Instant replay of the moves since your last turn"
+            >
+              {/* ⏹ while it is running: on a phone the label is hidden, and a
+                  lit-up 📺 doesn't say "tap me to stop" on its own. */}
+              <span aria-hidden="true">{isReplaying ? '⏹' : '📺'}</span>
+              {isReplaying && <span className="hidden sm:inline"> Stop</span>}
+              {!isReplaying && replayAvailable && (
+                <span
+                  className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full bg-amber-500 text-xs font-bold text-gray-900"
+                  aria-hidden="true"
+                >
+                  {replayReady}
+                </span>
+              )}
+            </button>
           </div>
           <div className="flex gap-2 items-center w-full sm:w-auto">
             {multiplayerConfigured && (
@@ -3810,8 +3842,27 @@ export default function PegsAndJokers() {
         {/* `aria-live` so a screen reader (or VoiceOver on an iPad, which is
             how a lot of people play) speaks each change of turn instead of the
             player having to notice it. Polite, so it never interrupts. */}
+        {/* Two lines' worth of height is reserved whether or not both are used.
+            This box now carries the move commentary as well as the turn, so it
+            is the one element on the page whose text length changes with every
+            move — left to size itself it would grow and shrink under the board
+            and shove it up and down the screen, which is exactly what the
+            overlays were introduced to stop. Clamped to two lines for the same
+            reason: the longest line in the game (a split, described in full)
+            must not be able to make a third. */}
         <div className="text-center mb-4 p-2 bg-gray-800 rounded" aria-live="polite">
-          <div className="text-base sm:text-lg">{statusLine}</div>
+          <div className="min-h-[3.5rem] flex flex-col items-center justify-center">
+            <div className="text-base sm:text-lg line-clamp-2">
+              {statusParts.prefix && <span className="text-gray-300">{statusParts.prefix} </span>}
+              {statusParts.who && (
+                <span className="font-bold" style={{ color: PLAYER_COLORS[statusParts.player] }}>
+                  {statusParts.who}
+                </span>
+              )}
+              {statusParts.who && statusParts.detail ? ' ' : ''}
+              {statusParts.detail}
+            </div>
+          </div>
           {notice && <div className="text-sm text-amber-300 mt-1">{notice}</div>}
           {phase === PHASES.FINISHED && endOverlayDismissed && (
             <button
@@ -3852,39 +3903,14 @@ export default function PegsAndJokers() {
           </div>
         )}
 
-        {/* Instant replay: offer a rewind when it's your turn and the AI just moved */}
-        {!isReplaying && replayReady > 0 && isMyTurn && winner === null && (
-          <div className="text-center mb-4">
-            <button
-              onClick={startReplay}
-              className="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded font-semibold"
-            >
-              📺 Instant Replay ({replayReady} {replayReady === 1 ? 'move' : 'moves'})
-            </button>
-          </div>
-        )}
-
-        {/* Playback banner while the replay runs */}
-        {isReplaying && replayInfo && (
-          <div className="mb-4 p-3 rounded flex items-center justify-between gap-3 bg-purple-900">
-            <div className="text-sm min-w-0">
-              <span className="font-bold">📺 Instant Replay</span>{' '}
-              <span className="text-gray-300">({replayInfo.index}/{replayInfo.total})</span>
-              <div className="truncate">
-                <span className="font-semibold" style={{ color: PLAYER_COLORS[replayInfo.player] }}>
-                  {PLAYER_NAMES[replayInfo.player]}
-                </span>
-                <span className="text-gray-200"> — {replayInfo.description}</span>
-              </div>
-            </div>
-            <button
-              onClick={stopReplay}
-              className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm flex-shrink-0"
-            >
-              Stop
-            </button>
-          </div>
-        )}
+        {/* The instant-replay button and its playback banner used to live here,
+            between the status box and the board. Both appeared and disappeared
+            on their own schedule — the button the moment your turn came round,
+            the banner for the length of the replay — and each one shoved the
+            board down the screen and pulled it back up again. They are now the
+            📺 toggle in the header (which is always mounted, so it changes
+            nothing about the layout) and the replay's progress is in the status
+            line, alongside everything else that is "what is happening now". */}
 
         <div className="flex flex-col lg:flex-row gap-4 items-center lg:items-start">
           {/* Game Board */}
@@ -4290,20 +4316,10 @@ export default function PegsAndJokers() {
                 appear at the same instant. */}
             {renderPlayedCard()}
 
-            {/* The overlay is drawn, so it says nothing out loud. The move log
-                it replaced was the live region that read each move; this keeps
-                that for a screen reader without occupying a pixel of layout.
-                (`sr-only` is absolutely positioned, so it can't push the board
-                around the way the old box did.) */}
-            <div className="sr-only" aria-live="polite">
-              {nowPlaying && !isReplaying && winner === null
-                ? `${ownsSeat(nowPlaying.player) ? 'You' : PLAYER_NAMES[nowPlaying.player]} played ${
-                    nowPlaying.card
-                      ? (nowPlaying.card.rank === 'JOKER' ? 'a Joker' : `${nowPlaying.card.rank} ${nowPlaying.card.suit}`)
-                      : 'a card'
-                  }. ${nowPlaying.description || ''}`
-                : ''}
-            </div>
+            {/* No `sr-only` companion here any more: the status box above is an
+                `aria-live` region and now carries the same sentence ("Blue
+                played 7♠ — Space 20 to Space 25"), so a second one would read
+                every move twice. */}
 
             {/* "Joker!" / "Partner Bump!" / "Double Play!" — the three things
                 that happen with nothing to watch, said large over the middle of

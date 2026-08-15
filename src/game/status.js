@@ -59,8 +59,37 @@ function myTurnPrompt({ splitRemaining, splitCard, jokerMode, discardMode, mode 
   return 'Your turn! Select a card and peg to move.';
 }
 
-// The status line. Never "Blue is thinking…" once the game is over.
-export function describeStatus({
+// A card, as it reads in a sentence: "7♠", "a Joker".
+export function describeCard(card) {
+  if (!card) return null;
+  return card.rank === 'JOKER' ? 'a Joker' : `${card.rank}${card.suit}`;
+}
+
+// The status line, as parts rather than as one string, so the seat's *name* can
+// be drawn in the seat's own colour. `text` is the same words joined with
+// spaces, which is what `describeStatus` returns and what a screen reader
+// hears — the two can't drift apart because there is only one derivation.
+//
+// `who` is the coloured span and `player` is the seat it belongs to; `prefix`
+// is anything that reads before the name ("Waiting for", "📺 Replay 2/3") and
+// `detail` anything after it.
+function parts({ prefix = null, player = null, who = null, detail = null }) {
+  return { prefix, player, who, detail, text: [prefix, who, detail].filter(Boolean).join(' ') };
+}
+
+// The move currently on screen: who played what, and what it did. This is the
+// status line's job now — it used to be a pill floating over the middle of the
+// board, which is one more thing to look at in the one place the board is
+// busiest. The status box is already where a player looks to find out what is
+// happening, and it is already the right size.
+function moveParts({ player, card, description, mine = false }, names) {
+  const label = describeCard(card);
+  const detail = [label && `played ${label}`, description && `— ${description}`]
+    .filter(Boolean).join(' ');
+  return parts({ player, who: mine ? 'You' : names[player], detail: detail || null });
+}
+
+export function describeStatusParts({
   phase,
   currentPlayer,
   splitRemaining = 0,
@@ -74,23 +103,55 @@ export function describeStatus({
   // and a confusing one for anyone relying on the words rather than the
   // movement — the two halves of the screen should agree.
   moving = false,
+  // The move being shown right now (`{ player, card, description, mine }`), if
+  // any. It replaces "Blue is moving…" — strictly more information in the same
+  // line — but never an *instruction*: a prompt telling you to tap something
+  // outranks commentary about a peg you can already see travelling.
+  move = null,
+  // `{ player, description, index, total }` while an instant replay runs.
+  replay = null,
 }) {
   switch (phase) {
     case PHASES.FINISHED:
-      return 'Game over.';
+      return parts({ detail: 'Game over.' });
     case PHASES.REPLAYING:
-      return 'Replaying the last round…';
+      if (replay) {
+        return parts({
+          prefix: `📺 Replay ${replay.index}/${replay.total}`,
+          player: replay.player,
+          who: names[replay.player],
+          detail: replay.description ? `— ${replay.description}` : null,
+        });
+      }
+      return parts({ detail: 'Replaying the last round…' });
     case PHASES.DEALING:
-      return 'Dealing…';
-    case PHASES.MY_TURN:
-      if (moving) return 'Moving…';
-      return myTurnPrompt({ splitRemaining, splitCard, jokerMode, discardMode, mode });
+      return parts({ detail: 'Dealing…' });
+    case PHASES.MY_TURN: {
+      // Mid-split, mid-joker and mid-discard the line is a prompt, and the
+      // prompt wins: the first half of a split animates while the second half
+      // is still waiting on a tap.
+      const pending = discardMode || jokerMode || splitRemaining;
+      if (!pending && move) return moveParts(move, names);
+      if (!pending && moving) return parts({ detail: 'Moving…' });
+      return parts({ detail: myTurnPrompt({ splitRemaining, splitCard, jokerMode, discardMode, mode }) });
+    }
     case PHASES.WAITING_PARTNER:
-      return `Waiting for ${names[currentPlayer]} to play…`;
+      if (move) return moveParts(move, names);
+      return parts({ prefix: 'Waiting for', player: currentPlayer, who: names[currentPlayer], detail: 'to play…' });
     case PHASES.AI_TURN:
     default:
-      return `${names[currentPlayer]} is ${moving ? 'moving…' : 'thinking...'}`;
+      if (move) return moveParts(move, names);
+      return parts({
+        player: currentPlayer,
+        who: names[currentPlayer],
+        detail: moving ? 'is moving…' : 'is thinking...',
+      });
   }
+}
+
+// The status line. Never "Blue is thinking…" once the game is over.
+export function describeStatus(args) {
+  return describeStatusParts(args).text;
 }
 
 // How to announce the result, phrased for the mode and for who you are:

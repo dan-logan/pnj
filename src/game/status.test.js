@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { PHASES, derivePhase, describeStatus, describeOutcome, attributeFrameDescription } from './status.js';
+import { PHASES, derivePhase, describeStatus, describeStatusParts, describeCard, describeOutcome, attributeFrameDescription } from './status.js';
 import { GAME_MODES } from './constants.js';
 
 const SOLO = ['me', 'ai', 'ai', 'ai'];
@@ -124,6 +124,101 @@ describe('describeStatus', () => {
     expect(describeStatus({
       phase: PHASES.MY_TURN, currentPlayer: 0, discardMode: true, jokerMode: true,
     })).toBe('Select a card to discard.');
+  });
+});
+
+// The move commentary used to be a pill floating over the middle of the board.
+// It is the status line now: same words, no second thing to look at, and — the
+// point of the change — no element whose size depends on the move.
+describe('describeStatus carrying the move being played', () => {
+  const move = { player: 1, card: { rank: '7', suit: '♠' }, description: 'Space 20 to Space 25' };
+
+  it('says what an opponent played instead of that they are moving', () => {
+    expect(describeStatus({ phase: PHASES.AI_TURN, currentPlayer: 1, moving: true, move }))
+      .toBe('Blue played 7♠ — Space 20 to Space 25');
+  });
+
+  it('names your own seat "You"', () => {
+    expect(describeStatus({
+      phase: PHASES.AI_TURN, currentPlayer: 1, move: { ...move, player: 0, mine: true },
+    })).toBe('You played 7♠ — Space 20 to Space 25');
+  });
+
+  it('reads a joker by name rather than as a rank and suit', () => {
+    expect(describeStatus({
+      phase: PHASES.AI_TURN, currentPlayer: 1,
+      move: { player: 1, card: { rank: 'JOKER' }, description: 'Bumped Pink' },
+    })).toBe('Blue played a Joker — Bumped Pink');
+  });
+
+  it('covers a remote partner the same way', () => {
+    expect(describeStatus({ phase: PHASES.WAITING_PARTNER, currentPlayer: 2, move }))
+      .toBe('Blue played 7♠ — Space 20 to Space 25');
+  });
+
+  it('never displaces a prompt that is waiting on a tap', () => {
+    // The first half of a split animates while the second half still needs a
+    // peg: commentary about the peg you can already see would cost you the
+    // instruction you actually need.
+    expect(describeStatus({
+      phase: PHASES.MY_TURN, currentPlayer: 0, splitRemaining: 4, splitCard: { rank: '7' },
+      moving: true, move: { ...move, player: 0, mine: true },
+    })).toBe('Tap a glowing peg to move the remaining 4 spaces (or Undo).');
+
+    expect(describeStatus({
+      phase: PHASES.MY_TURN, currentPlayer: 0, jokerMode: true, move,
+    })).toMatch(/opponent's peg/);
+  });
+
+  it('is outranked by a finished game', () => {
+    expect(describeStatus({ phase: PHASES.FINISHED, currentPlayer: 1, move })).toBe('Game over.');
+  });
+
+  it('falls back to the plain line with no move on screen', () => {
+    expect(describeStatus({ phase: PHASES.AI_TURN, currentPlayer: 1, moving: true, move: null }))
+      .toBe('Blue is moving…');
+  });
+});
+
+describe('describeStatusParts', () => {
+  it('separates the seat name out so it can be drawn in the seat colour', () => {
+    const p = describeStatusParts({ phase: PHASES.AI_TURN, currentPlayer: 3 });
+    expect(p).toMatchObject({ prefix: null, player: 3, who: 'Green', detail: 'is thinking...' });
+    expect(p.text).toBe('Green is thinking...');
+  });
+
+  it('puts the name in the middle of a "waiting for" line', () => {
+    const p = describeStatusParts({ phase: PHASES.WAITING_PARTNER, currentPlayer: 2 });
+    expect(p).toMatchObject({ prefix: 'Waiting for', player: 2, who: 'Pink', detail: 'to play…' });
+    expect(p.text).toBe('Waiting for Pink to play…');
+  });
+
+  it('has no seat to colour for a prompt', () => {
+    const p = describeStatusParts({ phase: PHASES.MY_TURN, currentPlayer: 0 });
+    expect(p.player).toBeNull();
+    expect(p.who).toBeNull();
+  });
+
+  it('carries the replay frame instead of a generic "replaying" line', () => {
+    const p = describeStatusParts({
+      phase: PHASES.REPLAYING, currentPlayer: 0,
+      replay: { player: 1, description: 'Space 20 to Space 25', index: 2, total: 3 },
+    });
+    expect(p).toMatchObject({ prefix: '📺 Replay 2/3', player: 1, who: 'Blue' });
+    expect(p.text).toBe('📺 Replay 2/3 Blue — Space 20 to Space 25');
+  });
+
+  it('still says something with no frame info yet', () => {
+    expect(describeStatusParts({ phase: PHASES.REPLAYING, currentPlayer: 0 }).text)
+      .toBe('Replaying the last round…');
+  });
+});
+
+describe('describeCard', () => {
+  it('joins rank and suit, and names a joker', () => {
+    expect(describeCard({ rank: 'K', suit: '♦' })).toBe('K♦');
+    expect(describeCard({ rank: 'JOKER' })).toBe('a Joker');
+    expect(describeCard(null)).toBeNull();
   });
 });
 
