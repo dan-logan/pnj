@@ -1782,6 +1782,7 @@ export default function PegsAndJokers() {
       if (replaySegTimerRef.current) { clearInterval(replaySegTimerRef.current); replaySegTimerRef.current = null; }
       if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
       setAnimatingPeg(null);
+      clearSplitVisual();
       setReplayInfo(null);
       setIsReplaying(false);
       if (replayRestoreRef.current) {
@@ -1808,7 +1809,7 @@ export default function PegsAndJokers() {
     // Animate one segment (a single peg gliding), then advance to the next.
     const animateSegments = (segments, idx, done) => {
       if (replayCancelRef.current) return;
-      if (idx >= segments.length) { done(); return; }
+      if (idx >= segments.length) { clearSplitVisual(); done(); return; }
       const seg = segments[idx];
       setPegs(seg.fromPegs);
       const path = calculateMovePath(seg.owner, seg.pegIndex, seg.card, seg.amount, seg.fromPegs);
@@ -1817,6 +1818,24 @@ export default function PegsAndJokers() {
         animateSegments(segments, idx + 1, done);
         return;
       }
+      // A half that has already been played stays lit until the whole move is
+      // over — see `landedPegs`. A replay commits each segment's `toPegs`, so
+      // unlike the live split there is nothing to hold the peg in place here;
+      // the pin is purely so the finished half keeps its highlight and its
+      // count while the other half counts out the rest of the card. It draws
+      // over the same coordinates the board is already using, and
+      // `isPegLanded` blanks the board's copy, so nothing moves when it takes
+      // over.
+      const pinFirstHalf = () => {
+        if (idx + 1 >= segments.length) return;
+        setLandedPegs(prev => [...prev, {
+          player: seg.owner,
+          pegIndex: seg.pegIndex,
+          at: pegAnchor(seg.toPegs?.[seg.owner]?.[seg.pegIndex], seg.pegIndex),
+          from: pegAnchor(seg.fromPegs?.[seg.owner]?.[seg.pegIndex], seg.pegIndex),
+          count: path.length,
+        }]);
+      };
       setAnimatingPeg({
         player: seg.owner,
         pegIndex: seg.pegIndex,
@@ -1838,6 +1857,7 @@ export default function PegsAndJokers() {
           replaySegTimerRef.current = null;
           setAnimatingPeg(null);
           setPegs(seg.toPegs);
+          pinFirstHalf();
           nextSegment(segments, idx + 1, done);
         } else {
           sfx.step(seg.owner, step, path.length);
@@ -1879,13 +1899,14 @@ export default function PegsAndJokers() {
     if (replaySegTimerRef.current) { clearInterval(replaySegTimerRef.current); replaySegTimerRef.current = null; }
     if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
     setAnimatingPeg(null);
+    clearSplitVisual();
     setReplayInfo(null);
     setIsReplaying(false);
     if (replayRestoreRef.current) {
       setPegs(replayRestoreRef.current);
       replayRestoreRef.current = null;
     }
-  }, []);
+  }, [clearSplitVisual]);
 
   // Package 5: auto-play the buffered frames once it becomes this client's
   // turn — the wire frames (the partner's move, and anything the *other*
@@ -4741,14 +4762,21 @@ export default function PegsAndJokers() {
                 );
               })}
 
-              {/* Pegs that have finished their half of a split and are waiting
-                  for the rest of the move to commit. Drawn where they landed,
-                  keeping their ghost and their count, so the first half of a
-                  split stays on screen — and stays legible — while the second
-                  one plays. Dimmed a little: it has had its turn, and the eye
-                  should now be on the peg that is still moving. Drawn before
-                  the gliding peg so a peg that somehow overlaps it goes on top. */}
+              {/* Pegs that have finished their half of a split. Drawn where
+                  they landed, keeping their ghost, their halo and their count,
+                  so the first half of a split stays *lit* until the second one
+                  finishes — the two halves are one card, and a peg that drops
+                  back to looking like every other peg the instant it stops
+                  takes the first half of the move off the board with it. It
+                  keeps the size and the white ring it had while it was gliding
+                  (so there is no shrink at the hand-off) and only softens its
+                  glow, which is what still sends the eye to the peg that is
+                  moving. Drawn before the gliding peg so a peg that somehow
+                  overlaps it goes on top. */}
               {landedPegs.map((item) => {
+                // Belt and braces: a segment that moved this peg *again* would
+                // otherwise draw it twice — the glide owns a peg it is holding.
+                if (isPegAnimating(item.player, item.pegIndex)) return null;
                 const color = PLAYER_COLORS[item.player];
                 const anchorXY = (anchor) => {
                   if (!anchor) return null;
@@ -4760,11 +4788,8 @@ export default function PegsAndJokers() {
                 const pos = anchorXY(item.at);
                 if (!pos) return null;
                 const ghost = anchorXY(item.from);
-                // Match whatever the board would have drawn there: a track peg
-                // is bigger than a peg sitting in a start or home slot.
-                const r = item.at.type === 'track' ? 7 : 5;
                 return (
-                  <g key={`landed-${item.player}-${item.pegIndex}`} opacity={0.9}>
+                  <g key={`landed-${item.player}-${item.pegIndex}`}>
                     {ghost && (
                       <circle
                         cx={ghost.x}
@@ -4774,18 +4799,32 @@ export default function PegsAndJokers() {
                         stroke={color}
                         strokeWidth={1.5}
                         strokeDasharray="3 2"
-                        opacity={0.35}
+                        opacity={0.45}
                       />
                     )}
-                    <circle cx={pos.x} cy={pos.y} r={r + 5} fill={color} opacity={0.15} />
-                    <circle cx={pos.x} cy={pos.y} r={r} fill={color} stroke="white" strokeWidth={2} />
+                    {/* Same halo and same white ring as the gliding peg (which
+                        is drawn at r=8 wherever it is, home slot included), a
+                        shade softer so the peg still counting reads as the
+                        live one. */}
+                    <circle cx={pos.x} cy={pos.y} r={12} fill={color} opacity={0.2} />
+                    <circle
+                      cx={pos.x}
+                      cy={pos.y}
+                      r={8}
+                      fill={color}
+                      stroke="white"
+                      strokeWidth={3}
+                      style={{ filter: 'drop-shadow(0 0 3px rgba(255,255,255,0.55))' }}
+                    />
                     {/* The spaces this half was worth, left over the peg while
                         the other half counts out the rest — 4 here and 3 there
                         is what makes a split visibly add up to the seven on the
-                        card. */}
+                        card. Drawn exactly like the moving peg's count, so the
+                        two halves read as one sum rather than as a live number
+                        and a faded one. */}
                     {item.count > 0 && (
                       <>
-                        <circle cx={pos.x} cy={pos.y - 15} r={8} fill="#111827" opacity={0.6} />
+                        <circle cx={pos.x} cy={pos.y - 15} r={8} fill="#111827" opacity={0.85} />
                         <text
                           x={pos.x}
                           y={pos.y - 12}
@@ -4793,7 +4832,6 @@ export default function PegsAndJokers() {
                           fill="white"
                           fontSize="11"
                           fontWeight="bold"
-                          opacity={0.8}
                         >
                           {item.count}
                         </text>
