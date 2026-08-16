@@ -151,6 +151,56 @@ export function splitBeatMs(speed) {
 export const JOKER_CARD_MS = 2400;
 export const JOKER_CARD_HOLD_MS = Math.round(JOKER_CARD_MS * 0.75);
 
+// The played card's own little sequence, which is deliberately *not* concurrent
+// with the move it belongs to.
+//
+// It used to pop up over the middle of the board and immediately start shrinking
+// away onto the discard pile, scaled so that it landed as the move ended — so
+// the card and the peg were travelling at the same time, in different
+// directions, and the eye had to pick one. The card is the *label* on a move,
+// not a second thing happening during it: it now holds where it was dealt for
+// as long as the peg is travelling, and only drops onto the pile once the peg
+// has stopped. One thing moving at a time.
+//
+// CARD_POP_MS is the deal-in, and therefore the shortest the card can hold: a
+// drop that started before the pop finished would yank the card out of its own
+// entrance.
+export const CARD_POP_MS = 300;
+
+// The drop onto the pile, capped. It is not travel anyone is meant to count —
+// the pegs have already stopped by the time it runs — so it stays brisk, and
+// scales down at the faster paces where nearly half a second of card would
+// otherwise be most of the turn.
+export const CARD_DISCARD_MS = 420;
+
+export function cardDiscardMs(speed) {
+  const { stepMs } = settingsFor(speed);
+  // Animations off: no card is ever shown (the board hold is zero and the
+  // overlay is torn down in the same batch it appeared), so nothing to drop.
+  if (stepMs <= 0) return 0;
+  return Math.min(CARD_DISCARD_MS, stepMs * 3);
+}
+
+// How long the card holds centre-board for a move whose travel takes
+// `travelMs` — the whole move for a split, both halves and the beat between.
+export function cardHoldMs(travelMs, speed) {
+  if (!animationsOn(speed)) return 0;
+  return Math.max(CARD_POP_MS, travelMs > 0 ? travelMs : 0);
+}
+
+// What the board still owes the card once the pegs have stopped: whatever is
+// left of its hold, plus the drop.
+//
+// The overlay is unmounted the moment the board hold ends, so a hold shorter
+// than this leaves the card vanishing in mid-air — and a card that disappears
+// instead of landing is worse than one that never moved. That used to be
+// handled by scaling the flight to fit the move; it is this one number now, and
+// every hold site takes the larger of its own beat and this.
+export function cardOutroMs(travelMs, speed) {
+  if (!animationsOn(speed)) return 0;
+  return cardHoldMs(travelMs, speed) - (travelMs > 0 ? travelMs : 0) + cardDiscardMs(speed);
+}
+
 // How long the board must be held from the moment a move's effects *start*, so
 // the next play doesn't begin on top of them: every flight this move will run
 // (`totalTicks` is the staging above), and then the pause.

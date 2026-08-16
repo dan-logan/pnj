@@ -112,6 +112,10 @@ import {
   stageBumpFlights,
   specialPlayHoldMs,
   splitBeatMs,
+  cardHoldMs,
+  cardDiscardMs,
+  cardOutroMs,
+  CARD_POP_MS,
   BUMP_FLY_STEPS,
   BUMP_FLY_TICK_MS,
   JOKER_CARD_MS,
@@ -146,10 +150,6 @@ const DISCARD_CARD_H = 30;
 // the `transform-origin` of `.pnj-card-play` in index.css (CSS can't read it
 // from here), so the two move together.
 const PLAYED_CARD = { w: 44, h: 60, cx: 200, cy: 140 };
-// How long the card takes to pop up, hold and drop onto the pile. Scaled to the
-// move it belongs to (see `lifeMs`), between these two.
-const PLAYED_CARD_MIN_MS = 550;
-const PLAYED_CARD_MAX_MS = 1500;
 
 // The ?g= invite link for a game. Needed both when a game is created and when
 // its host reopens it while still waiting for a partner to join.
@@ -315,18 +315,22 @@ export default function PegsAndJokers() {
   // phone pushed the whole screen down every time an opponent moved and pulled
   // it back up a second later — the jump was more distracting than the
   // information was useful. An overlay costs no layout at all.
-  const [nowPlaying, setNowPlaying] = useState(null); // { id, player, card, description, lifeMs }
+  const [nowPlaying, setNowPlaying] = useState(null); // { id, player, card, description, holdMs }
   const nowPlayingSeqRef = useRef(0);
 
-  // Every move gets its own id so the overlay's entrance/fly-to-the-pile
+  // Every move gets its own id so the overlay's entrance/drop-to-the-pile
   // animation replays for each one — two identical moves in a row would
   // otherwise reuse the same DOM node and animate only once.
   //
-  // `lifeMs` is how long this move will be on screen (travel + settle). The
-  // card's flight to the discard pile is scaled to fit inside it: the overlay
-  // is unmounted the moment the move ends, so a fixed flight would leave a
-  // one-space move's card hanging in mid-air halfway to the pile, and a card
-  // that vanishes instead of landing is worse than one that never moved.
+  // `holdMs` is how long the card sits centre-board before it drops onto the
+  // pile: the move's own travel (`cardHoldMs`, anim.js). The drop used to be
+  // scaled to run *during* the move so that it landed as the move ended, which
+  // meant the card was sliding across the board while the peg it described was
+  // still counting its way round — two things moving at once, and the card is
+  // the one you don't need to watch. It waits for the peg now. The board hold
+  // at the far end has to cover what's left (`cardOutroMs`), because the
+  // overlay is unmounted the moment that hold ends and a card that vanishes
+  // instead of landing is worse than one that never moved.
   const showNowPlaying = useCallback((meta) => {
     nowPlayingSeqRef.current += 1;
     setNowPlaying({ ...meta, id: nowPlayingSeqRef.current });
@@ -1610,16 +1614,21 @@ export default function PegsAndJokers() {
     if (animationRef.current) { clearInterval(animationRef.current); animationRef.current = null; }
     if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
     setVisualBusy(true);
-    if (meta) showNowPlaying({ ...meta, lifeMs: (path.length - 1) * pacing.stepMs + pacing.settleMs });
+    // The card holds centre-board for exactly as long as the peg is travelling
+    // and drops onto the pile as it stops (see `showNowPlaying`).
+    const travelMs = (path.length - 1) * pacing.stepMs;
+    if (meta) showNowPlaying({ ...meta, holdMs: cardHoldMs(travelMs, animationSpeed) });
     animateMove(player, pegIndex, card, amount, fromPegs, () => {
-      // Hold the "now playing" banner through the settle beat, so the card that
-      // was played is still on screen when the peg stops — and through
+      // Hold the board through the settle beat, so the card that was played is
+      // still dropping onto its pile when the peg stops — and through
       // `extraHoldMs` on top of that when the move was a special one, so the
       // bumped peg finishes its flight and the player gets a moment with the
-      // result before an opponent starts moving.
-      holdBoard(pacing.settleMs + extraHoldMs);
+      // result before an opponent starts moving. Never less than what the card
+      // still owes (`cardOutroMs`): at the `fast` pace there is no settle beat
+      // at all, and the card would be unmounted before it left the middle.
+      holdBoard(Math.max(pacing.settleMs + extraHoldMs, cardOutroMs(travelMs, animationSpeed)));
     });
-  }, [animationsEnabled, animateMove, pacing.stepMs, pacing.settleMs, showNowPlaying, holdBoard]);
+  }, [animationsEnabled, animateMove, pacing.stepMs, pacing.settleMs, animationSpeed, showNowPlaying, holdBoard]);
 
   // How long `playMoveVisual` keeps the board for a move that has just
   // committed: the glide (`animateMove` calls back a step *after* the peg lands
@@ -1628,10 +1637,15 @@ export default function PegsAndJokers() {
   // which needs the same number so the result can wait for exactly as long as
   // the move it is announcing (endGame's `presentDelayMs`). Zero with
   // animations off, where there is no playback to wait for and the pacing table
-  // is zeroes anyway.
+  // is zeroes anyway. The `Math.max` is the same one `playMoveVisual` applies:
+  // the played card's drop can outlast a short settle beat, and the result must
+  // not land on top of it.
   const moveVisualMs = useCallback((travelMs, extraHoldMs = 0) => (
-    animationsEnabled ? travelMs + pacing.stepMs + pacing.settleMs + extraHoldMs : 0
-  ), [animationsEnabled, pacing.stepMs, pacing.settleMs]);
+    animationsEnabled
+      ? travelMs + pacing.stepMs
+        + Math.max(pacing.settleMs + extraHoldMs, cardOutroMs(travelMs, animationSpeed))
+      : 0
+  ), [animationsEnabled, pacing.stepMs, pacing.settleMs, animationSpeed]);
 
   // The card a seat draws to replace the one it just played — except on the
   // move that ends the game. Nothing will ever be played from that hand again,
@@ -2616,6 +2630,15 @@ export default function PegsAndJokers() {
       aiTimerRef.current = null;
       const aiHand = hands[aiPlayer];
 
+      // What the played card still owes when the pegs stop: its drop onto the
+      // pile, which now waits for the move rather than running over the top of
+      // it (see `showNowPlaying`). Written once the move is picked and its
+      // travel is known, a few lines below, and read back out of the closure
+      // when the move completes — the card is dealt before the animation starts
+      // and put away after it ends, so the two ends of it sit either side of
+      // `completeAIMove`.
+      let cardOutro = 0;
+
       // Helper function to complete AI move.
       //
       // `joker` is `{ player, pegIndex }` when the move was a joker, and null
@@ -2640,6 +2663,13 @@ export default function PegsAndJokers() {
         const specialHoldMs = triggerMoveEffects(
           pegs, newPegs, aiPlayer, displacements, jokerDelay, { joker: showJoker ? joker : null },
         );
+        // How long the board is held once the pegs have stopped — the settle
+        // beat, whatever a special play earned, and never less than what the
+        // played card still owes: it only starts dropping onto the pile now,
+        // and the overlay is torn down the instant this hold ends. One number,
+        // used both for the hold itself and for the beat a winning move gets
+        // before the result covers the board.
+        const holdMs = Math.max(pacing.settleMs + jokerDelay + specialHoldMs, cardOutro);
         sfx.peg();
 
         // The board catches up with the whole move here, so the pin holding the
@@ -2689,7 +2719,7 @@ export default function PegsAndJokers() {
           endGame(w, {
             winningSeat: aiPlayer,
             description: moveDescription,
-            presentDelayMs: silent ? 0 : pacing.settleMs + jokerDelay + specialHoldMs,
+            presentDelayMs: silent ? 0 : holdMs,
           });
           // A decision the plan doesn't spell out: §4.2 says the AI effect's
           // own player-advance "must stay purely local", folded into this
@@ -2719,7 +2749,7 @@ export default function PegsAndJokers() {
         // joker its card, which hasn't even dropped yet): the opponent after a
         // bump should be watching the same thing you are, not already moving.
         if (!silent) {
-          holdBoard(pacing.settleMs + jokerDelay + specialHoldMs);
+          holdBoard(holdMs);
         } else {
           setNowPlaying(null);
         }
@@ -2806,12 +2836,12 @@ export default function PegsAndJokers() {
         // as the move takes. Cleared by the settle beat in completeAIMove.
         // The segments are exactly what is about to be animated (both halves of
         // a split; none at all for a joker), so they also give the overlay the
-        // move's length — see `lifeMs` on showNowPlaying.
+        // move's length — see `holdMs` on showNowPlaying.
         if (!silent) {
-          // Every segment's travel, plus the beat *between* them — a split's
-          // card would otherwise reach the discard pile while its second peg
-          // was still on its way, and a card that lands early is the same
-          // wrong-by-a-move problem as one that never lands at all.
+          // Every segment's travel, plus the beat *between* them: the card is
+          // the label on the whole move, so a split's card holds across both
+          // halves rather than being put away while its second peg is still on
+          // its way.
           const travelMs = replaySegments.reduce(
             (ms, s) => ms + landingDelayFor(s.owner, s.pegIndex, s.card, s.amount, s.fromPegs),
             0,
@@ -2819,10 +2849,13 @@ export default function PegsAndJokers() {
           showNowPlaying({
             player: aiPlayer, card: bestMove.card, description: moveDescription,
             // A joker's card is the move: it holds centre-board for its own
-            // fixed span (and animates differently — see renderPlayedCard)
-            // rather than being scaled to travel it doesn't have.
-            lifeMs: jokerPeg ? JOKER_CARD_MS : travelMs + pacing.settleMs,
+            // fixed span and drops on its own cue (a keyframe of its own — see
+            // renderPlayedCard), so it wants none of the travel-driven hold.
+            holdMs: jokerPeg ? 0 : cardHoldMs(travelMs, animationSpeed),
           });
+          // Read back in completeAIMove, once the pegs have stopped: the drop
+          // starts then, and the board must be held long enough for it to land.
+          cardOutro = jokerPeg ? 0 : cardOutroMs(travelMs, animationSpeed);
         }
 
         // If animations are disabled, or this is a silent catch-up simulation
@@ -3239,7 +3272,10 @@ export default function PegsAndJokers() {
     // the delay before any of it starts.
     announce([ANNOUNCEMENTS.joker]);
     sfx.evilLaugh();
-    showNowPlaying({ player: actor, card, description: jokerDescription, lifeMs: JOKER_CARD_MS });
+    // No `holdMs`: the joker's card runs its own keyframes end to end
+    // (JOKER_CARD_MS), throb and drop together, rather than holding for travel
+    // it doesn't have.
+    showNowPlaying({ player: actor, card, description: jokerDescription });
     const jokerDelay = animationsEnabled ? JOKER_CARD_HOLD_MS : 0;
     const specialHoldMs = triggerMoveEffects(pegs, newPegs, actor, displacements, jokerDelay, {
       joker: { player: owner, pegIndex: jokerSourcePeg },
@@ -3515,7 +3551,7 @@ export default function PegsAndJokers() {
     // "current" (see `resultPending`). The card that won the game is the last
     // thing anyone wants to have missed.
     if (!nowPlaying || isReplaying || (winner !== null && !resultPending)) return null;
-    const { id, player, card, lifeMs } = nowPlaying;
+    const { id, player, card, holdMs } = nowPlaying;
     const colour = PLAYER_COLORS[player];
     const isRed = card && (card.suit === '♥' || card.suit === '♦');
     const isJoker = card && card.rank === 'JOKER';
@@ -3527,18 +3563,19 @@ export default function PegsAndJokers() {
     const dx = slot.x + DISCARD_CARD_W / 2 - PLAYED_CARD.cx;
     const dy = slot.y + DISCARD_CARD_H / 2 - PLAYED_CARD.cy;
 
-    // Land the card by the time the move ends, but never dawdle over the middle
-    // of the board for more than a beat and a half — a peg crossing half the
-    // board at the slow pace takes several seconds, and "briefly" is the point.
+    // Two animations, one after the other: the card is dealt in, holds centre-
+    // board while the peg travels, and drops onto the pile once it has stopped.
+    // The drop is a plain `animation-delay` on the second of them, which is
+    // what lets the hold be as long as the move needs without stretching the
+    // drop itself into a slow slide across the board.
     //
-    // The joker is the exception, and deliberately breaks both rules: its card
-    // is the only visible part of the move until the peg leaves the ground, so
-    // it holds centre-board for a fixed JOKER_CARD_MS, throbbing (a keyframe of
-    // its own, `pnj-card-joker`), and drops onto the pile exactly as the peg
-    // sets off — the flight is scheduled off the same constant.
-    const flightMs = isJoker
-      ? JOKER_CARD_MS
-      : Math.min(PLAYED_CARD_MAX_MS, Math.max(PLAYED_CARD_MIN_MS, lifeMs || 0));
+    // The joker is the exception and runs a single keyframe end to end: its
+    // card is the only visible part of the move until the peg leaves the
+    // ground, so it holds centre-board for a fixed JOKER_CARD_MS, throbbing
+    // (`pnj-card-joker`), and drops exactly as the peg sets off — the flight is
+    // scheduled off the same constant.
+    const dropMs = cardDiscardMs(animationSpeed);
+    const dropDelayMs = Math.max(0, holdMs || 0);
 
     const left = PLAYED_CARD.cx - PLAYED_CARD.w / 2;
     const top = PLAYED_CARD.cy - PLAYED_CARD.h / 2;
@@ -3562,7 +3599,12 @@ export default function PegsAndJokers() {
             style={{
               '--pnj-card-dx': `${dx}px`,
               '--pnj-card-dy': `${dy}px`,
-              animationDuration: `${flightMs}ms`,
+              ...(isJoker
+                ? { animationDuration: `${JOKER_CARD_MS}ms` }
+                : {
+                    animationDuration: `${CARD_POP_MS}ms, ${dropMs}ms`,
+                    animationDelay: `0ms, ${dropDelayMs}ms`,
+                  }),
               filter: isJoker
                 ? 'drop-shadow(0 0 10px rgba(168, 85, 247, 0.95)) drop-shadow(0 3px 5px rgba(0,0,0,0.65))'
                 : 'drop-shadow(0 3px 5px rgba(0,0,0,0.65))',
