@@ -4599,15 +4599,7 @@ export default function PegsAndJokers() {
               {Array.from({ length: TRACK_LENGTH }).map((_, i) => {
                 const { x, y } = getTrackPosition(i);
                 const isHomeEntrance = i % SPACES_PER_SIDE === 3;
-                // The space a peg comes out onto (getStartPosition). It was the
-                // one important space on the board with no marking at all, which
-                // made the rule that hangs off it invisible: one of your own
-                // pegs standing here blocks every peg in start, and until you
-                // can see the space you cannot see why. Dashed, so it reads as
-                // a doorway rather than as the solid home entrance ring.
-                const isComeOut = i % SPACES_PER_SIDE === 8;
                 const playerSection = Math.floor(i / SPACES_PER_SIDE);
-                const marked = isHomeEntrance || isComeOut;
                 return (
                   <circle
                     key={`track-${i}`}
@@ -4615,10 +4607,8 @@ export default function PegsAndJokers() {
                     cy={y}
                     r={6}
                     fill="#4B5563"
-                    stroke={marked ? PLAYER_COLORS[playerSection] : '#374151'}
-                    strokeWidth={marked ? 2 : 1}
-                    strokeDasharray={isComeOut ? '2 2' : undefined}
-                    strokeOpacity={isComeOut ? 0.85 : 1}
+                    stroke={isHomeEntrance ? PLAYER_COLORS[playerSection] : '#374151'}
+                    strokeWidth={isHomeEntrance ? 2 : 1}
                   />
                 );
               })}
@@ -5319,7 +5309,7 @@ export default function PegsAndJokers() {
                 <li>• 9: Split between two pegs (one forward, one backward)</li>
                 <li>• Joker: Bump any opponent peg</li>
                 <li>• Cannot jump or land on your own pegs</li>
-                <li>• Your own peg on your come-out space (the dashed ring) blocks every peg in START — move it first</li>
+                <li>• Your own peg on your come-out space blocks every peg in START — move it first</li>
                 <li>• <span className="text-yellow-400">Stuck 3 turns in a row = auto-start a peg!</span></li>
                 {gameMode === GAME_MODES.PARTNERS && (
                   <>
