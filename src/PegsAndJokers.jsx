@@ -3172,6 +3172,21 @@ export default function PegsAndJokers() {
     return myHand.map(c => getMovablePegs(controlledOwner, c, pegs, moveOptions).length > 0);
   }, [isMyTurn, winner, myHand, pegs, controlledOwner, moveOptions]);
 
+  // Put a half-made move back down: no card, no peg, no joker target pending.
+  // The turn is "pick a card, then pick a peg", and every way of changing your
+  // mind — tapping the selected card again, tapping the selected peg again, the
+  // Cancel buttons — lands here or on a subset of it. Most cards commit on the
+  // peg tap and so leave nothing to undo, but a 7, a 9 and a joker all park the
+  // selection waiting on a second tap, and *that* state needs a way out that
+  // isn't "guess which other card to press".
+  const clearSelection = () => {
+    setSelectedCard(null);
+    setSelectedPeg(null);
+    setJokerMode(false);
+    setJokerSourcePeg(null);
+    setNotice(null);
+  };
+
   const handleCardClick = (cardIndex) => {
     if (!isMyTurn || winner !== null || isReplaying) return;
     if (splitRemaining !== 0) return;
@@ -3183,13 +3198,20 @@ export default function PegsAndJokers() {
       return;
     }
 
-    // Reset joker mode if selecting a different card
-    if (jokerMode) {
-      setJokerMode(false);
-      setJokerSourcePeg(null);
+    // Tapping the card that is already selected drops the selection entirely.
+    if (cardIndex === selectedCard) {
+      clearSelection();
+      return;
     }
+
+    // A different card starts the choice over: the peg you had picked was
+    // picked for the old card, and so was joker mode. Any notice about the old
+    // card ("that peg has no legal move with this card") goes with them.
+    setJokerMode(false);
+    setJokerSourcePeg(null);
     setSelectedCard(cardIndex);
     setSelectedPeg(null);
+    setNotice(null);
   };
 
   const handlePegClick = (player, pegIndex) => {
@@ -3226,8 +3248,18 @@ export default function PegsAndJokers() {
       return;
     }
 
+    // Tapping the peg that is already selected puts it back down. Only a move
+    // still waiting on a second tap can reach this — a card that moves the peg
+    // on the tap has already committed and cleared the selection — so this is
+    // the escape from a 7 or a 9 whose destination you no longer want to pick.
+    if (pegIndex === selectedPeg) {
+      setSelectedPeg(null);
+      setNotice(null);
+      return;
+    }
+
     if (movablePegSet && !movablePegSet.has(pegIndex)) {
-      setNotice('That peg has no legal move with this card. Glowing pegs can move.');
+      setNotice('That peg has no legal move with this card. Tap a glowing peg, or tap the card again to choose another.');
       return;
     }
 
@@ -3246,9 +3278,12 @@ export default function PegsAndJokers() {
     if ((cardInfo.canSplit || cardInfo.mustSplit) &&
         (pegs[controlledOwner][pegIndex].location === 'track' || pegs[controlledOwner][pegIndex].location === 'home')) {
       // 7s and 9s: tap one of the ghost destination spaces to pick the amount
-      setNotice('Tap a pulsing space on the board to move this peg there.');
+      setNotice('Tap a pulsing space on the board to move this peg there, or tap the peg again to pick a different one.');
     } else {
-      executeMove(controlledOwner, pegIndex, card);
+      // Nothing is pending after an ordinary card — it either moved (and
+      // executeMove cleared the selection) or it was rejected, and a rejected
+      // move must not leave the peg sitting there lit.
+      if (!executeMove(controlledOwner, pegIndex, card)) setSelectedPeg(null);
     }
   };
 
@@ -4544,7 +4579,10 @@ export default function PegsAndJokers() {
                     const isFlyingBack = isPegBumping(player, i);
                     const hasPeg = pegs[player][i]?.location === 'start' && !isFlyingBack
                       && !isPegAnimating(player, i) && !isPegLanded(player, i);
-                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && !jokerMode;
+                    // Clickable in joker mode too — a joker's source is always a
+                    // track peg, so tapping one of your own pegs anywhere else
+                    // can only mean "cancel", which is what handlePegClick does.
+                    const isClickable = isMyTurn && player === controlledOwner && hasPeg;
                     const isSelected = player === controlledOwner && (i === selectedPeg || i === jokerSourcePeg) && pegs[player][i]?.location === 'start';
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(i);
                     const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(i);
@@ -4587,7 +4625,9 @@ export default function PegsAndJokers() {
                     // it in the slot it left while the pin draws it in the one
                     // it reached.
                     const hasPeg = pegIndex !== -1 && !isPegAnimating(player, pegIndex) && !isPegLanded(player, pegIndex);
-                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && i < 4 && !jokerMode;
+                    // `i < 4` because a peg in the last home slot can never move
+                    // again; in joker mode any of your own pegs is a cancel tap.
+                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && (i < 4 || jokerMode);
                     const isSelected = player === controlledOwner && pegIndex === selectedPeg && hasPeg;
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(pegIndex);
                     const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(pegIndex);
@@ -5135,6 +5175,15 @@ export default function PegsAndJokers() {
                     the 9 in the opposite direction.
                   </p>
                 )}
+                {/* Nothing has been played yet — this state is waiting on a
+                    destination tap, and it needs the same visible way out that
+                    joker mode has. */}
+                <button
+                  onClick={clearSelection}
+                  className="mt-2 px-3 py-1 bg-gray-600 rounded hover:bg-gray-700"
+                >
+                  Cancel
+                </button>
               </div>
             )}
 
