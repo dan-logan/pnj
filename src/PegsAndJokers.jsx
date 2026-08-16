@@ -3189,7 +3189,13 @@ export default function PegsAndJokers() {
 
   const handleCardClick = (cardIndex) => {
     if (!isMyTurn || winner !== null || isReplaying) return;
-    if (splitRemaining !== 0) return;
+    // The first half of a split is already on the board, so the card is spent
+    // and there is no changing it — but silently ignoring the tap made the hand
+    // look broken. Say which way out there is.
+    if (splitRemaining !== 0) {
+      setNotice('That card is already part-played. Tap a glowing peg to finish it, or Undo Split to take it back.');
+      return;
+    }
     unlockAudio();
 
     // In discard mode, clicking a card discards it
@@ -3531,6 +3537,29 @@ export default function PegsAndJokers() {
     }
     return `${PLAYER_NAMES[player]} (${isAISeat(seatOwners, player) ? 'AI' : 'Player'})`;
   };
+
+  // The peg you have picked is drawn differently from the pegs you *could*
+  // pick: a steady gold ring around it, and none of the pulse the movable pegs
+  // carry. They used to be the same white ring — and because a selected peg
+  // stays in the movable set it kept pulsing too, so "I chose this peg" and
+  // "this peg can move" were the same picture. With several cards able to move
+  // the same peg, that made choosing a different card look like it had changed
+  // nothing at all. Gold is Tailwind's yellow-400, the ring already worn by the
+  // selected card in the hand: one card, one peg, one highlight.
+  const SELECTED_PEG_COLOR = '#FACC15';
+  const renderSelectionRing = (cx, cy, r) => (
+    <circle
+      cx={cx}
+      cy={cy}
+      r={r}
+      fill="none"
+      stroke={SELECTED_PEG_COLOR}
+      strokeWidth={1.5}
+      opacity={0.95}
+      className="peg-selected"
+      pointerEvents="none"
+    />
+  );
 
   const renderCard = (card, index, isSelected, isPlayable = true) => {
     const isRed = card.suit === '♥' || card.suit === '♦';
@@ -4597,11 +4626,12 @@ export default function PegsAndJokers() {
                           cy={y}
                           r={5}
                           fill={hasPeg ? PLAYER_COLORS[player] : '#374151'}
-                          stroke={isSelected || isMovable ? 'white' : PLAYER_COLORS[player]}
+                          stroke={isSelected ? SELECTED_PEG_COLOR : (isMovable ? 'white' : PLAYER_COLORS[player])}
                           strokeWidth={isSelected || isMovable ? 2 : 1.5}
                           opacity={isDimmed ? 0.4 : 1}
-                          className={isMovable ? 'peg-glow' : undefined}
+                          className={isSelected ? undefined : (isMovable ? 'peg-glow' : undefined)}
                         />
+                        {isSelected && renderSelectionRing(x, y, 9)}
                         {isClickable && <circle cx={x} cy={y} r={12} fill="transparent" />}
                       </g>
                     );
@@ -4642,11 +4672,12 @@ export default function PegsAndJokers() {
                           cy={y}
                           r={5}
                           fill={hasPeg ? PLAYER_COLORS[player] : '#374151'}
-                          stroke={isSelected || isMovable ? 'white' : PLAYER_COLORS[player]}
+                          stroke={isSelected ? SELECTED_PEG_COLOR : (isMovable ? 'white' : PLAYER_COLORS[player])}
                           strokeWidth={isSelected || isMovable ? 2 : 1.5}
                           opacity={isDimmed ? 0.4 : 1}
-                          className={isMovable ? 'peg-glow' : undefined}
+                          className={isSelected ? undefined : (isMovable ? 'peg-glow' : undefined)}
                         />
+                        {isSelected && renderSelectionRing(x, y, 9)}
                         {isClickable && <circle cx={x} cy={y} r={11} fill="transparent" />}
                       </g>
                     );
@@ -4709,11 +4740,12 @@ export default function PegsAndJokers() {
                         cy={pos.y}
                         r={7}
                         fill={PLAYER_COLORS[player]}
-                        stroke={isSelected || isMovable ? 'white' : (isJokerTarget ? '#EF4444' : '#1F2937')}
+                        stroke={isSelected ? SELECTED_PEG_COLOR : (isMovable ? 'white' : (isJokerTarget ? '#EF4444' : '#1F2937'))}
                         strokeWidth={isSelected ? 2 : (isJokerTarget ? 3 : (isMovable ? 2 : 1))}
                         opacity={isDimmed ? 0.4 : 1}
-                        className={isMovable || isJokerTarget ? 'peg-glow' : undefined}
+                        className={isSelected ? undefined : ((isMovable || isJokerTarget) ? 'peg-glow' : undefined)}
                       />
+                      {isSelected && renderSelectionRing(pos.x, pos.y, 11)}
                       {isClickable && <circle cx={pos.x} cy={pos.y} r={13} fill="transparent" />}
                     </g>
                   );

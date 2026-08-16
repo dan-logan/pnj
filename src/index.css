@@ -13,6 +13,18 @@
   filter: drop-shadow(0 0 3px rgba(255, 255, 255, 0.9));
 }
 
+/* The peg you have actually picked, as opposed to the pegs you *could* pick.
+   Deliberately the opposite treatment to `peg-glow`: a steady gold ring, no
+   pulse. The two used to be the same white ring, and a selected peg stays in
+   the movable set, so it kept pulsing along with the rest — leaving no way to
+   tell "I chose this one" from "this one can move", and no way to see that
+   picking a different card had let go of it. Gold because that is the colour
+   the selected card in the hand already uses (ring-yellow-400): one card, one
+   peg, same highlight. */
+.peg-selected {
+  filter: drop-shadow(0 0 3px rgba(250, 204, 21, 0.9));
+}
+
 /* Ghost circles marking tappable destination spaces */
 .ghost-dest {
   animation: pnj-pulse 1.1s ease-in-out infinite;
