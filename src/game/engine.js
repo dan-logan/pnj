@@ -698,6 +698,39 @@ export function getMovablePegs(player, card, currentPegs, options = {}) {
   return movable;
 }
 
+// Why this peg has no play with this card, in a sentence the player can act on.
+// Returns null when the peg *can* move, and null again for the ordinary "it just
+// doesn't reach" cases — the UI's generic prompt covers those.
+//
+// The one that earns a sentence is a peg of your own parked on your come-out
+// space. It blocks *every* peg in start at once, it is the only thing that can,
+// and nothing about the board says so: the blocker is on an unremarkable track
+// space several places from the marked home entrance, the pegs it blocks are
+// simply not glowing, and picking a different starting card changes nothing. So
+// it reads as the game refusing to let you start a peg for no reason — right up
+// until you know the rule.
+export function explainNoMove(player, pegIndex, card, currentPegs, options = {}) {
+  if (getMovablePegs(player, card, currentPegs, options).includes(pegIndex)) return null;
+
+  const peg = currentPegs[player][pegIndex];
+  if (peg.location !== 'start') return null;
+
+  const cardInfo = CARD_VALUES[card.rank];
+  if (!cardInfo.canStart && !cardInfo.isJoker) {
+    return 'Only an Ace, Jack, Queen, King or Joker can bring a peg out of start.';
+  }
+  if (cardInfo.canStart) {
+    const startPos = getStartPosition(player);
+    const blocker = currentPegs[player].some(p => p.location === 'track' && p.position === startPos);
+    // An opponent there is no obstacle — you come out on top of them and bump
+    // them. Only your own peg holds the space against you.
+    if (blocker) {
+      return `Your own peg is sitting on your come-out space (${startPos}), which blocks every peg in start. Move that peg first.`;
+    }
+  }
+  return null;
+}
+
 // Diff two peg states and report pegs that were knocked from the track back to
 // start (i.e. bumped), with the track position they were bumped from.
 export function findBumps(oldPegs, newPegs) {

@@ -22,6 +22,8 @@ import {
   calculateMovePath,
   getValidDestinations,
   getMovablePegs,
+  getStartPosition,
+  explainNoMove,
   findBumps,
   splitCompleter
 } from './game/engine.js';
@@ -3172,9 +3174,30 @@ export default function PegsAndJokers() {
     return myHand.map(c => getMovablePegs(controlledOwner, c, pegs, moveOptions).length > 0);
   }, [isMyTurn, winner, myHand, pegs, controlledOwner, moveOptions]);
 
+  // Put a half-made move back down: no card, no peg, no joker target pending.
+  // The turn is "pick a card, then pick a peg", and every way of changing your
+  // mind — tapping the selected card again, tapping the selected peg again, the
+  // Cancel buttons — lands here or on a subset of it. Most cards commit on the
+  // peg tap and so leave nothing to undo, but a 7, a 9 and a joker all park the
+  // selection waiting on a second tap, and *that* state needs a way out that
+  // isn't "guess which other card to press".
+  const clearSelection = () => {
+    setSelectedCard(null);
+    setSelectedPeg(null);
+    setJokerMode(false);
+    setJokerSourcePeg(null);
+    setNotice(null);
+  };
+
   const handleCardClick = (cardIndex) => {
     if (!isMyTurn || winner !== null || isReplaying) return;
-    if (splitRemaining !== 0) return;
+    // The first half of a split is already on the board, so the card is spent
+    // and there is no changing it — but silently ignoring the tap made the hand
+    // look broken. Say which way out there is.
+    if (splitRemaining !== 0) {
+      setNotice('That card is already part-played. Tap a glowing peg to finish it, or Undo Split to take it back.');
+      return;
+    }
     unlockAudio();
 
     // In discard mode, clicking a card discards it
@@ -3183,13 +3206,20 @@ export default function PegsAndJokers() {
       return;
     }
 
-    // Reset joker mode if selecting a different card
-    if (jokerMode) {
-      setJokerMode(false);
-      setJokerSourcePeg(null);
+    // Tapping the card that is already selected drops the selection entirely.
+    if (cardIndex === selectedCard) {
+      clearSelection();
+      return;
     }
+
+    // A different card starts the choice over: the peg you had picked was
+    // picked for the old card, and so was joker mode. Any notice about the old
+    // card ("that peg has no legal move with this card") goes with them.
+    setJokerMode(false);
+    setJokerSourcePeg(null);
     setSelectedCard(cardIndex);
     setSelectedPeg(null);
+    setNotice(null);
   };
 
   const handlePegClick = (player, pegIndex) => {
@@ -3226,8 +3256,24 @@ export default function PegsAndJokers() {
       return;
     }
 
+    // Tapping the peg that is already selected puts it back down. Only a move
+    // still waiting on a second tap can reach this — a card that moves the peg
+    // on the tap has already committed and cleared the selection — so this is
+    // the escape from a 7 or a 9 whose destination you no longer want to pick.
+    if (pegIndex === selectedPeg) {
+      setSelectedPeg(null);
+      setNotice(null);
+      return;
+    }
+
     if (movablePegSet && !movablePegSet.has(pegIndex)) {
-      setNotice('That peg has no legal move with this card. Glowing pegs can move.');
+      // Some refusals have a reason worth spelling out — above all your own peg
+      // holding your come-out space, which blocks every peg in start at once and
+      // is invisible on the board.
+      setNotice(
+        explainNoMove(controlledOwner, pegIndex, selectedCardObj, pegs, moveOptions)
+        ?? 'That peg has no legal move with this card. Tap a glowing peg, or tap the card again to choose another.'
+      );
       return;
     }
 
@@ -3246,9 +3292,12 @@ export default function PegsAndJokers() {
     if ((cardInfo.canSplit || cardInfo.mustSplit) &&
         (pegs[controlledOwner][pegIndex].location === 'track' || pegs[controlledOwner][pegIndex].location === 'home')) {
       // 7s and 9s: tap one of the ghost destination spaces to pick the amount
-      setNotice('Tap a pulsing space on the board to move this peg there.');
+      setNotice('Tap a pulsing space on the board to move this peg there, or tap the peg again to pick a different one.');
     } else {
-      executeMove(controlledOwner, pegIndex, card);
+      // Nothing is pending after an ordinary card — it either moved (and
+      // executeMove cleared the selection) or it was rejected, and a rejected
+      // move must not leave the peg sitting there lit.
+      if (!executeMove(controlledOwner, pegIndex, card)) setSelectedPeg(null);
     }
   };
 
@@ -3497,20 +3546,51 @@ export default function PegsAndJokers() {
     return `${PLAYER_NAMES[player]} (${isAISeat(seatOwners, player) ? 'AI' : 'Player'})`;
   };
 
+  // The peg you have picked is drawn differently from the pegs you *could*
+  // pick: a steady gold ring around it, and none of the pulse the movable pegs
+  // carry. They used to be the same white ring — and because a selected peg
+  // stays in the movable set it kept pulsing too, so "I chose this peg" and
+  // "this peg can move" were the same picture. With several cards able to move
+  // the same peg, that made choosing a different card look like it had changed
+  // nothing at all. Gold is Tailwind's yellow-400, the ring already worn by the
+  // selected card in the hand: one card, one peg, one highlight.
+  const SELECTED_PEG_COLOR = '#FACC15';
+  const renderSelectionRing = (cx, cy, r) => (
+    <circle
+      cx={cx}
+      cy={cy}
+      r={r}
+      fill="none"
+      stroke={SELECTED_PEG_COLOR}
+      strokeWidth={1.5}
+      opacity={0.95}
+      className="peg-selected"
+      pointerEvents="none"
+    />
+  );
+
   const renderCard = (card, index, isSelected, isPlayable = true) => {
     const isRed = card.suit === '♥' || card.suit === '♦';
     const discardHighlight = discardMode ? 'ring-2 ring-red-400 hover:ring-red-300' : '';
     const deadCard = !isPlayable && !discardMode ? 'opacity-50' : '';
+    // The selected card has to be readable at a glance from across a table: a
+    // 2px gold outline on a white card, lifted by a few pixels, was a border
+    // rather than a choice. It now lifts further, grows, glows and takes an
+    // amber face — the same gold as the ring around the peg it is paired with,
+    // so "this card, this peg" reads as one thing.
+    const selectedLook = isSelected
+      ? 'relative z-10 ring-4 ring-yellow-400 -translate-y-3 scale-110 shadow-[0_0_14px_rgba(250,204,21,0.85)]'
+      : 'hover:-translate-y-1';
     return (
       <div
         key={card.id}
         onClick={() => handleCardClick(index)}
-        className={`cursor-pointer transition-transform ${isSelected ? 'ring-2 ring-yellow-400 -translate-y-2' : 'hover:-translate-y-1'} ${discardHighlight} ${deadCard}`}
+        className={`cursor-pointer transition-all ${selectedLook} ${discardHighlight} ${deadCard}`}
         style={{
           width: 50,
           height: 70,
-          backgroundColor: discardMode ? '#FEE2E2' : 'white',
-          border: '1px solid #ccc',
+          backgroundColor: discardMode ? '#FEE2E2' : (isSelected ? '#FEF3C7' : 'white'),
+          border: isSelected ? `2px solid ${SELECTED_PEG_COLOR}` : '1px solid #ccc',
           borderRadius: 4,
           display: 'flex',
           flexDirection: 'column',
@@ -4519,7 +4599,15 @@ export default function PegsAndJokers() {
               {Array.from({ length: TRACK_LENGTH }).map((_, i) => {
                 const { x, y } = getTrackPosition(i);
                 const isHomeEntrance = i % SPACES_PER_SIDE === 3;
+                // The space a peg comes out onto (getStartPosition). It was the
+                // one important space on the board with no marking at all, which
+                // made the rule that hangs off it invisible: one of your own
+                // pegs standing here blocks every peg in start, and until you
+                // can see the space you cannot see why. Dashed, so it reads as
+                // a doorway rather than as the solid home entrance ring.
+                const isComeOut = i % SPACES_PER_SIDE === 8;
                 const playerSection = Math.floor(i / SPACES_PER_SIDE);
+                const marked = isHomeEntrance || isComeOut;
                 return (
                   <circle
                     key={`track-${i}`}
@@ -4527,8 +4615,10 @@ export default function PegsAndJokers() {
                     cy={y}
                     r={6}
                     fill="#4B5563"
-                    stroke={isHomeEntrance ? PLAYER_COLORS[playerSection] : '#374151'}
-                    strokeWidth={isHomeEntrance ? 2 : 1}
+                    stroke={marked ? PLAYER_COLORS[playerSection] : '#374151'}
+                    strokeWidth={marked ? 2 : 1}
+                    strokeDasharray={isComeOut ? '2 2' : undefined}
+                    strokeOpacity={isComeOut ? 0.85 : 1}
                   />
                 );
               })}
@@ -4544,7 +4634,10 @@ export default function PegsAndJokers() {
                     const isFlyingBack = isPegBumping(player, i);
                     const hasPeg = pegs[player][i]?.location === 'start' && !isFlyingBack
                       && !isPegAnimating(player, i) && !isPegLanded(player, i);
-                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && !jokerMode;
+                    // Clickable in joker mode too — a joker's source is always a
+                    // track peg, so tapping one of your own pegs anywhere else
+                    // can only mean "cancel", which is what handlePegClick does.
+                    const isClickable = isMyTurn && player === controlledOwner && hasPeg;
                     const isSelected = player === controlledOwner && (i === selectedPeg || i === jokerSourcePeg) && pegs[player][i]?.location === 'start';
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(i);
                     const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(i);
@@ -4559,11 +4652,12 @@ export default function PegsAndJokers() {
                           cy={y}
                           r={5}
                           fill={hasPeg ? PLAYER_COLORS[player] : '#374151'}
-                          stroke={isSelected || isMovable ? 'white' : PLAYER_COLORS[player]}
+                          stroke={isSelected ? SELECTED_PEG_COLOR : (isMovable ? 'white' : PLAYER_COLORS[player])}
                           strokeWidth={isSelected || isMovable ? 2 : 1.5}
                           opacity={isDimmed ? 0.4 : 1}
-                          className={isMovable ? 'peg-glow' : undefined}
+                          className={isSelected ? undefined : (isMovable ? 'peg-glow' : undefined)}
                         />
+                        {isSelected && renderSelectionRing(x, y, 9)}
                         {isClickable && <circle cx={x} cy={y} r={12} fill="transparent" />}
                       </g>
                     );
@@ -4587,7 +4681,9 @@ export default function PegsAndJokers() {
                     // it in the slot it left while the pin draws it in the one
                     // it reached.
                     const hasPeg = pegIndex !== -1 && !isPegAnimating(player, pegIndex) && !isPegLanded(player, pegIndex);
-                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && i < 4 && !jokerMode;
+                    // `i < 4` because a peg in the last home slot can never move
+                    // again; in joker mode any of your own pegs is a cancel tap.
+                    const isClickable = isMyTurn && player === controlledOwner && hasPeg && (i < 4 || jokerMode);
                     const isSelected = player === controlledOwner && pegIndex === selectedPeg && hasPeg;
                     const isMovable = player === controlledOwner && hasPeg && movablePegSet != null && movablePegSet.has(pegIndex);
                     const isDimmed = player === controlledOwner && hasPeg && movablePegSet != null && !movablePegSet.has(pegIndex);
@@ -4602,11 +4698,12 @@ export default function PegsAndJokers() {
                           cy={y}
                           r={5}
                           fill={hasPeg ? PLAYER_COLORS[player] : '#374151'}
-                          stroke={isSelected || isMovable ? 'white' : PLAYER_COLORS[player]}
+                          stroke={isSelected ? SELECTED_PEG_COLOR : (isMovable ? 'white' : PLAYER_COLORS[player])}
                           strokeWidth={isSelected || isMovable ? 2 : 1.5}
                           opacity={isDimmed ? 0.4 : 1}
-                          className={isMovable ? 'peg-glow' : undefined}
+                          className={isSelected ? undefined : (isMovable ? 'peg-glow' : undefined)}
                         />
+                        {isSelected && renderSelectionRing(x, y, 9)}
                         {isClickable && <circle cx={x} cy={y} r={11} fill="transparent" />}
                       </g>
                     );
@@ -4669,11 +4766,12 @@ export default function PegsAndJokers() {
                         cy={pos.y}
                         r={7}
                         fill={PLAYER_COLORS[player]}
-                        stroke={isSelected || isMovable ? 'white' : (isJokerTarget ? '#EF4444' : '#1F2937')}
+                        stroke={isSelected ? SELECTED_PEG_COLOR : (isMovable ? 'white' : (isJokerTarget ? '#EF4444' : '#1F2937'))}
                         strokeWidth={isSelected ? 2 : (isJokerTarget ? 3 : (isMovable ? 2 : 1))}
                         opacity={isDimmed ? 0.4 : 1}
-                        className={isMovable || isJokerTarget ? 'peg-glow' : undefined}
+                        className={isSelected ? undefined : ((isMovable || isJokerTarget) ? 'peg-glow' : undefined)}
                       />
+                      {isSelected && renderSelectionRing(pos.x, pos.y, 11)}
                       {isClickable && <circle cx={pos.x} cy={pos.y} r={13} fill="transparent" />}
                     </g>
                   );
@@ -5116,8 +5214,15 @@ export default function PegsAndJokers() {
           {/* Hand and Controls */}
           <div className="flex-1 w-full lg:w-auto">
             <div className="mb-4">
-              <h3 className="text-lg font-semibold mb-2">Your Hand:</h3>
-              <div className="flex gap-2 flex-wrap">
+              <h3 className="text-lg font-semibold">Your Hand:</h3>
+              {/* Always mounted, so it costs no layout (see "Nothing else
+                  appears and disappears above the board"). It states the one
+                  rule of the input: a card, then a peg, and the card again to
+                  change your mind. */}
+              <p className="text-xs text-gray-400">Tap a card, then a glowing peg. Tap the card again to unpick it.</p>
+              {/* pt-4 is headroom for the selected card, which lifts and grows
+                  — without it the raised card sits on top of the hint above. */}
+              <div className="flex gap-2 flex-wrap pt-5">
                 {myHand.map((card, i) => renderCard(card, i, i === selectedCard, playableCards[i]))}
               </div>
             </div>
@@ -5135,6 +5240,15 @@ export default function PegsAndJokers() {
                     the 9 in the opposite direction.
                   </p>
                 )}
+                {/* Nothing has been played yet — this state is waiting on a
+                    destination tap, and it needs the same visible way out that
+                    joker mode has. */}
+                <button
+                  onClick={clearSelection}
+                  className="mt-2 px-3 py-1 bg-gray-600 rounded hover:bg-gray-700"
+                >
+                  Cancel
+                </button>
               </div>
             )}
 
@@ -5205,6 +5319,7 @@ export default function PegsAndJokers() {
                 <li>• 9: Split between two pegs (one forward, one backward)</li>
                 <li>• Joker: Bump any opponent peg</li>
                 <li>• Cannot jump or land on your own pegs</li>
+                <li>• Your own peg on your come-out space (the dashed ring) blocks every peg in START — move it first</li>
                 <li>• <span className="text-yellow-400">Stuck 3 turns in a row = auto-start a peg!</span></li>
                 {gameMode === GAME_MODES.PARTNERS && (
                   <>

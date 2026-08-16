@@ -13,6 +13,7 @@ import {
   calculateMovePath,
   getValidDestinations,
   getMovablePegs,
+  explainNoMove,
   findBumps
 } from './engine.js';
 import { TRACK_LENGTH } from './constants.js';
@@ -594,6 +595,49 @@ describe('getMovablePegs', () => {
   it('for a joker, lists nothing when no opponent is on track', () => {
     const pegs = pegState([[1, 0, onTrack(30)]]);
     expect(getMovablePegs(1, card('JOKER'), pegs)).toHaveLength(0);
+  });
+});
+
+describe('explainNoMove', () => {
+  const jack = card('J');
+
+  it('says nothing about a peg that can move', () => {
+    const pegs = pegState();
+    expect(explainNoMove(0, 0, jack, pegs)).toBeNull();
+  });
+
+  it('names your own peg on the come-out space, which blocks every peg in start', () => {
+    // The reported board: one peg parked on the come-out spot, the rest in
+    // start, a Jack in hand — and no start peg can be played.
+    const pegs = pegState([[0, 4, onTrack(getStartPosition(0))]]);
+    expect(getMovablePegs(0, jack, pegs)).toEqual([4]);
+    for (const i of [0, 1, 2, 3]) {
+      expect(explainNoMove(0, i, jack, pegs)).toMatch(/own peg .* come-out space \(8\)/);
+    }
+  });
+
+  it('says nothing when the come-out space holds an opponent — you bump them', () => {
+    const pegs = pegState([[1, 0, onTrack(getStartPosition(0))]]);
+    expect(getMovablePegs(0, jack, pegs)).toEqual([0, 1, 2, 3, 4]);
+    expect(explainNoMove(0, 0, jack, pegs)).toBeNull();
+  });
+
+  it('says nothing about a peg on the home entrance, which blocks nothing', () => {
+    const pegs = pegState([[0, 4, onTrack(getHomeEntrance(0))]]);
+    expect(getMovablePegs(0, jack, pegs)).toEqual([0, 1, 2, 3, 4]);
+    expect(explainNoMove(0, 0, jack, pegs)).toBeNull();
+  });
+
+  it('names the cards that can bring a peg out when the card cannot', () => {
+    const pegs = pegState();
+    expect(explainNoMove(0, 0, card('7'), pegs)).toMatch(/Ace, Jack, Queen, King or Joker/);
+  });
+
+  it('falls through to null for an ordinary "it just does not reach" refusal', () => {
+    // Peg 0 on the track, blocked from moving 5 by its own peg 5 spaces ahead.
+    const pegs = pegState([[0, 0, onTrack(30)], [0, 1, onTrack(35)]]);
+    expect(getMovablePegs(0, card('5'), pegs)).not.toContain(0);
+    expect(explainNoMove(0, 0, card('5'), pegs)).toBeNull();
   });
 });
 
