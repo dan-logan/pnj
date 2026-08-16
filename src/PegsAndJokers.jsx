@@ -22,6 +22,8 @@ import {
   calculateMovePath,
   getValidDestinations,
   getMovablePegs,
+  getStartPosition,
+  explainNoMove,
   findBumps,
   splitCompleter
 } from './game/engine.js';
@@ -3265,7 +3267,13 @@ export default function PegsAndJokers() {
     }
 
     if (movablePegSet && !movablePegSet.has(pegIndex)) {
-      setNotice('That peg has no legal move with this card. Tap a glowing peg, or tap the card again to choose another.');
+      // Some refusals have a reason worth spelling out — above all your own peg
+      // holding your come-out space, which blocks every peg in start at once and
+      // is invisible on the board.
+      setNotice(
+        explainNoMove(controlledOwner, pegIndex, selectedCardObj, pegs, moveOptions)
+        ?? 'That peg has no legal move with this card. Tap a glowing peg, or tap the card again to choose another.'
+      );
       return;
     }
 
@@ -3565,16 +3573,24 @@ export default function PegsAndJokers() {
     const isRed = card.suit === '♥' || card.suit === '♦';
     const discardHighlight = discardMode ? 'ring-2 ring-red-400 hover:ring-red-300' : '';
     const deadCard = !isPlayable && !discardMode ? 'opacity-50' : '';
+    // The selected card has to be readable at a glance from across a table: a
+    // 2px gold outline on a white card, lifted by a few pixels, was a border
+    // rather than a choice. It now lifts further, grows, glows and takes an
+    // amber face — the same gold as the ring around the peg it is paired with,
+    // so "this card, this peg" reads as one thing.
+    const selectedLook = isSelected
+      ? 'relative z-10 ring-4 ring-yellow-400 -translate-y-3 scale-110 shadow-[0_0_14px_rgba(250,204,21,0.85)]'
+      : 'hover:-translate-y-1';
     return (
       <div
         key={card.id}
         onClick={() => handleCardClick(index)}
-        className={`cursor-pointer transition-transform ${isSelected ? 'ring-2 ring-yellow-400 -translate-y-2' : 'hover:-translate-y-1'} ${discardHighlight} ${deadCard}`}
+        className={`cursor-pointer transition-all ${selectedLook} ${discardHighlight} ${deadCard}`}
         style={{
           width: 50,
           height: 70,
-          backgroundColor: discardMode ? '#FEE2E2' : 'white',
-          border: '1px solid #ccc',
+          backgroundColor: discardMode ? '#FEE2E2' : (isSelected ? '#FEF3C7' : 'white'),
+          border: isSelected ? `2px solid ${SELECTED_PEG_COLOR}` : '1px solid #ccc',
           borderRadius: 4,
           display: 'flex',
           flexDirection: 'column',
@@ -4583,7 +4599,15 @@ export default function PegsAndJokers() {
               {Array.from({ length: TRACK_LENGTH }).map((_, i) => {
                 const { x, y } = getTrackPosition(i);
                 const isHomeEntrance = i % SPACES_PER_SIDE === 3;
+                // The space a peg comes out onto (getStartPosition). It was the
+                // one important space on the board with no marking at all, which
+                // made the rule that hangs off it invisible: one of your own
+                // pegs standing here blocks every peg in start, and until you
+                // can see the space you cannot see why. Dashed, so it reads as
+                // a doorway rather than as the solid home entrance ring.
+                const isComeOut = i % SPACES_PER_SIDE === 8;
                 const playerSection = Math.floor(i / SPACES_PER_SIDE);
+                const marked = isHomeEntrance || isComeOut;
                 return (
                   <circle
                     key={`track-${i}`}
@@ -4591,8 +4615,10 @@ export default function PegsAndJokers() {
                     cy={y}
                     r={6}
                     fill="#4B5563"
-                    stroke={isHomeEntrance ? PLAYER_COLORS[playerSection] : '#374151'}
-                    strokeWidth={isHomeEntrance ? 2 : 1}
+                    stroke={marked ? PLAYER_COLORS[playerSection] : '#374151'}
+                    strokeWidth={marked ? 2 : 1}
+                    strokeDasharray={isComeOut ? '2 2' : undefined}
+                    strokeOpacity={isComeOut ? 0.85 : 1}
                   />
                 );
               })}
@@ -5188,8 +5214,15 @@ export default function PegsAndJokers() {
           {/* Hand and Controls */}
           <div className="flex-1 w-full lg:w-auto">
             <div className="mb-4">
-              <h3 className="text-lg font-semibold mb-2">Your Hand:</h3>
-              <div className="flex gap-2 flex-wrap">
+              <h3 className="text-lg font-semibold">Your Hand:</h3>
+              {/* Always mounted, so it costs no layout (see "Nothing else
+                  appears and disappears above the board"). It states the one
+                  rule of the input: a card, then a peg, and the card again to
+                  change your mind. */}
+              <p className="text-xs text-gray-400">Tap a card, then a glowing peg. Tap the card again to unpick it.</p>
+              {/* pt-4 is headroom for the selected card, which lifts and grows
+                  — without it the raised card sits on top of the hint above. */}
+              <div className="flex gap-2 flex-wrap pt-5">
                 {myHand.map((card, i) => renderCard(card, i, i === selectedCard, playableCards[i]))}
               </div>
             </div>
@@ -5286,6 +5319,7 @@ export default function PegsAndJokers() {
                 <li>• 9: Split between two pegs (one forward, one backward)</li>
                 <li>• Joker: Bump any opponent peg</li>
                 <li>• Cannot jump or land on your own pegs</li>
+                <li>• Your own peg on your come-out space (the dashed ring) blocks every peg in START — move it first</li>
                 <li>• <span className="text-yellow-400">Stuck 3 turns in a row = auto-start a peg!</span></li>
                 {gameMode === GAME_MODES.PARTNERS && (
                   <>
