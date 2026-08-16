@@ -105,6 +105,20 @@ export function stageBumpFlights(count, leadCount = 0) {
 // `specialPlayHoldMs`, which is the whole thing a caller has to wait out.
 export const SPECIAL_PAUSE_MS = 2000;
 
+// The beat between the winning move finishing and the result overlay going up.
+//
+// The overlay is a modal: it covers the very position the move just created,
+// and the game is over, so there is no "look again in a moment" afterwards.
+// Shorter than a special play's pause — the result is what the player is
+// waiting for by then, and the board can be inspected at leisure once the
+// overlay is dismissed — but long enough that the last peg is seen to arrive
+// rather than being wiped off the screen as it lands.
+//
+// Added by `endGame` on top of whatever the winning move itself still owed,
+// and only when the move had something to show at all: a win adopted from the
+// wire, or one played with animations off, still lands instantly.
+export const WIN_PAUSE_MS = 900;
+
 // The beat *between* the two halves of a split — the one card in the game that
 // moves two different pegs off one play.
 //

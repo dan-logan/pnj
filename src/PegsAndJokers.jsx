@@ -116,6 +116,7 @@ import {
   BUMP_FLY_TICK_MS,
   JOKER_CARD_MS,
   JOKER_CARD_HOLD_MS,
+  WIN_PAUSE_MS,
 } from './anim.js';
 
 // Instant-replay pacing. Deliberately slower than the live step so a round of
@@ -244,6 +245,15 @@ export default function PegsAndJokers() {
   // The overlay covers the board, so it can be dismissed to inspect the final
   // position and reopened from the status line.
   const [endOverlayDismissed, setEndOverlayDismissed] = useState(false);
+  // True while the *winning move is still on screen*: the game is over and
+  // nothing else may happen, but the peg that ended it is still counting its
+  // way along the board, its card is still over the middle of it and whatever
+  // it bumped is still flying. The result waits for all of that — a win used to
+  // cancel its own move's animation mid-glide and drop the overlay over a board
+  // that had teleported, which is the one move in the game you most want to
+  // watch. See endGame's `presentDelayMs`.
+  const [resultPending, setResultPending] = useState(false);
+  const endHoldRef = useRef(null);
   const [lastMoves, setLastMoves] = useState([null, null, null, null]); // Last move description per player
 
   // Replaces every `currentPlayer === 0` turn gate in the component.
@@ -615,35 +625,59 @@ export default function PegsAndJokers() {
   const [pendingResume, setPendingResume] = useState(null);
   const [showResumeModal, setShowResumeModal] = useState(false);
 
+  // Take the board back off the animation layer: every timer that is still
+  // showing something, and every piece of overlay state it draws through. Split
+  // out of `endGame` because the winning move is allowed to finish first — see
+  // `presentDelayMs` below, which runs exactly this after the hold instead of
+  // immediately.
+  const stopMoveVisuals = useCallback(() => {
+    if (animationRef.current) { clearInterval(animationRef.current); animationRef.current = null; }
+    if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
+    if (bumpHoldRef.current) { clearTimeout(bumpHoldRef.current); bumpHoldRef.current = null; }
+    if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
+    arrivalTimersRef.current.forEach(clearTimeout);
+    arrivalTimersRef.current = [];
+    clearAnnouncements();
+    clearSplitVisual();
+    setAnimatingPeg(null);
+    setVisualBusy(false);
+    setNowPlaying(null);
+    setBumpFx(null);
+  }, [clearAnnouncements, clearSplitVisual]);
+
   // The one terminal transition. Every win-detection site routes through here —
   // your move, a split that completes the win, an AI move, and later a finished
   // state arriving over the wire — so a finished game looks the same however it
   // was observed, and nothing is left running behind it.
-  const endGame = useCallback((winnerIdx, { winningSeat = null, description = null } = {}) => {
+  //
+  // `presentDelayMs` is how long the winning move still owes the eye. The game
+  // is over the moment this is called — `winner` is set, stats are recorded,
+  // nothing may move again — but a *locally played* winning move is still on
+  // screen when its own win is detected (a human move commits before its
+  // cosmetic glide runs at all), and cancelling it was how the last move of
+  // every game came to be the one move you never got to watch. So the win is
+  // committed immediately and only the *presentation* waits: the peg finishes
+  // counting, its card lands on the pile, whatever it bumped finishes flying,
+  // and then the result appears. A win adopted from the wire passes 0 — there
+  // is nothing on this screen to wait for, and the auto-replay is what gets
+  // watched there instead.
+  const endGame = useCallback((winnerIdx, { winningSeat = null, description = null, presentDelayMs = 0 } = {}) => {
     if (winnerIdx === null || winnerIdx === undefined) return;
     if (endedRef.current) return; // already terminal
     endedRef.current = true;
 
     // 1. Cancel everything pending. A timer that fires after the game ends and
     //    overwrites the result is the bug this whole package exists to remove.
-    if (animationRef.current) { clearInterval(animationRef.current); animationRef.current = null; }
-    if (bumpFxRef.current) { clearInterval(bumpFxRef.current); bumpFxRef.current = null; }
-    if (bumpHoldRef.current) { clearTimeout(bumpHoldRef.current); bumpHoldRef.current = null; }
+    //    The move *visuals* are the one exception, and only while the winning
+    //    move is still playing: they are torn down by the same timer that
+    //    reveals the result, so nothing outlives the hold either way.
     if (replaySegTimerRef.current) { clearInterval(replaySegTimerRef.current); replaySegTimerRef.current = null; }
     if (replayFrameTimerRef.current) { clearTimeout(replayFrameTimerRef.current); replayFrameTimerRef.current = null; }
     if (spinIntervalRef.current) { clearInterval(spinIntervalRef.current); spinIntervalRef.current = null; }
     if (aiTimerRef.current) { clearTimeout(aiTimerRef.current); aiTimerRef.current = null; }
-    if (settleTimerRef.current) { clearTimeout(settleTimerRef.current); settleTimerRef.current = null; }
-    arrivalTimersRef.current.forEach(clearTimeout);
-    arrivalTimersRef.current = [];
-    clearAnnouncements();
-    clearSplitVisual();
+    if (endHoldRef.current) { clearTimeout(endHoldRef.current); endHoldRef.current = null; }
     replayCancelRef.current = true;
     aiProcessingRef.current = false;
-    setAnimatingPeg(null);
-    setVisualBusy(false);
-    setNowPlaying(null);
-    setBumpFx(null);
     setIsReplaying(false);
     setReplayInfo(null);
     setNotice(null);
@@ -656,6 +690,22 @@ export default function PegsAndJokers() {
     if (replayRestoreRef.current) {
       setPegs(replayRestoreRef.current);
       replayRestoreRef.current = null;
+    }
+
+    // What the move still owes, plus a beat of the finished board before the
+    // modal covers it (WIN_PAUSE_MS). A hold of nothing stays nothing: a win
+    // with nothing on screen to wait for — animations off, or a result adopted
+    // from the wire — is presented immediately, exactly as it always was.
+    if (presentDelayMs > 0) {
+      setResultPending(true);
+      endHoldRef.current = setTimeout(() => {
+        endHoldRef.current = null;
+        stopMoveVisuals();
+        setResultPending(false);
+      }, presentDelayMs + WIN_PAUSE_MS);
+    } else {
+      stopMoveVisuals();
+      setResultPending(false);
     }
 
     // 2. The winner. Classic: a player index. Partners: a *team* index.
@@ -696,7 +746,7 @@ export default function PegsAndJokers() {
     setStats(updated);
     setEndInfo({ winner: winnerIdx, winningSeat, description, ...tallies });
     setEndOverlayDismissed(false);
-  }, [clearAnnouncements]);
+  }, [stopMoveVisuals]);
 
   // In partner mode, once your own pegs are all home you play your hand on your
   // partner's pegs; otherwise you always control your own seat's pegs. This is
@@ -769,6 +819,11 @@ export default function PegsAndJokers() {
     endedRef.current = false;
     setEndInfo(null);
     setEndOverlayDismissed(false);
+    // A result still waiting on the last game's winning move must not be
+    // carried into this one — the hold reveals an overlay, so a stranded one
+    // would drop the previous game's result over a freshly dealt board.
+    if (endHoldRef.current) { clearTimeout(endHoldRef.current); endHoldRef.current = null; }
+    setResultPending(false);
     setShowFirstPlayerModal(false);
   }, [resetReplay, ownsSeat, clearAnnouncements, clearSplitVisual]);
 
@@ -897,6 +952,11 @@ export default function PegsAndJokers() {
     endedRef.current = false;
     setEndInfo(null);
     setEndOverlayDismissed(false);
+    // Same reason the board hold is cancelled above: a pending result belongs
+    // to the game being replaced, and revealing it here would put that game's
+    // overlay over this one.
+    if (endHoldRef.current) { clearTimeout(endHoldRef.current); endHoldRef.current = null; }
+    setResultPending(false);
 
     // Seed the turn-return tracker to the restored player so resuming doesn't
     // fire a spurious "your turn" chime.
@@ -972,6 +1032,8 @@ export default function PegsAndJokers() {
     setNotice(null);
     setEndInfo(null);
     setEndOverlayDismissed(false);
+    if (endHoldRef.current) { clearTimeout(endHoldRef.current); endHoldRef.current = null; }
+    setResultPending(false);
     endedRef.current = false;
 
     // No game is in progress, so nothing may be carried into the one that is
@@ -1559,6 +1621,30 @@ export default function PegsAndJokers() {
     });
   }, [animationsEnabled, animateMove, pacing.stepMs, pacing.settleMs, showNowPlaying, holdBoard]);
 
+  // How long `playMoveVisual` keeps the board for a move that has just
+  // committed: the glide (`animateMove` calls back a step *after* the peg lands
+  // on its last space — see `landingDelayFor`), then the settle beat and
+  // whatever extra a special play earned. The one caller is the winning move,
+  // which needs the same number so the result can wait for exactly as long as
+  // the move it is announcing (endGame's `presentDelayMs`). Zero with
+  // animations off, where there is no playback to wait for and the pacing table
+  // is zeroes anyway.
+  const moveVisualMs = useCallback((travelMs, extraHoldMs = 0) => (
+    animationsEnabled ? travelMs + pacing.stepMs + pacing.settleMs + extraHoldMs : 0
+  ), [animationsEnabled, pacing.stepMs, pacing.settleMs]);
+
+  // The card a seat draws to replace the one it just played — except on the
+  // move that ends the game. Nothing will ever be played from that hand again,
+  // and `drawCard` folds *every* discard pile back into the deck when it runs
+  // dry: on the winning move that would empty the final board's piles, winning
+  // card and all, which is precisely the thing the card was just put there to
+  // show. Kept as one helper so all four "play a card" sites read the same way.
+  const drawReplacement = useCallback((finished, currentDeck, piles) => (
+    finished
+      ? { card: null, newDeck: currentDeck, newDiscardPiles: piles }
+      : drawCard(currentDeck, piles)
+  ), []);
+
   // Fly every peg a move displaced, from the space it was on to wherever the
   // bump sent it. `items` is [{ player, pegIndex, from, to, kind, onImpact }]
   // in *causal* order — the peg that was pushed first goes first — and they all
@@ -1819,6 +1905,7 @@ export default function PegsAndJokers() {
       if (replayFrameTimerRef.current) clearTimeout(replayFrameTimerRef.current);
       if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
       if (splitBeatRef.current) clearTimeout(splitBeatRef.current);
+      if (endHoldRef.current) clearTimeout(endHoldRef.current);
       if (bumpFxRef.current) clearInterval(bumpFxRef.current);
       if (bumpHoldRef.current) clearTimeout(bumpHoldRef.current);
       arrivals.current.forEach(clearTimeout);
@@ -2182,18 +2269,13 @@ export default function PegsAndJokers() {
 
     turnsRef.current += 1; // §4.4: once per seat that actually moves
 
-    const w = checkWinner(newPegs, gameMode);
-    if (w !== null) {
-      endGame(w, { winningSeat: actor, description: moveDescription });
-      const nextPlayer = (actor + 1) % 4;
-      commitTurn({
-        nextPlayer, pegs: newPegs, hands, deck, discardPiles, stuckCounts,
-        lastMoves: updatedLastMoves, frame, winner: w, winningSeat: actor, description: moveDescription,
-      });
-      return true;
-    }
-
-    // Remove card from the human's hand and draw new one
+    // Spend the card *before* the win check. The winning move is still a move:
+    // it leaves your hand and lands on your discard pile like any other. This
+    // used to sit below the check and be skipped by the one move that ends the
+    // game, so a game you won with a 4 finished with that 4 still in your hand
+    // and the pile showing whatever you had played the turn before — and the
+    // card flying to the pile over the board landed on the wrong card. (The
+    // joker site has always done it in this order; the two move sites hadn't.)
     const newHands = hands.map(h => [...h]);
     const cardIndex = newHands[actor].findIndex(c => c.id === card.id);
     const discarded = newHands[actor].splice(cardIndex, 1)[0];
@@ -2203,7 +2285,10 @@ export default function PegsAndJokers() {
       i === actor ? [...pile, discarded] : [...pile]
     );
 
-    const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
+    const w = checkWinner(newPegs, gameMode);
+
+    const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } =
+      drawReplacement(w !== null, deck, newDiscardPiles);
     if (newCard) newHands[actor].push(newCard);
 
     setHands(newHands);
@@ -2214,6 +2299,23 @@ export default function PegsAndJokers() {
     const newStuckCounts = [...stuckCounts];
     newStuckCounts[actor] = 0;
     setStuckCounts(newStuckCounts);
+
+    if (w !== null) {
+      // The move is only just starting to animate (the state commits first —
+      // see playMoveVisual), so the result waits for it.
+      endGame(w, {
+        winningSeat: actor,
+        description: moveDescription,
+        presentDelayMs: moveVisualMs(travelMs, specialHoldMs),
+      });
+      const nextPlayer = (actor + 1) % 4;
+      commitTurn({
+        nextPlayer, pegs: newPegs, hands: newHands, deck: newDeck, discardPiles: updatedDiscardPiles,
+        stuckCounts: newStuckCounts, lastMoves: updatedLastMoves, frame,
+        winner: w, winningSeat: actor, description: moveDescription,
+      });
+      return true;
+    }
 
     setSelectedCard(null);
     setSelectedPeg(null);
@@ -2232,7 +2334,7 @@ export default function PegsAndJokers() {
     setNotice(null);
 
     return true;
-  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat, endGame, commitTurn, landingDelayFor, playMoveVisual]);
+  }, [pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, moveOptions, gameMode, mySeat, endGame, commitTurn, landingDelayFor, playMoveVisual, moveVisualMs, drawReplacement]);
 
   const completeSplit = useCallback((pegIndex, amount) => {
     const actor = mySeat;
@@ -2289,17 +2391,9 @@ export default function PegsAndJokers() {
 
     turnsRef.current += 1; // §4.4: once per seat that actually moves
 
-    const w = checkWinner(newPegs, gameMode);
-    if (w !== null) {
-      endGame(w, { winningSeat: actor, description: splitDescription });
-      const nextPlayer = (actor + 1) % 4;
-      commitTurn({
-        nextPlayer, pegs: newPegs, hands, deck, discardPiles, stuckCounts,
-        lastMoves: updatedLastMoves, frame, winner: w, winningSeat: actor, description: splitDescription,
-      });
-      return true;
-    }
-
+    // The card is spent whether or not the second half won the game — see the
+    // same note in executeMove, and the joker site, which has always done it in
+    // this order.
     const newHands = hands.map(h => [...h]);
     const cardIndex = newHands[actor].findIndex(c => c.id === splitCard.id);
     const discarded = newHands[actor].splice(cardIndex, 1)[0];
@@ -2309,7 +2403,10 @@ export default function PegsAndJokers() {
       i === actor ? [...pile, discarded] : [...pile]
     );
 
-    const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
+    const w = checkWinner(newPegs, gameMode);
+
+    const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } =
+      drawReplacement(w !== null, deck, newDiscardPiles);
     if (newCard) newHands[actor].push(newCard);
 
     setHands(newHands);
@@ -2320,6 +2417,23 @@ export default function PegsAndJokers() {
     const newStuckCounts = [...stuckCounts];
     newStuckCounts[actor] = 0;
     setStuckCounts(newStuckCounts);
+
+    if (w !== null) {
+      // The second half is only just starting to animate; the result waits for
+      // it (see executeMove).
+      endGame(w, {
+        winningSeat: actor,
+        description: splitDescription,
+        presentDelayMs: moveVisualMs(travelMs, specialHoldMs),
+      });
+      const nextPlayer = (actor + 1) % 4;
+      commitTurn({
+        nextPlayer, pegs: newPegs, hands: newHands, deck: newDeck, discardPiles: updatedDiscardPiles,
+        stuckCounts: newStuckCounts, lastMoves: updatedLastMoves, frame,
+        winner: w, winningSeat: actor, description: splitDescription,
+      });
+      return true;
+    }
 
     setSelectedCard(null);
     setSelectedPeg(null);
@@ -2336,7 +2450,7 @@ export default function PegsAndJokers() {
     setNotice(null);
 
     return true;
-  }, [splitCard, splitPegIndex, splitOwner, splitUndo, pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat, endGame, commitTurn, landingDelayFor, playMoveVisual]);
+  }, [splitCard, splitPegIndex, splitOwner, splitUndo, pegs, hands, deck, discardPiles, stuckCounts, lastMoves, triggerMoveEffects, controlledOwnerFor, moveOptions, gameMode, mySeat, endGame, commitTurn, landingDelayFor, playMoveVisual, moveVisualMs, drawReplacement]);
 
   // Undo a half-finished split: restore the board (and anything the first half
   // bumped) to the snapshot taken before it, and return the turn to the point
@@ -2544,7 +2658,10 @@ export default function PegsAndJokers() {
           i === aiPlayer ? [...pile, discarded] : [...pile]
         );
 
-        const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
+        const w = checkWinner(newPegs, gameMode);
+
+        const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } =
+          drawReplacement(w !== null, deck, newDiscardPiles);
         if (newCard) newHands[aiPlayer].push(newCard);
 
         setHands(newHands);
@@ -2562,9 +2679,18 @@ export default function PegsAndJokers() {
         // undercounts across an adopted remote state).
         turnsRef.current += 1;
 
-        const w = checkWinner(newPegs, gameMode);
         if (w !== null) {
-          endGame(w, { winningSeat: aiPlayer, description: moveDescription });
+          // The peg has already finished gliding by the time this runs, but
+          // what the move *caused* has not: a winning bump is still in the air,
+          // a winning joker's card is still throbbing over the board, and the
+          // settle beat is what separates the move from the result. A silent
+          // catch-up simulation has nothing on screen to wait for.
+          // (The hold is exactly what the settle beat below would have been.)
+          endGame(w, {
+            winningSeat: aiPlayer,
+            description: moveDescription,
+            presentDelayMs: silent ? 0 : pacing.settleMs + jokerDelay + specialHoldMs,
+          });
           // A decision the plan doesn't spell out: §4.2 says the AI effect's
           // own player-advance "must stay purely local", folded into this
           // client's *next* human publish. But if the AI's move ends the
@@ -2777,7 +2903,7 @@ export default function PegsAndJokers() {
       if (aiTimerRef.current === timer) aiTimerRef.current = null;
       aiProcessingRef.current = false;
     };
-  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, announce, showNowPlaying, landingDelayFor, holdBoard, animationSpeed, pegAnchor, clearSplitVisual]);
+  }, [currentPlayer, isMyTurn, winner, hands, pegs, deck, discardPiles, stuckCounts, lastMoves, discardAndDraw, animationsEnabled, animateMove, triggerMoveEffects, recordReplayFrame, gameMode, ownsSeat, endGame, seatOwners, session, commitTurn, visualBusy, pacing.thinkMs, pacing.settleMs, announce, showNowPlaying, landingDelayFor, holdBoard, animationSpeed, pegAnchor, clearSplitVisual, drawReplacement]);
 
   // Chime + gentle buzz when control passes back to a seat you own
   useEffect(() => {
@@ -2792,14 +2918,20 @@ export default function PegsAndJokers() {
   // transition-watching effect only fires for whoever happened to be looking,
   // which is wrong the moment a game can end on another device. endGame records
   // them from the terminal state instead.
+  //
+  // It sounds with the *result*, not with the win: while the winning move is
+  // still playing out (`resultPending`) the board is still making that move's
+  // own noises — the step clicks, the peg-is-home chime, a bump — and a
+  // fanfare over the top of them is the audible version of the overlay landing
+  // on a board that hasn't finished moving.
   useEffect(() => {
-    if (winner === null) return;
+    if (winner === null || resultPending) return;
     if (didIWin(winner, gameMode, mySeats)) {
       sfx.win();
     } else {
       sfx.lose();
     }
-  }, [winner, gameMode, mySeats]);
+  }, [winner, resultPending, gameMode, mySeats]);
 
   // Persist the in-progress game after every committed change so a mobile tab
   // eviction (a phone call mid-game) doesn't lose it. Skip while a modal is up
@@ -2866,7 +2998,7 @@ export default function PegsAndJokers() {
   // is still drawn over the board; the *words* live in the status box, which is
   // where a player is already looking and which costs no layout to change.
   const statusMove = useMemo(
-    () => (nowPlaying && !isReplaying && winner === null
+    () => (nowPlaying && !isReplaying && (winner === null || resultPending)
       ? {
           player: nowPlaying.player,
           card: nowPlaying.card,
@@ -2874,7 +3006,7 @@ export default function PegsAndJokers() {
           mine: ownsSeat(nowPlaying.player),
         }
       : null),
-    [nowPlaying, isReplaying, winner, ownsSeat]
+    [nowPlaying, isReplaying, winner, resultPending, ownsSeat]
   );
 
   const statusParts = useMemo(
@@ -3128,7 +3260,10 @@ export default function PegsAndJokers() {
       i === actor ? [...pile, discarded] : [...pile]
     );
 
-    const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } = drawCard(deck, newDiscardPiles);
+    const w = checkWinner(newPegs, gameMode);
+
+    const { card: newCard, newDeck, newDiscardPiles: updatedDiscardPiles } =
+      drawReplacement(w !== null, deck, newDiscardPiles);
     if (newCard) newHands[actor].push(newCard);
 
     setHands(newHands);
@@ -3159,10 +3294,16 @@ export default function PegsAndJokers() {
 
     turnsRef.current += 1; // §4.4: once per seat that actually moves
 
-    const w = checkWinner(newPegs, gameMode);
     const nextPlayer = (actor + 1) % 4;
     if (w !== null) {
-      endGame(w, { winningSeat: actor, description: jokerDescription });
+      // The joker's whole sequence — card, cackle, the peg's flight and the
+      // bump it causes — is still ahead of us (see holdBoard above), and it is
+      // the only evidence a joker was played at all. The result waits for it.
+      endGame(w, {
+        winningSeat: actor,
+        description: jokerDescription,
+        presentDelayMs: jokerDelay + specialHoldMs,
+      });
       commitTurn({
         nextPlayer, pegs: newPegs, hands: newHands, deck: newDeck, discardPiles: updatedDiscardPiles,
         stuckCounts: newStuckCounts, lastMoves: updatedLastMoves, frame, winner: w, winningSeat: actor, description: jokerDescription,
@@ -3369,7 +3510,11 @@ export default function PegsAndJokers() {
   // Same viewBox as the board (like the taunt overlay), so it scales with it
   // and the discard-pile target follows the board rotation for free.
   const renderPlayedCard = () => {
-    if (!nowPlaying || isReplaying || winner !== null) return null;
+    // A finished game hides it — except while the winning move is still
+    // playing out, which is the one time the card and the result are both
+    // "current" (see `resultPending`). The card that won the game is the last
+    // thing anyone wants to have missed.
+    if (!nowPlaying || isReplaying || (winner !== null && !resultPending)) return null;
     const { id, player, card, lifeMs } = nowPlaying;
     const colour = PLAYER_COLORS[player];
     const isRed = card && (card.suit === '♥' || card.suit === '♦');
@@ -3827,8 +3972,10 @@ export default function PegsAndJokers() {
       {/* Package 5's settle/present split: `winner` is set immediately when
           the game ends (endGame), but the overlay itself waits for any
           in-flight replay to finish — a remote win auto-replays the winning
-          move first, so the player sees it before the result appears. */}
-      {winner !== null && outcome && !isReplaying && !endOverlayDismissed && (
+          move first, so the player sees it before the result appears. It waits
+          on `resultPending` for the same reason: a winning move played on this
+          device is still travelling when its own win is detected. */}
+      {winner !== null && outcome && !isReplaying && !resultPending && !endOverlayDismissed && (
         <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50 p-4">
           <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full max-h-[90vh] overflow-y-auto p-6">
             <h2 className={`text-3xl font-bold mb-1 text-center ${outcome.won ? 'text-green-400' : 'text-gray-200'}`}>

@@ -170,8 +170,19 @@ describe('describeStatus carrying the move being played', () => {
     })).toMatch(/opponent's peg/);
   });
 
-  it('is outranked by a finished game', () => {
-    expect(describeStatus({ phase: PHASES.FINISHED, currentPlayer: 1, move })).toBe('Game over.');
+  it('says what won while the winning move is still on screen', () => {
+    // A finished game holds its result back until the move that ended it has
+    // played out (the component's `resultPending`), and for those few seconds
+    // the board is still moving. "Game over." over a travelling peg is the same
+    // small lie as "Blue is thinking…" over one — and the winning card is the
+    // one card in the game you least want to have missed.
+    expect(describeStatus({ phase: PHASES.FINISHED, currentPlayer: 1, move }))
+      .toBe('Blue played 7♠ — Space 20 to Space 25');
+  });
+
+  it('falls back to "Game over." once the winning move has cleared', () => {
+    expect(describeStatus({ phase: PHASES.FINISHED, currentPlayer: 1, move: null, moving: true }))
+      .toBe('Game over.');
   });
 
   it('falls back to the plain line with no move on screen', () => {

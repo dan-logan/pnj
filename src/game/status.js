@@ -113,6 +113,12 @@ export function describeStatusParts({
 }) {
   switch (phase) {
     case PHASES.FINISHED:
+      // The winning move is still on screen for as long as it takes to play
+      // out (the component holds the result back for it — see `resultPending`),
+      // and while it is, saying what won is better than saying it is over: the
+      // board is still moving, and "Game over." over a travelling peg is the
+      // same small lie as "Blue is thinking…" over one.
+      if (move) return moveParts(move, names);
       return parts({ detail: 'Game over.' });
     case PHASES.REPLAYING:
       if (replay) {
