@@ -370,6 +370,79 @@ describe('calculateMovePath', () => {
     });
   });
 
+  it('stays on the track when a peg in the corridor blocks the home entry', () => {
+    // Blue (player 1) sits on its own home entrance (21) with a peg already in
+    // Home 2, and plays a 5. The entry to Home 4 jumps that peg, so the engine
+    // moves along the track to 26 — the path must not animate through home.
+    const pegs = pegState([
+      [1, 0, onTrack(getHomeEntrance(1))],
+      [1, 1, inHome(2)]
+    ]);
+    const path = calculateMovePath(1, 0, card('5'), null, pegs);
+    expect(path).toEqual([
+      { type: 'track', position: 22 },
+      { type: 'track', position: 23 },
+      { type: 'track', position: 24 },
+      { type: 'track', position: 25 },
+      { type: 'track', position: 26 }
+    ]);
+
+    const { newPegs } = applyMove(1, 0, card('5'), null, pegs);
+    expect(newPegs[1][0]).toMatchObject({ location: 'track', position: 26 });
+  });
+
+  it('stays on the track when the destination home slot is occupied', () => {
+    const pegs = pegState([
+      [0, 0, onTrack(0)],
+      [0, 1, inHome(1)]
+    ]);
+    const path = calculateMovePath(0, 0, card('5'), null, pegs);
+    expect(path.every(step => step.type === 'track')).toBe(true);
+    expect(path[path.length - 1]).toEqual({ type: 'track', position: 5 });
+  });
+
+  it('stays on the track when an own peg blocks the way to the entrance', () => {
+    // Yellow (player 0) at 71 plays a 5, but its own peg on 2 is in the way of
+    // the home entry, so the engine takes the track move past it to space 4.
+    const pegs = pegState([
+      [0, 0, onTrack(71)],
+      [0, 1, onTrack(2)]
+    ]);
+    const path = calculateMovePath(0, 0, card('5'), null, pegs);
+    expect(path.every(step => step.type === 'track')).toBe(true);
+    expect(path[path.length - 1]).toEqual({ type: 'track', position: 4 });
+  });
+
+  it('ends where applyMove puts the peg for every home-entry blocker', () => {
+    // The path is a second reading of the move; it must never disagree with the
+    // move itself about the destination.
+    const player = 1;
+    const entrance = getHomeEntrance(player); // 21
+    const blockers = [
+      [],
+      [[player, 1, inHome(0)]],
+      [[player, 1, inHome(2)]],
+      [[player, 1, inHome(4)]],
+      [[player, 1, onTrack(entrance)]],
+      [[player, 1, onTrack(entrance + 1)]],
+      [[2, 1, onTrack(entrance + 1)]]
+    ];
+    for (const blocker of blockers) {
+      for (const [rank, from] of [['5', entrance], ['4', entrance - 2], ['2', entrance + 1], ['6', entrance - 3]]) {
+        const pegs = pegState([[player, 0, onTrack((from + TRACK_LENGTH) % TRACK_LENGTH)], ...blocker]);
+        if (!isValidMove(player, 0, card(rank), pegs)) continue;
+        const path = calculateMovePath(player, 0, card(rank), null, pegs);
+        const dest = applyMove(player, 0, card(rank), null, pegs).newPegs[player][0];
+        expect(path).toHaveLength(Number(rank));
+        expect(path[path.length - 1]).toEqual(
+          dest.location === 'home'
+            ? { type: 'home', position: dest.homePosition }
+            : { type: 'track', position: dest.position }
+        );
+      }
+    }
+  });
+
   it('is empty for jokers (handled without step animation)', () => {
     const pegs = pegState([[1, 0, onTrack(30)]]);
     expect(calculateMovePath(0, 0, card('JOKER'), null, pegs)).toHaveLength(0);

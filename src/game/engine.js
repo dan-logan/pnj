@@ -262,6 +262,53 @@ export function applyJoker(owner, pegIndex, targetPlayer, targetPegIndex, curren
   return { newPegs, bumped: true, bumpedPlayer: targetPlayer, displacements: log };
 }
 
+// The single answer to "does this forward track move end in the home corridor?"
+// — shared by isValidMove, applyMove and calculateMovePath so the three cannot
+// disagree about where a peg is going. That disagreement is not hypothetical:
+// the path calculation used to carry its own copy of this rule with the two
+// "jumped over one of my own pegs" checks missing, so a peg standing on its own
+// home entrance with a peg already in the corridor animated *up through home*
+// and then teleported to the track space the engine had actually moved it to.
+//
+// Returns null when the move stays on the track, or { stepsToHome, homeSteps }
+// when the peg enters home: `stepsToHome` is the step that lands on home slot 0
+// (the step onto `homeEntrance + 1`, which is the same step — see
+// calculateMovePath) and `homeSteps` is the slot it finishes in.
+export function resolveHomeEntry(player, peg, moveAmount, currentPegs) {
+  if (peg.location !== 'track' || !(moveAmount > 0)) return null;
+
+  const homeEntrance = getHomeEntrance(player);
+  const currentPos = peg.position;
+
+  let stepsToHome = 0;
+  for (let step = 1; step <= moveAmount; step++) {
+    if ((currentPos + step) % TRACK_LENGTH === (homeEntrance + 1) % TRACK_LENGTH) {
+      stepsToHome = step;
+      break;
+    }
+  }
+  if (stepsToHome === 0) return null; // never reaches the entrance
+
+  const homeSteps = moveAmount - stepsToHome;
+  if (homeSteps < 0 || homeSteps >= HOME_SIZE) return null; // overshoots the corridor
+
+  // Blocked by one of our own pegs: in the destination slot, anywhere in the
+  // corridor before it, or on the track between here and the entrance.
+  for (let homePos = 0; homePos <= homeSteps; homePos++) {
+    const blocked = currentPegs[player].some(
+      p => p.location === 'home' && p.homePosition === homePos
+    );
+    if (blocked) return null;
+  }
+  for (let step = 1; step < stepsToHome; step++) {
+    const checkPos = (currentPos + step) % TRACK_LENGTH;
+    const pegAtCheck = findPegAtPosition(checkPos, currentPegs);
+    if (pegAtCheck && pegAtCheck.player === player) return null;
+  }
+
+  return { stepsToHome, homeSteps };
+}
+
 export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = null, options = {}) {
   const { actor = player, mode = GAME_MODES.CLASSIC } = options;
   const peg = currentPegs[player][pegIndex];
@@ -332,7 +379,6 @@ export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = nu
   }
 
   const amount = moveAmount !== null ? moveAmount : cardInfo.value;
-  const homeEntrance = getHomeEntrance(player);
   const currentPos = peg.position;
 
   let newPos;
@@ -342,60 +388,10 @@ export function isValidMove(player, pegIndex, card, currentPegs, moveAmount = nu
     newPos = (currentPos + amount + TRACK_LENGTH) % TRACK_LENGTH;
   }
 
-  // Check if passing through home entrance (only for forward movement)
-  if (amount > 0) {
-    let stepsToHome = 0;
-    for (let step = 1; step <= amount; step++) {
-      const checkPos = (currentPos + step) % TRACK_LENGTH;
-      if (checkPos === (homeEntrance + 1) % TRACK_LENGTH && stepsToHome === 0) {
-        stepsToHome = step;
-      }
-    }
-
-    if (stepsToHome > 0 && stepsToHome <= amount) {
-      const homeSteps = amount - stepsToHome;
-
-      // Check if home position is valid (0-4)
-      if (homeSteps >= 0 && homeSteps < HOME_SIZE) {
-        // Check if destination home position is occupied
-        const homeOccupied = currentPegs[player].some(
-          p => p.location === 'home' && p.homePosition === homeSteps
-        );
-        if (homeOccupied) {
-          // Can't enter home here, will continue on track - check track move validity below
-        } else {
-          // Check if we'd jump over own pegs on track before home entrance
-          let trackBlocked = false;
-          for (let step = 1; step < stepsToHome; step++) {
-            const checkPos = (currentPos + step) % TRACK_LENGTH;
-            const pegAtCheck = findPegAtPosition(checkPos, currentPegs);
-            if (pegAtCheck && pegAtCheck.player === player) {
-              trackBlocked = true;
-              break;
-            }
-          }
-
-          // Check if we'd jump over own pegs in home corridor
-          let homeBlocked = false;
-          for (let homePos = 0; homePos < homeSteps; homePos++) {
-            const blocked = currentPegs[player].some(
-              p => p.location === 'home' && p.homePosition === homePos
-            );
-            if (blocked) {
-              homeBlocked = true;
-              break;
-            }
-          }
-
-          if (!trackBlocked && !homeBlocked) {
-            return true; // Valid home entry
-          }
-          // Otherwise, can't enter home - check if track move is valid below
-        }
-      }
-      // If homeSteps >= 5, we overshoot home - continue on track
-    }
-  }
+  // Entering home is a legal move in its own right. If the entry is blocked (or
+  // overshoots the corridor) the peg continues on the track, so fall through to
+  // the track checks below.
+  if (resolveHomeEntry(player, peg, amount, currentPegs)) return true;
 
   // Check if landing on own peg
   const pegAtNewPos = findPegAtPosition(newPos, currentPegs);
@@ -534,67 +530,14 @@ export function applyMove(player, pegIndex, card, amount, currentPegs, options =
     return { newPegs, bumpedOpponent: false, displacements: [] };
   }
 
-  const homeEntrance = getHomeEntrance(player);
   const currentPos = peg.position;
   const moveAmount = amount !== null ? amount : cardInfo.value;
 
   // Check if we should enter home (only for forward movement)
-  let shouldEnterHome = false;
-  let homeSteps = 0;
-
-  if (moveAmount > 0) {
-    let stepsToHome = 0;
-    for (let step = 1; step <= moveAmount; step++) {
-      const checkPos = (currentPos + step) % TRACK_LENGTH;
-      if (checkPos === (homeEntrance + 1) % TRACK_LENGTH && stepsToHome === 0) {
-        stepsToHome = step;
-      }
-    }
-
-    if (stepsToHome > 0 && stepsToHome <= moveAmount) {
-      homeSteps = moveAmount - stepsToHome;
-
-      if (homeSteps >= 0 && homeSteps < HOME_SIZE) {
-        // Check if destination home position is occupied
-        const homeOccupied = newPegs[player].some(
-          p => p.location === 'home' && p.homePosition === homeSteps
-        );
-
-        if (!homeOccupied) {
-          // Check if we'd jump over own pegs on track before home entrance
-          let trackBlocked = false;
-          for (let step = 1; step < stepsToHome; step++) {
-            const checkPos = (currentPos + step) % TRACK_LENGTH;
-            const pegAtCheck = findPegAtPosition(checkPos, newPegs);
-            if (pegAtCheck && pegAtCheck.player === player) {
-              trackBlocked = true;
-              break;
-            }
-          }
-
-          // Check if we'd jump over own pegs in home corridor
-          let homeBlocked = false;
-          for (let homePos = 0; homePos < homeSteps; homePos++) {
-            const blocked = newPegs[player].some(
-              p => p.location === 'home' && p.homePosition === homePos
-            );
-            if (blocked) {
-              homeBlocked = true;
-              break;
-            }
-          }
-
-          if (!trackBlocked && !homeBlocked) {
-            shouldEnterHome = true;
-          }
-        }
-      }
-    }
-  }
-
-  if (shouldEnterHome) {
+  const homeEntry = resolveHomeEntry(player, peg, moveAmount, newPegs);
+  if (homeEntry) {
     peg.location = 'home';
-    peg.homePosition = homeSteps;
+    peg.homePosition = homeEntry.homeSteps;
     return { newPegs, bumpedOpponent: false, displacements: [] };
   }
 
@@ -827,48 +770,25 @@ export function calculateMovePath(player, pegIndex, card, amount, currentPegs) {
 
   // Track movement
   if (peg.location === 'track') {
-    const homeEntrance = getHomeEntrance(player);
     const currentPos = peg.position;
     const moveAmount = amount !== null ? amount : cardInfo.value;
     const direction = moveAmount > 0 ? 1 : -1;
 
-    // Check if we'll enter home
-    let stepsToHome = 0;
-    if (moveAmount > 0) {
-      for (let step = 1; step <= moveAmount; step++) {
-        const checkPos = (currentPos + step) % TRACK_LENGTH;
-        if (checkPos === (homeEntrance + 1) % TRACK_LENGTH && stepsToHome === 0) {
-          stepsToHome = step;
-        }
-      }
-    }
+    // Whether this move ends in home is the engine's decision, not a second copy
+    // of the rule here — see resolveHomeEntry.
+    const homeEntry = resolveHomeEntry(player, peg, moveAmount, currentPegs);
 
-    // Check if home entry is valid
-    let willEnterHome = false;
-    let homeSteps = 0;
-    if (stepsToHome > 0 && stepsToHome <= moveAmount) {
-      homeSteps = moveAmount - stepsToHome;
-      if (homeSteps >= 0 && homeSteps < HOME_SIZE) {
-        const homeOccupied = currentPegs[player].some(
-          p => p.location === 'home' && p.homePosition === homeSteps
-        );
-        if (!homeOccupied) {
-          willEnterHome = true;
-        }
-      }
-    }
-
-    if (willEnterHome) {
+    if (homeEntry) {
       // Animate up to the home entrance, then into home.
       // The step that would land on `homeEntrance + 1` is the step into home
       // slot 0 (that is what makes `homeSteps = moveAmount - stepsToHome` the
       // final slot), so it must not also be drawn as a track space — otherwise
       // the peg counts one space more than the card played.
-      for (let step = 1; step < stepsToHome; step++) {
+      for (let step = 1; step < homeEntry.stepsToHome; step++) {
         const pos = (currentPos + step) % TRACK_LENGTH;
         path.push({ type: 'track', position: pos });
       }
-      for (let step = 0; step <= homeSteps; step++) {
+      for (let step = 0; step <= homeEntry.homeSteps; step++) {
         path.push({ type: 'home', position: step });
       }
     } else {
