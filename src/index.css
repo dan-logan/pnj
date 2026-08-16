@@ -51,31 +51,47 @@
   transform-origin: bottom center;
 }
 
-/* The card being played: dealt over the middle of the board, held long enough
-   to read, then shrunk away onto its owner's discard pile — which is where it
-   really goes, so the eye follows it there instead of the card simply
-   appearing in a corner. The destination is per-seat (and rotates with the
-   board), so it arrives as a custom property in *user units* — a CSS transform
-   on an SVG element is in the viewBox's own coordinates, which is what keeps
-   this correct at every screen size without measuring anything.
+/* The card being played: dealt over the middle of the board, held there for the
+   whole move, and only then shrunk away onto its owner's discard pile — which
+   is where it really goes, so the eye follows it there instead of the card
+   simply appearing in a corner. The destination is per-seat (and rotates with
+   the board), so it arrives as a custom property in *user units* — a CSS
+   transform on an SVG element is in the viewBox's own coordinates, which is
+   what keeps this correct at every screen size without measuring anything.
+
+   Two keyframes rather than one, and that is the point: the drop used to be the
+   tail of a single animation scaled to the length of the move, so it ran *while
+   the peg was still travelling* — two things moving at once, in different
+   directions, and the card is the one you don't need to watch. Splitting them
+   lets the hold be as long as the move needs (`animation-delay` on the drop)
+   while the drop itself stays a fixed, brisk beat afterwards.
 
    `transform-box: view-box` with the origin at the card's centre, so the
    shrink pulls toward the card rather than the corner of the board — that
    origin is PLAYED_CARD.cx/cy in PegsAndJokers.jsx, which CSS can't read, so
    the two have to be changed together. */
-@keyframes pnj-card-play {
+@keyframes pnj-card-in {
   0%   { opacity: 0; transform: translate(0, 0) scale(0.6); }
-  10%  { opacity: 1; transform: translate(0, 0) scale(1.08); }
-  18%  { opacity: 1; transform: translate(0, 0) scale(1); }
-  62%  { opacity: 1; transform: translate(0, 0) scale(1); }
+  55%  { opacity: 1; transform: translate(0, 0) scale(1.08); }
+  100% { opacity: 1; transform: translate(0, 0) scale(1); }
+}
+
+/* Starts exactly where `pnj-card-in` was left filling forwards, so the card is
+   still where the player last saw it when the drop begins. */
+@keyframes pnj-card-out {
+  0%   { opacity: 1; transform: translate(0, 0) scale(1); }
   100% { opacity: 0; transform: translate(var(--pnj-card-dx, 0), var(--pnj-card-dy, 0)) scale(0.34); }
 }
 
-/* The duration is set inline, per move: it is scaled to how long that move is
-   actually on screen, so the card always reaches the pile instead of being
-   unmounted in mid-air. This value is only the fallback. */
+/* Both durations and the drop's delay are set inline, per move (CARD_POP_MS /
+   cardDiscardMs / cardHoldMs in anim.js): the hold is however long that move
+   takes, so the card always reaches the pile instead of being unmounted in
+   mid-air. These values are only the fallback. Neither animation fills
+   backwards, which is what keeps the drop from applying during its own delay. */
 .pnj-card-play {
-  animation: pnj-card-play 900ms cubic-bezier(0.2, 0.7, 0.3, 1) forwards;
+  animation:
+    pnj-card-in 300ms cubic-bezier(0.2, 0.7, 0.3, 1) forwards,
+    pnj-card-out 420ms cubic-bezier(0.4, 0, 0.6, 1) forwards;
   transform-box: view-box;
   transform-origin: 200px 140px;
 }

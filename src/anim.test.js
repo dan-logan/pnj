@@ -15,6 +15,11 @@ import {
   stageBumpFlights,
   specialPlayHoldMs,
   splitBeatMs,
+  cardHoldMs,
+  cardDiscardMs,
+  cardOutroMs,
+  CARD_POP_MS,
+  CARD_DISCARD_MS,
   BUMP_FLY_STEPS,
   BUMP_FLY_STAGGER,
   BUMP_FLY_TICK_MS,
@@ -221,6 +226,64 @@ describe('the beat between the halves of a split', () => {
 
   it('falls back to the default pace for a speed it does not know', () => {
     expect(splitBeatMs('sideways')).toBe(splitBeatMs(DEFAULT_SPEED));
+  });
+});
+
+describe('the played card', () => {
+  const speeds = SPEED_ORDER.filter(animationsOn);
+
+  it('holds centre-board for the whole of the move it labels', () => {
+    // The point of the whole thing: the card does not start moving until the
+    // peg has stopped, so there is only ever one thing travelling at a time.
+    for (const speed of speeds) {
+      const travelMs = 12 * stepMsFor(speed);
+      expect(cardHoldMs(travelMs, speed)).toBe(travelMs);
+    }
+  });
+
+  it('never holds for less than its own entrance', () => {
+    // A drop that started before the pop finished would yank the card out of
+    // its own deal-in — a one-space move at the fast pace is shorter than that.
+    for (const speed of speeds) {
+      expect(cardHoldMs(stepMsFor(speed), speed)).toBeGreaterThanOrEqual(CARD_POP_MS);
+    }
+    expect(cardHoldMs(0, 'slow')).toBe(CARD_POP_MS);
+  });
+
+  it('drops onto the pile briskly, and more briskly as the pace quickens', () => {
+    expect(cardDiscardMs('slow')).toBe(CARD_DISCARD_MS);
+    expect(cardDiscardMs('normal')).toBe(CARD_DISCARD_MS);
+    expect(cardDiscardMs('fast')).toBeLessThan(CARD_DISCARD_MS);
+    expect(cardDiscardMs('fast')).toBeGreaterThan(0);
+  });
+
+  it('leaves the board owing exactly the drop when the pegs stop', () => {
+    // What `cardOutroMs` is for: the overlay is unmounted the moment the board
+    // hold ends, so every hold site takes the larger of its own beat and this.
+    // A card that vanishes in mid-air is worse than one that never moved.
+    for (const speed of speeds) {
+      const travelMs = 6 * stepMsFor(speed);
+      expect(cardOutroMs(travelMs, speed)).toBe(cardDiscardMs(speed));
+    }
+  });
+
+  it("adds the unspent part of a short move's hold to what the board owes", () => {
+    // A one-space move at the fast pace is over before the card has finished
+    // being dealt, so the board has to cover the rest of the pop as well.
+    const travelMs = stepMsFor('fast');
+    expect(cardOutroMs(travelMs, 'fast'))
+      .toBe(CARD_POP_MS - travelMs + cardDiscardMs('fast'));
+  });
+
+  it('is nothing at all with animations off — no card is ever shown', () => {
+    expect(cardHoldMs(1000, 'off')).toBe(0);
+    expect(cardDiscardMs('off')).toBe(0);
+    expect(cardOutroMs(1000, 'off')).toBe(0);
+  });
+
+  it('falls back to the default pace for a speed it does not know', () => {
+    expect(cardDiscardMs('sideways')).toBe(cardDiscardMs(DEFAULT_SPEED));
+    expect(cardHoldMs(900, 'sideways')).toBe(cardHoldMs(900, DEFAULT_SPEED));
   });
 });
 
