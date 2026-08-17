@@ -5266,17 +5266,41 @@ export default function PegsAndJokers() {
           {/* Hand and Controls */}
           <div className="flex-1 w-full lg:w-auto">
             <div className="mb-4">
-              <h3 className="text-lg font-semibold">Your Hand:</h3>
+              {/* The burn button sits *above* the hand, on the heading's own
+                  row. It used to be a panel below the cards, which on a phone
+                  is off the bottom of the screen — the one control a stuck
+                  turn cannot finish without was the one you had to go looking
+                  for. The row reserves its height whether or not a card is
+                  picked, so the cards don't jump down the screen when it
+                  appears. Its words are the status line's words: the box above
+                  the board says `Press "Burn this card"`, and this is it. */}
+              <div className="flex items-center justify-between gap-3 min-h-[2.5rem]">
+                <h3 className="text-lg font-semibold">Your Hand:</h3>
+                {mustBurn && burnPrompt.ready && (
+                  <button
+                    onClick={burnSelectedCard}
+                    className="px-4 py-2 rounded font-bold text-sm bg-orange-600 hover:bg-orange-500 text-white shadow-[0_0_12px_rgba(249,115,22,0.6)] transition-colors"
+                  >
+                    {burnPrompt.label}
+                  </button>
+                )}
+              </div>
               {/* Always mounted, so it costs no layout (see "Nothing else
                   appears and disappears above the board"). It states the one
                   rule of the input: a card, then a peg, and the card again to
                   change your mind. */}
               {/* One line, always the same size, saying what a tap does right
                   now — when you're stuck there is no glowing peg to tap, and a
-                  hint pointing at one is worse than none. */}
-              <p className="text-xs text-gray-400">
+                  hint pointing at one is worse than none. Once a card is
+                  picked, the line is what the burn is *worth* instead, which
+                  is the one thing the status line doesn't carry. */}
+              <p className={`text-xs ${
+                mustBurn && burnPrompt.ready && stuckCounts[mySeat] >= 2 ? 'text-yellow-300' : 'text-gray-400'
+              }`}>
                 {mustBurn
-                  ? 'Nothing in this hand can move a peg — tap the one to burn.'
+                  ? (burnPrompt.ready
+                      ? `Burning ${describeCard(selectedCardObj)}. ${burnPrompt.hint}`
+                      : 'Nothing in this hand can move a peg — tap the one to burn.')
                   : 'Tap a card, then a glowing peg. Tap the card again to unpick it.'}
               </p>
               {/* pt-4 is headroom for the selected card, which lifts and grows
@@ -5328,38 +5352,12 @@ export default function PegsAndJokers() {
               </div>
             )}
 
-            {/* Burning is only possible when the player is genuinely stuck (no
-                legal move with any card), so this panel *is* the announcement
-                that they are — there is no button to press to find out, and
-                nothing to cancel back to. The cards above are already live; the
-                button here is the commit, dead until one is picked. */}
-            {mustBurn && (
-              <div className="mb-4 p-3 rounded bg-orange-950 border border-orange-700">
-                <p className="mb-1 font-bold text-orange-200">
-                  {selectedCardObj
-                    ? <>Burn {describeCard(selectedCardObj)}?</>
-                    : <>No valid move — you have to burn a card.</>}
-                </p>
-                <p className="text-sm mb-2 text-orange-100/80">
-                  Tap any card in your hand, then press Burn. It goes on your pile and you draw
-                  a new one.
-                </p>
-                <button
-                  onClick={burnSelectedCard}
-                  disabled={!burnPrompt.ready}
-                  className={`px-4 py-2 rounded font-bold transition-colors ${
-                    burnPrompt.ready
-                      ? 'bg-orange-600 hover:bg-orange-500 text-white shadow-[0_0_12px_rgba(249,115,22,0.6)]'
-                      : 'bg-gray-700 text-gray-400 cursor-not-allowed'
-                  }`}
-                >
-                  {burnPrompt.label}
-                </button>
-                <p className={`text-sm mt-1 ${stuckCounts[mySeat] >= 2 ? 'text-yellow-300' : 'text-orange-200/70'}`}>
-                  {burnPrompt.hint}
-                </p>
-              </div>
-            )}
+            {/* No burn panel here. Being stuck is announced by the status box
+                above the board — the place a player already looks — and the
+                commit lives on the hand's own heading row, where it is on
+                screen with the cards it acts on. It used to be a panel below
+                the hand, and on a phone that put the turn's only exit below
+                the fold. */}
 
             <div className="mt-4 p-3 bg-gray-800 rounded text-sm">
               <h4 className="font-semibold mb-2">Quick Rules:</h4>
