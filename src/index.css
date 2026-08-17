@@ -137,6 +137,36 @@
   transform-origin: 200px 140px;
 }
 
+/* The flame on a seat's burnt pile. A burn is the one thing that happens on a
+   turn with nothing to watch — a card leaves a hand you can't see and the
+   counter ticks — so the pile it lands on is the only place it can be read
+   from, and a number alone doesn't say *why* those cards are there.
+
+   Flames don't pulse evenly, so this doesn't either: the two axes are scaled
+   against each other (taller-and-thinner, then shorter-and-wider) at steps that
+   don't divide neatly, which is what reads as guttering rather than as
+   throbbing. Each seat's flame carries its own animation-delay so four of them
+   never flicker in unison. `transform-box: fill-box` puts the origin at the
+   flame's own base — an SVG group's default origin is the corner of the
+   viewport, which would throw it off the board — and the base is where a real
+   flame is anchored, so it grows upward out of the pile.
+
+   Ambient motion, so it is only mounted when animations are on (the speed
+   setting's `off` means "none of this"); the flame itself still draws. */
+@keyframes pnj-flame {
+  0%, 100% { transform: scale(1, 1);       opacity: 1; }
+  22%      { transform: scale(0.9, 1.14);  opacity: 0.9; }
+  41%      { transform: scale(1.07, 0.93); opacity: 1; }
+  63%      { transform: scale(0.95, 1.08); opacity: 0.94; }
+  81%      { transform: scale(1.04, 0.97); opacity: 1; }
+}
+
+.pnj-flame {
+  animation: pnj-flame 1100ms ease-in-out infinite;
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+}
+
 /* The peg a joker is about to move (and then moves): pulsing hard from the
    moment the card appears, so that by the time it leaves the ground you already
    know which peg you are watching. Faster than `peg-glow`, which marks the

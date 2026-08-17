@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { PHASES, derivePhase, describeStatus, describeStatusParts, describeCard, describeOutcome, attributeFrameDescription } from './status.js';
+import { PHASES, derivePhase, describeStatus, describeStatusParts, describeCard, describeBurn, describeOutcome, attributeFrameDescription } from './status.js';
 import { GAME_MODES } from './constants.js';
 
 const SOLO = ['me', 'ai', 'ai', 'ai'];
@@ -120,10 +120,16 @@ describe('describeStatus', () => {
     expect(partners).toMatch(/partner/);
   });
 
-  it('puts discard mode ahead of the other prompts', () => {
+  it('puts burn mode ahead of the other prompts', () => {
     expect(describeStatus({
-      phase: PHASES.MY_TURN, currentPlayer: 0, discardMode: true, jokerMode: true,
-    })).toBe('Select a card to discard.');
+      phase: PHASES.MY_TURN, currentPlayer: 0, burnMode: true, jokerMode: true,
+    })).toBe('No valid move — tap a card to burn it.');
+  });
+
+  it('asks for the remaining tap once a card is picked to burn', () => {
+    expect(describeStatus({
+      phase: PHASES.MY_TURN, currentPlayer: 0, burnMode: true, burnCard: { rank: '7', suit: '♠' },
+    })).toBe('No valid move. Press "Burn this card" to burn 7♠.');
   });
 });
 
@@ -264,6 +270,28 @@ describe('describeOutcome', () => {
 
   it('puts you first however the team is ordered', () => {
     expect(describeOutcome(1, GAME_MODES.PARTNERS, [3]).text).toBe('You and Blue win!');
+  });
+});
+
+describe('describeBurn', () => {
+  it('is not ready, and says so, until a card is picked', () => {
+    const burn = describeBurn({ card: null });
+    expect(burn.ready).toBe(false);
+    expect(burn.label).toBe('Tap a card to burn');
+  });
+
+  it('names the action once a card is picked', () => {
+    const burn = describeBurn({ card: { rank: '7', suit: '♠' } });
+    expect(burn.ready).toBe(true);
+    expect(burn.label).toBe('🔥 Burn this card');
+  });
+
+  it('warns on the burn that will start a peg', () => {
+    // stuckCount is the burns already on the pile, so 2 means this is the third.
+    expect(describeBurn({ stuckCount: 2 }).hint).toMatch(/starts a peg/);
+    expect(describeBurn({ stuckCount: 2 }).hint).toMatch(/^Two burnt already/);
+    expect(describeBurn({ stuckCount: 1 }).hint).toMatch(/^One burnt/);
+    expect(describeBurn({ stuckCount: 0 }).hint).toMatch(/^Three burns in a row/);
   });
 });
 
