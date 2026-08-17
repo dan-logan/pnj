@@ -39,8 +39,16 @@ export function derivePhase({ winner, isReplaying, dealt, isMyTurn, currentPlaye
 
 // The prompt shown while it is your turn, which depends on what you are part
 // way through rather than on the phase alone.
-function myTurnPrompt({ splitRemaining, splitCard, jokerMode, discardMode, mode }) {
-  if (discardMode) return 'Select a card to discard.';
+function myTurnPrompt({ splitRemaining, splitCard, jokerMode, burnMode, burnCard, mode }) {
+  // A burn is a two-tap action — pick the card, then press the button — so the
+  // line says which tap is outstanding. The old single prompt ("Select a card
+  // to discard.") described a mode you had to *enter* first, which is exactly
+  // the step that made the whole thing hard to find.
+  if (burnMode) {
+    return burnCard
+      ? `No valid move. Press "Burn this card" to burn ${describeCard(burnCard)}.`
+      : 'No valid move — tap a card to burn it.';
+  }
   if (jokerMode) {
     return mode === GAME_MODES.PARTNERS
       ? 'Click a peg on the track to bump — hit your partner to send them to their home stretch.'
@@ -95,7 +103,10 @@ export function describeStatusParts({
   splitRemaining = 0,
   splitCard = null,
   jokerMode = false,
-  discardMode = false,
+  // True when the hand has no legal move at all and the only thing left to do
+  // is burn a card; `burnCard` is the card picked to burn, if one is yet.
+  burnMode = false,
+  burnCard = null,
   mode = GAME_MODES.CLASSIC,
   names = PLAYER_NAMES,
   // True while a peg is actually travelling. "Blue is thinking…" printed over
@@ -133,13 +144,13 @@ export function describeStatusParts({
     case PHASES.DEALING:
       return parts({ detail: 'Dealing…' });
     case PHASES.MY_TURN: {
-      // Mid-split, mid-joker and mid-discard the line is a prompt, and the
-      // prompt wins: the first half of a split animates while the second half
-      // is still waiting on a tap.
-      const pending = discardMode || jokerMode || splitRemaining;
+      // Mid-split, mid-joker and mid-burn the line is a prompt, and the prompt
+      // wins: the first half of a split animates while the second half is
+      // still waiting on a tap.
+      const pending = burnMode || jokerMode || splitRemaining;
       if (!pending && move) return moveParts(move, names);
       if (!pending && moving) return parts({ detail: 'Moving…' });
-      return parts({ detail: myTurnPrompt({ splitRemaining, splitCard, jokerMode, discardMode, mode }) });
+      return parts({ detail: myTurnPrompt({ splitRemaining, splitCard, jokerMode, burnMode, burnCard, mode }) });
     }
     case PHASES.WAITING_PARTNER:
       if (move) return moveParts(move, names);
@@ -158,6 +169,31 @@ export function describeStatusParts({
 // The status line. Never "Blue is thinking…" once the game is over.
 export function describeStatus(args) {
   return describeStatusParts(args).text;
+}
+
+// Burning a card: what the button says, and whether it does anything yet.
+//
+// "Burning" is what this is called at a kitchen table — you have no legal move,
+// so a card goes on the pile and you draw a replacement. It used to be a red
+// button reading "No Valid Move - Select Card to Discard", which is a sentence
+// describing your predicament rather than an action, and pressing it only
+// opened a *second* step where the cards became tappable. Nobody found it.
+// So the cards are live the moment you're stuck, and the button is the commit:
+// dead until you've picked one, and then named after what it will do.
+//
+// `stuckCount` is the burns already on this seat's pile *before* this one, so
+// at 2 the next burn is the third and earns a free peg out of start.
+export function describeBurn({ card = null, stuckCount = 0 } = {}) {
+  const ready = card !== null && card !== undefined;
+  return {
+    ready,
+    label: ready ? '🔥 Burn this card' : 'Tap a card to burn',
+    hint: stuckCount >= 2
+      ? 'Two burnt already — this one starts a peg for you.'
+      : stuckCount === 1
+        ? 'One burnt. Three in a row starts a peg for you.'
+        : 'Three burns in a row starts a peg for you.',
+  };
 }
 
 // How to announce the result, phrased for the mode and for who you are:

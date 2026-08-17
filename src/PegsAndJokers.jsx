@@ -41,7 +41,7 @@ import {
   getNemesis
 } from './game/stats.js';
 import { loadGame, saveGame, clearGame, serializeGame } from './game/persistence.js';
-import { PHASES, derivePhase, describeStatusParts, describeOutcome, attributeFrameDescription } from './game/status.js';
+import { PHASES, derivePhase, describeStatusParts, describeCard, describeBurn, describeOutcome, attributeFrameDescription } from './game/status.js';
 import {
   SOLO_SEAT_OWNERS,
   HOST_SEAT_OWNERS,
@@ -236,7 +236,13 @@ export default function PegsAndJokers() {
   const [splitUndo, setSplitUndo] = useState(null); // { pegs, lastMoves } | null
   const [jokerMode, setJokerMode] = useState(false); // true when waiting for target selection
   const [jokerSourcePeg, setJokerSourcePeg] = useState(null); // which of player's pegs to move
-  const [discardMode, setDiscardMode] = useState(false); // true when player is selecting a card to discard
+  // Burning a card (what a discard is called at the table) used to be a *mode*:
+  // a red button reading "No Valid Move - Select Card to Discard" that you had
+  // to press before the cards in your hand became tappable at all. Two steps,
+  // and the first one didn't look like a button. It is derived now — `mustBurn`
+  // below — because being stuck is a fact about the hand, not a mode you enter:
+  // the cards go live the moment no card can move a peg, and the only thing
+  // left to press is the button that actually burns the one you picked.
   // Transient feedback only — "Invalid move. Try again." The *status* is
   // derived (see `phase` / `statusLine` below) and is never set imperatively.
   const [notice, setNotice] = useState(null);
@@ -691,7 +697,6 @@ export default function PegsAndJokers() {
     setSelectedPeg(null);
     setJokerMode(false);
     setJokerSourcePeg(null);
-    setDiscardMode(false);
     // A replay cut short by the end of the game leaves the board rewound.
     if (replayRestoreRef.current) {
       setPegs(replayRestoreRef.current);
@@ -788,7 +793,6 @@ export default function PegsAndJokers() {
     setSplitUndo(null);
     setJokerMode(false);
     setJokerSourcePeg(null);
-    setDiscardMode(false);
     setNotice(null);
     setWinner(null);
     setLastMoves([null, null, null, null]);
@@ -924,7 +928,6 @@ export default function PegsAndJokers() {
     setSelectedPeg(null);
     setJokerMode(false);
     setJokerSourcePeg(null);
-    setDiscardMode(false);
     setAnimatingPeg(null);
     setVisualBusy(false);
     setNowPlaying(null);
@@ -1026,7 +1029,6 @@ export default function PegsAndJokers() {
     setSplitUndo(null);
     setJokerMode(false);
     setJokerSourcePeg(null);
-    setDiscardMode(false);
     setAnimatingPeg(null);
     setVisualBusy(false);
     setNowPlaying(null);
@@ -1772,7 +1774,6 @@ export default function PegsAndJokers() {
     setSelectedPeg(null);
     setJokerMode(false);
     setJokerSourcePeg(null);
-    setDiscardMode(false);
 
     const total = frames.length;
     // A replay is meant to be watchable, so it never runs faster than the
@@ -2556,14 +2557,16 @@ export default function PegsAndJokers() {
       newStuckCounts[player] = 0; // Reset even if no peg to start
     }
 
-    // Record last move description for discard
+    // Record last move description for the burn. Every seat's rim label and the
+    // replay say "burnt", because that is what the button says and what the
+    // flame on the pile means — one word for one thing.
     const updatedLastMoves = [...lastMoves];
-    updatedLastMoves[player] = autoStarted ? 'Stuck 3x - Started a peg' : 'Discarded (stuck)';
+    updatedLastMoves[player] = autoStarted ? 'Burnt 3rd - started a peg' : 'Burnt a card';
     setLastMoves(updatedLastMoves);
 
     const discardFrame = {
       player,
-      description: autoStarted ? 'Stuck 3x — started a peg' : 'No move — discarded',
+      description: autoStarted ? 'Third burn — started a peg' : 'No move — burnt a card',
       pegsBefore: pegs,
       pegsAfter: newPegs,
       segments: [],
@@ -2586,7 +2589,6 @@ export default function PegsAndJokers() {
     setStuckCounts(newStuckCounts);
     setSelectedCard(null);
     setSelectedPeg(null);
-    setDiscardMode(false);
 
     setNotice(null);
 
@@ -3037,6 +3039,29 @@ export default function PegsAndJokers() {
 
   const selectedCardObj = selectedCard !== null ? myHand[selectedCard] ?? null : null;
 
+  // Whose pegs the human is moving this turn (their own, or their partner's once
+  // they've finished in partner mode).
+  const controlledOwner = controlledOwnerFor(pegs);
+
+  // Which cards in hand have at least one fully playable move (used to dim
+  // dead cards; unlike hasAnyValidMove this requires splits to be completable)
+  const playableCards = useMemo(() => {
+    if (!isMyTurn || winner !== null) return myHand.map(() => true);
+    return myHand.map(c => getMovablePegs(controlledOwner, c, pegs, moveOptions).length > 0);
+  }, [isMyTurn, winner, myHand, pegs, controlledOwner, moveOptions]);
+
+  // Stuck: not one card in the hand can move a peg, so the turn can only end by
+  // burning a card. Derived rather than stored — see the note where `jokerMode`
+  // is declared — which is why there is nothing to enter and nothing to cancel.
+  // It sits here, above the status derivation, because the status line is one of
+  // the things that reads it.
+  const mustBurn = isMyTurn && winner === null && !isReplaying
+    && !jokerMode && splitRemaining === 0
+    && myHand.length > 0 && !playableCards.some(Boolean);
+
+  // What the Burn button says and whether it does anything yet (game/status.js).
+  const burnPrompt = describeBurn({ card: mustBurn ? selectedCardObj : null, stuckCount: stuckCounts[mySeat] });
+
   // --- Derived game phase and status ---
   //
   // `phase` is the single answer to "what is happening", and `statusLine` is how
@@ -3067,11 +3092,12 @@ export default function PegsAndJokers() {
 
   const statusParts = useMemo(
     () => describeStatusParts({
-      phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, mode: gameMode,
+      phase, currentPlayer, splitRemaining, splitCard, jokerMode, mode: gameMode,
+      burnMode: mustBurn, burnCard: mustBurn ? selectedCardObj : null,
       moving: animatingPeg != null, move: statusMove, replay: replayInfo,
     }),
-    [phase, currentPlayer, splitRemaining, splitCard, jokerMode, discardMode, gameMode, animatingPeg,
-     statusMove, replayInfo]
+    [phase, currentPlayer, splitRemaining, splitCard, jokerMode, mustBurn, selectedCardObj,
+     gameMode, animatingPeg, statusMove, replayInfo]
   );
 
   const outcome = useMemo(
@@ -3134,14 +3160,10 @@ export default function PegsAndJokers() {
     prevPhaseRef.current = phase;
   }, [phase]);
 
-  // Whose pegs the human is moving this turn (their own, or their partner's once
-  // they've finished in partner mode).
-  const controlledOwner = controlledOwnerFor(pegs);
-
   // Pegs the human can legally move right now (null = highlighting inactive).
   // During the second half of a split this is the set of pegs that can finish it.
   const movablePegSet = useMemo(() => {
-    if (!isMyTurn || winner !== null || discardMode || jokerMode || isReplaying) return null;
+    if (!isMyTurn || winner !== null || jokerMode || isReplaying) return null;
     if (splitRemaining !== 0 && splitCard) {
       const set = new Set();
       for (let i = 0; i < 5; i++) {
@@ -3155,24 +3177,17 @@ export default function PegsAndJokers() {
     }
     if (!selectedCardObj) return null;
     return new Set(getMovablePegs(controlledOwner, selectedCardObj, pegs, moveOptions));
-  }, [isMyTurn, winner, discardMode, jokerMode, isReplaying, splitRemaining, splitCard, splitPegIndex, splitOwner, selectedCardObj, pegs, controlledOwner, moveOptions]);
+  }, [isMyTurn, winner, jokerMode, isReplaying, splitRemaining, splitCard, splitPegIndex, splitOwner, selectedCardObj, pegs, controlledOwner, moveOptions]);
 
   // Tappable destination spaces for the selected peg with a 7 or 9 (ghost
   // circles on the board — tapping one picks that split amount)
   const ghostDestinations = useMemo(() => {
-    if (!isMyTurn || winner !== null || jokerMode || discardMode || isReplaying) return [];
+    if (!isMyTurn || winner !== null || jokerMode || isReplaying) return [];
     if (splitRemaining !== 0 || !selectedCardObj || selectedPeg === null) return [];
     const info = CARD_VALUES[selectedCardObj.rank];
     if (!info.canSplit && !info.mustSplit) return [];
     return getValidDestinations(controlledOwner, selectedPeg, selectedCardObj, pegs, moveOptions);
-  }, [isMyTurn, winner, jokerMode, discardMode, isReplaying, splitRemaining, selectedCardObj, selectedPeg, pegs, controlledOwner, moveOptions]);
-
-  // Which cards in hand have at least one fully playable move (used to dim
-  // dead cards; unlike hasAnyValidMove this requires splits to be completable)
-  const playableCards = useMemo(() => {
-    if (!isMyTurn || winner !== null) return myHand.map(() => true);
-    return myHand.map(c => getMovablePegs(controlledOwner, c, pegs, moveOptions).length > 0);
-  }, [isMyTurn, winner, myHand, pegs, controlledOwner, moveOptions]);
+  }, [isMyTurn, winner, jokerMode, isReplaying, splitRemaining, selectedCardObj, selectedPeg, pegs, controlledOwner, moveOptions]);
 
   // Put a half-made move back down: no card, no peg, no joker target pending.
   // The turn is "pick a card, then pick a peg", and every way of changing your
@@ -3200,12 +3215,10 @@ export default function PegsAndJokers() {
     }
     unlockAudio();
 
-    // In discard mode, clicking a card discards it
-    if (discardMode) {
-      discardAndDraw(mySeat, cardIndex);
-      return;
-    }
-
+    // A card tap means the same thing whether or not you are stuck: this is the
+    // card I've got hold of. When stuck it is the card the Burn button will
+    // burn — the tap itself never burns anything, because a burn is a card you
+    // don't get back and it should take a deliberate second press.
     // Tapping the card that is already selected drops the selection entirely.
     if (cardIndex === selectedCard) {
       clearSelection();
@@ -3222,8 +3235,26 @@ export default function PegsAndJokers() {
     setNotice(null);
   };
 
+  // Burn the card in hand: it goes on this seat's pile, a replacement is drawn
+  // and the turn passes. The button is the only way in, and it is disabled
+  // until a card is picked, so this can't fire on an empty selection — but it
+  // checks anyway, because a burn is irreversible.
+  const burnSelectedCard = () => {
+    if (!mustBurn || selectedCard === null) return;
+    unlockAudio();
+    discardAndDraw(mySeat, selectedCard);
+  };
+
   const handlePegClick = (player, pegIndex) => {
     if (!isMyTurn || winner !== null || isReplaying) return;
+
+    // Stuck: no card in the hand moves any peg, so every peg tap is a question
+    // the board can't answer. Say what the turn actually needs rather than
+    // explaining this one peg's refusal five times over.
+    if (mustBurn) {
+      setNotice('No card in your hand can move a peg. Tap a card, then Burn this card.');
+      return;
+    }
 
     // In joker mode, clicking your own peg cancels the selection
     if (jokerMode && player === controlledOwner) {
@@ -3569,10 +3600,34 @@ export default function PegsAndJokers() {
     />
   );
 
+  // A flame over a seat's burnt pile. Two nested teardrops — an orange body and
+  // a yellow heart — both anchored at the base, which is where the flicker's
+  // transform-origin sits (`.pnj-flame` in index.css), so it gutters upward out
+  // of the pile instead of swimming around it. Each seat gets its own delay so
+  // four piles never flicker in step. Static when animations are off: ambient
+  // motion is precisely what that setting is for, and the flame still reads.
+  const FLAME_BODY = 'M0,-12 C2.4,-8.6 3.5,-6.2 3.5,-3.5 A3.5,3.5 0 0 1 -3.5,-3.5 C-3.5,-6.2 -2.4,-8.6 0,-12 Z';
+  const FLAME_HEART = 'M0,-6.8 C1.3,-4.9 1.9,-3.4 1.9,-1.9 A1.9,1.9 0 0 1 -1.9,-1.9 C-1.9,-3.4 -1.3,-4.9 0,-6.8 Z';
+  const renderFlame = (cx, baseY, seat, hot = false) => (
+    <g transform={`translate(${cx}, ${baseY})`} pointerEvents="none">
+      <ellipse cx="0" cy="-6" rx="6.5" ry="7.5" fill="#F97316" opacity={hot ? 0.32 : 0.18} />
+      <g
+        className={animationsEnabled ? 'pnj-flame' : undefined}
+        style={animationsEnabled ? { animationDelay: `${seat * 0.29}s` } : undefined}
+      >
+        <path d={FLAME_BODY} fill={hot ? '#FB923C' : '#F97316'} />
+        <path d={FLAME_HEART} fill={hot ? '#FEF08A' : '#FDE047'} />
+      </g>
+    </g>
+  );
+
   const renderCard = (card, index, isSelected, isPlayable = true) => {
     const isRed = card.suit === '♥' || card.suit === '♦';
-    const discardHighlight = discardMode ? 'ring-2 ring-red-400 hover:ring-red-300' : '';
-    const deadCard = !isPlayable && !discardMode ? 'opacity-50' : '';
+    // Stuck, every card is equally burnable: an ember ring says "this one will
+    // do", and none of them are dimmed — dimming is for a card that can't be
+    // played while others can, and here that is all of them.
+    const burnHighlight = mustBurn && !isSelected ? 'ring-2 ring-orange-500/70 hover:ring-orange-400' : '';
+    const deadCard = !isPlayable && !mustBurn ? 'opacity-50' : '';
     // The selected card has to be readable at a glance from across a table: a
     // 2px gold outline on a white card, lifted by a few pixels, was a border
     // rather than a choice. It now lifts further, grows, glows and takes an
@@ -3585,11 +3640,11 @@ export default function PegsAndJokers() {
       <div
         key={card.id}
         onClick={() => handleCardClick(index)}
-        className={`cursor-pointer transition-all ${selectedLook} ${discardHighlight} ${deadCard}`}
+        className={`cursor-pointer transition-all ${selectedLook} ${burnHighlight} ${deadCard}`}
         style={{
           width: 50,
           height: 70,
-          backgroundColor: discardMode ? '#FEE2E2' : (isSelected ? '#FEF3C7' : 'white'),
+          backgroundColor: isSelected ? '#FEF3C7' : 'white',
           border: isSelected ? `2px solid ${SELECTED_PEG_COLOR}` : '1px solid #ccc',
           borderRadius: 4,
           display: 'flex',
@@ -5056,16 +5111,23 @@ export default function PegsAndJokers() {
                       <rect x={pos.x} y={pos.y} width={DISCARD_CARD_W} height={DISCARD_CARD_H} rx="2" fill="none" stroke={PLAYER_COLORS[player]} strokeWidth="1" strokeDasharray="3" opacity="0.5" />
                     )}
 
-                    {/* Stuck counter (face down cards) - shows when player has discarded while stuck */}
+                    {/* The burnt pile: the cards this seat has thrown away with
+                        no legal move, and a flame over the count so it reads as
+                        *burnt* rather than as some other number on a busy
+                        board. It used to be a purple card with a bare digit,
+                        which told you nothing about why it was there. Three in
+                        a row buys a peg out of start, so at 2 the flame burns
+                        brighter — it's about to be worth something. */}
                     {stuckCount > 0 && (
                       <g>
-                        <rect x={pos.x + 26} y={pos.y} width="22" height="30" rx="2" fill="#7C3AED" stroke="#A78BFA" strokeWidth="2" />
+                        <rect x={pos.x + 26} y={pos.y} width="22" height="30" rx="2" fill="#3F1206" stroke="#F97316" strokeWidth="1.5" />
+                        {renderFlame(pos.x + 37, pos.y + 18, player, stuckCount >= 2)}
                         <text
                           x={pos.x + 37}
-                          y={pos.y + 20}
+                          y={pos.y + 27}
                           textAnchor="middle"
-                          fill="white"
-                          fontSize="14"
+                          fill="#FED7AA"
+                          fontSize="10"
                           fontWeight="bold"
                         >
                           {stuckCount}
@@ -5209,7 +5271,14 @@ export default function PegsAndJokers() {
                   appears and disappears above the board"). It states the one
                   rule of the input: a card, then a peg, and the card again to
                   change your mind. */}
-              <p className="text-xs text-gray-400">Tap a card, then a glowing peg. Tap the card again to unpick it.</p>
+              {/* One line, always the same size, saying what a tap does right
+                  now — when you're stuck there is no glowing peg to tap, and a
+                  hint pointing at one is worse than none. */}
+              <p className="text-xs text-gray-400">
+                {mustBurn
+                  ? 'Nothing in this hand can move a peg — tap the one to burn.'
+                  : 'Tap a card, then a glowing peg. Tap the card again to unpick it.'}
+              </p>
               {/* pt-4 is headroom for the selected card, which lifts and grows
                   — without it the raised card sits on top of the hint above. */}
               <div className="flex gap-2 flex-wrap pt-5">
@@ -5259,43 +5328,36 @@ export default function PegsAndJokers() {
               </div>
             )}
 
-            {discardMode && (
-              <div className="mb-4 p-3 bg-yellow-900 rounded">
-                <p className="mb-2 font-bold">Select a card to discard:</p>
-                <p className="text-sm mb-2">Click on any card in your hand to discard it and draw a new card.</p>
+            {/* Burning is only possible when the player is genuinely stuck (no
+                legal move with any card), so this panel *is* the announcement
+                that they are — there is no button to press to find out, and
+                nothing to cancel back to. The cards above are already live; the
+                button here is the commit, dead until one is picked. */}
+            {mustBurn && (
+              <div className="mb-4 p-3 rounded bg-orange-950 border border-orange-700">
+                <p className="mb-1 font-bold text-orange-200">
+                  {selectedCardObj
+                    ? <>Burn {describeCard(selectedCardObj)}?</>
+                    : <>No valid move — you have to burn a card.</>}
+                </p>
+                <p className="text-sm mb-2 text-orange-100/80">
+                  Tap any card in your hand, then press Burn. It goes on your pile and you draw
+                  a new one.
+                </p>
                 <button
-                  onClick={() => {
-                    setDiscardMode(false);
-                    setNotice(null);
-                  }}
-                  className="px-3 py-1 bg-gray-600 rounded hover:bg-gray-700"
+                  onClick={burnSelectedCard}
+                  disabled={!burnPrompt.ready}
+                  className={`px-4 py-2 rounded font-bold transition-colors ${
+                    burnPrompt.ready
+                      ? 'bg-orange-600 hover:bg-orange-500 text-white shadow-[0_0_12px_rgba(249,115,22,0.6)]'
+                      : 'bg-gray-700 text-gray-400 cursor-not-allowed'
+                  }`}
                 >
-                  Cancel
+                  {burnPrompt.label}
                 </button>
-              </div>
-            )}
-
-            {/* Discarding is only allowed when the player is genuinely stuck (no
-                legal move). If any card can be played, no discard option is shown
-                so the player can't skip a turn they're required to play. */}
-            {isMyTurn && !jokerMode && !splitRemaining && !discardMode && !isReplaying && myHand.length > 0 && !playableCards.some(Boolean) && (
-              <div className="mb-4">
-                <div>
-                  <button
-                    onClick={() => {
-                      setDiscardMode(true);
-                      setSelectedCard(null);
-                      setSelectedPeg(null);
-                      setNotice(null);
-                    }}
-                    className="px-4 py-2 bg-red-600 rounded hover:bg-red-700 font-bold"
-                  >
-                    No Valid Move - Select Card to Discard {stuckCounts[mySeat] > 0 && `(${stuckCounts[mySeat]}/3)`}
-                  </button>
-                  {stuckCounts[mySeat] === 2 && (
-                    <p className="text-yellow-400 text-sm mt-1">Next stuck discard will let you start a peg!</p>
-                  )}
-                </div>
+                <p className={`text-sm mt-1 ${stuckCounts[mySeat] >= 2 ? 'text-yellow-300' : 'text-orange-200/70'}`}>
+                  {burnPrompt.hint}
+                </p>
               </div>
             )}
 
@@ -5310,7 +5372,8 @@ export default function PegsAndJokers() {
                 <li>• Joker: Bump any opponent peg</li>
                 <li>• Cannot jump or land on your own pegs</li>
                 <li>• Your own peg on your come-out space blocks every peg in START — move it first</li>
-                <li>• <span className="text-yellow-400">Stuck 3 turns in a row = auto-start a peg!</span></li>
+                <li>• No legal move? Burn a card — it goes on your pile (🔥) and you draw a new one</li>
+                <li>• <span className="text-yellow-400">Burn 3 turns in a row = auto-start a peg!</span></li>
                 {gameMode === GAME_MODES.PARTNERS && (
                   <>
                     <li>• <span className="text-pink-400">Partners:</span> you and Pink are a team — win when both of you are all home</li>
