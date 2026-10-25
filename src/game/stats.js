@@ -6,6 +6,7 @@
 // storage is available (e.g. server-side or a private-mode failure).
 
 import { GAME_MODES, TEAMS } from './constants.js';
+import { resetTrophies } from './trophies.js';
 
 export const STATS_STORAGE_KEY = 'pnj:playerStats:v1';
 
@@ -97,6 +98,13 @@ export function resetStats(storage) {
       // ignore
     }
   }
+  // Trophies are derived from these counters, so they go with them — a trophy
+  // surviving a reset would sit in the tab with no stats behind it, which
+  // reads as a bug rather than as history. Note this leaves the trophy store
+  // *unseeded*: the caller must sync it against the fresh stats right away, or
+  // the next finished game seeds instead of announcing and swallows its own
+  // first trophy. The reset button does exactly that.
+  resetTrophies(storage);
   return createEmptyStats();
 }
 
