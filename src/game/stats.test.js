@@ -21,6 +21,12 @@ import {
   RECORDED_GAMES_STORAGE_KEY,
   MAX_RECORDED_GAMES,
 } from './stats.js';
+import {
+  syncTrophies,
+  loadTrophies,
+  earnedCount,
+  createEmptyTrophyState,
+} from './trophies.js';
 import { GAME_MODES } from './constants.js';
 
 // Minimal in-memory Storage stand-in so the pure logic can be tested without a
@@ -238,9 +244,21 @@ describe('persistence', () => {
     expect(loadStats(storage)).toEqual(createEmptyStats());
   });
 
+  it('resetStats clears the trophies too, so a reset really is a reset', () => {
+    // Trophies are derived from these counters; one surviving the reset would
+    // sit in the tab with no stats behind it.
+    const storage = memoryStorage();
+    syncTrophies({ ...createEmptyStats(), gamesPlayed: 60, wins: 30 }, storage);
+    expect(earnedCount(loadTrophies(storage))).toBeGreaterThan(0);
+
+    resetStats(storage);
+    expect(loadTrophies(storage)).toEqual(createEmptyTrophyState());
+  });
+
   it('does not throw when no storage is available', () => {
     expect(() => saveStats(createEmptyStats(), null)).not.toThrow();
     expect(loadStats(null)).toEqual(createEmptyStats());
+    expect(() => resetStats(null)).not.toThrow();
   });
 });
 

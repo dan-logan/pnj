@@ -40,6 +40,14 @@ import {
   formatStreak,
   getNemesis
 } from './game/stats.js';
+import {
+  syncTrophies,
+  createEmptyTrophyState,
+  describeTier,
+  trophyRows,
+  earnedCount,
+  totalTiers
+} from './game/trophies.js';
 import { loadGame, saveGame, clearGame, serializeGame } from './game/persistence.js';
 import { PHASES, derivePhase, describeStatusParts, describeCard, describeBurn, describeOutcome, attributeFrameDescription } from './game/status.js';
 import {
@@ -361,6 +369,16 @@ export default function PegsAndJokers() {
   // Player statistics (persisted to localStorage)
   const [stats, setStats] = useState(() => loadStats());
   const [showStats, setShowStats] = useState(false);
+  const [statsTab, setStatsTab] = useState('stats'); // 'stats' | 'trophies'
+  // Seeded in the initializer rather than in an effect, and deliberately so.
+  // The seeding run is what stops a long-time player being handed a dozen
+  // trophies at once (see trophies.js), and it has to have happened *before*
+  // any game can end — a mount that adopts an already-finished remote game
+  // calls endGame from an effect, and an effect ordered after this one would
+  // announce the player's whole back catalogue over that result. `syncTrophies`
+  // is idempotent, so StrictMode's double-invoke costs a redundant write and
+  // nothing else.
+  const [trophies, setTrophies] = useState(() => syncTrophies(loadStats()).state);
 
   // Per-game tallies, folded into stats when the game ends. Refs so updating
   // them mid-turn never triggers a re-render.
@@ -755,7 +773,18 @@ export default function PegsAndJokers() {
       ...tallies,
     });
     setStats(updated);
-    setEndInfo({ winner: winnerIdx, winningSeat, description, ...tallies });
+
+    // 4. Trophies, folded in from the stats that were just written. They need
+    //    no dedupe of their own: the earned set is sticky, so a tier already
+    //    held is never "newly earned" however many times a terminal state is
+    //    observed. `newly` rides on endInfo so the result overlay can show it
+    //    — which means it inherits that overlay's gating on `resultPending`
+    //    and `!isReplaying`, and a trophy won on a remote move waits for the
+    //    auto-replay rather than landing over a board still playing it out.
+    const { state: trophyState, newly: newTrophies } = syncTrophies(updated);
+    setTrophies(trophyState);
+
+    setEndInfo({ winner: winnerIdx, winningSeat, description, ...tallies, trophies: newTrophies });
     setEndOverlayDismissed(false);
   }, [stopMoveVisuals]);
 
@@ -4202,6 +4231,30 @@ export default function PegsAndJokers() {
               </div>
             )}
 
+            {/* Trophies this game earned. Only ever the ones crossed *now* —
+                the seeding run at mount means a long-time player's back
+                catalogue is already in the tab and never appears here. */}
+            {endInfo?.trophies?.length > 0 && (
+              <div className="bg-amber-500/10 border border-amber-500/40 rounded-lg px-4 py-3 mb-5">
+                <div className="text-xs text-amber-400 font-semibold mb-2">
+                  {endInfo.trophies.length === 1 ? 'Trophy earned' : `${endInfo.trophies.length} trophies earned`}
+                </div>
+                <div className="space-y-1.5">
+                  {endInfo.trophies.map((id) => {
+                    const t = describeTier(id);
+                    if (!t) return null;
+                    return (
+                      <div key={id} className="flex items-center gap-2 text-sm">
+                        <span className="text-lg leading-none">{t.icon}</span>
+                        <span className="font-semibold">{t.name}</span>
+                        <span className="text-gray-400 text-xs">{t.label}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             <div className="grid grid-cols-4 gap-2 mb-5 text-center">
               <div className="bg-gray-700 rounded-lg p-2">
                 <div className="text-lg font-bold">{endInfo?.turns ?? 0}</div>
@@ -4284,18 +4337,105 @@ export default function PegsAndJokers() {
             className="bg-gray-800 rounded-lg shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex justify-between items-center p-6 pb-4 border-b border-gray-700 sticky top-0 bg-gray-800">
-              <h2 className="text-2xl font-bold">📊 Your Stats</h2>
-              <button
-                onClick={() => setShowStats(false)}
-                className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-lg leading-none"
-                aria-label="Close stats"
-              >
-                ✕
-              </button>
+            <div className="p-6 pb-0 border-b border-gray-700 sticky top-0 bg-gray-800">
+              <div className="flex justify-between items-center pb-4">
+                <h2 className="text-2xl font-bold">Your Record</h2>
+                <button
+                  onClick={() => setShowStats(false)}
+                  className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-lg leading-none"
+                  aria-label="Close stats"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="flex gap-1" role="tablist">
+                {[['stats', '📊 Stats'], ['trophies', '🏆 Trophies']].map(([key, label]) => (
+                  <button
+                    key={key}
+                    role="tab"
+                    aria-selected={statsTab === key}
+                    onClick={() => setStatsTab(key)}
+                    className={`px-4 py-2 rounded-t-lg text-sm font-semibold transition-colors border-b-2 ${
+                      statsTab === key
+                        ? 'border-amber-400 text-amber-400'
+                        : 'border-transparent text-gray-400 hover:text-gray-200'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
 
-            {stats.gamesPlayed === 0 ? (
+            {statsTab === 'trophies' ? (
+              /* The trophy tab renders for a brand-new player too: an unearned
+                 ladder with its first rung visible is the whole pull, and
+                 hiding it behind "no games played yet" would show nothing to
+                 the one person who most needs a reason to play again. */
+              <div className="p-6 space-y-3">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-sm text-gray-400">
+                    {earnedCount(trophies) === 0 ? 'Nothing earned yet' : 'Earned so far'}
+                  </span>
+                  <span className="text-sm font-semibold text-amber-400 tabular-nums shrink-0">
+                    {earnedCount(trophies)} / {totalTiers()}
+                  </span>
+                </div>
+
+                {trophyRows(stats, trophies).map((row) => (
+                  <div
+                    key={row.trophy.id}
+                    className={`rounded-lg px-4 py-3 ${row.level > 0 ? 'bg-gray-700' : 'bg-gray-700/30'}`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className={`text-2xl leading-none ${row.level > 0 ? '' : 'opacity-30 grayscale'}`}>
+                        {row.trophy.icon}
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={`font-semibold ${row.level > 0 ? 'text-amber-300' : 'text-gray-400'}`}>
+                            {row.trophy.name}
+                          </span>
+                          {/* One pip per rung, so a ladder reads as one row
+                              that fills rather than four rows that light. */}
+                          {row.maxLevel > 1 && (
+                            <span className="flex gap-1 shrink-0">
+                              {row.trophy.tiers.map((tier) => (
+                                <span
+                                  key={tier}
+                                  className={`inline-block w-1.5 h-1.5 rounded-full ${
+                                    row.earnedTiers.includes(tier) ? 'bg-amber-400' : 'bg-gray-600'
+                                  }`}
+                                />
+                              ))}
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-gray-400 mt-0.5">{row.trophy.blurb}</div>
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <div className="h-1.5 bg-gray-600 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-amber-400 rounded-full"
+                          style={{ width: `${Math.round(row.fraction * 100)}%` }}
+                        />
+                      </div>
+                      <div className="text-[11px] text-gray-400 mt-1 text-right tabular-nums">
+                        {/* A ladder shows how far up it you are; a one-rung
+                            trophy has no distance to report, and "0 / 1 games"
+                            is a worse sentence than saying nothing. */}
+                        {row.complete
+                          ? 'Complete'
+                          : row.maxLevel === 1
+                            ? 'Not yet'
+                            : `${row.value} / ${row.nextTier} ${row.trophy.unit}`}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : stats.gamesPlayed === 0 ? (
               <div className="p-8 text-center text-gray-400">
                 <p className="text-lg mb-2">No games played yet.</p>
                 <p className="text-sm">Finish a game and your stats will show up here.</p>
@@ -4435,8 +4575,15 @@ export default function PegsAndJokers() {
                 <div className="pt-2 border-t border-gray-700 text-right">
                   <button
                     onClick={() => {
-                      if (window.confirm('Reset all your stats? This cannot be undone.')) {
-                        setStats(resetStats());
+                      if (window.confirm('Reset all your stats and trophies? This cannot be undone.')) {
+                        const fresh = resetStats();
+                        setStats(fresh);
+                        // resetStats clears the trophy store too. Re-seed it
+                        // straight away against the zeroed stats: a sync that
+                        // found an unseeded store at the end of the *next*
+                        // game would treat that game's first trophy as
+                        // backfill and swallow it.
+                        setTrophies(syncTrophies(fresh).state);
                       }
                     }}
                     className="text-sm text-gray-400 hover:text-red-400 underline"
